@@ -4,3 +4,4 @@
 *.db-wal
 /gateway
 /dist
+/config.yaml
