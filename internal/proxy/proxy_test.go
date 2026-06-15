@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -224,5 +225,139 @@ func TestUnknownProviderNamesIgnored(t *testing.T) {
 
 	if rec := do(t, p, plain, "/v1/x", `{"model":"gpt-5.4"}`); rec.Code != 200 {
 		t.Errorf("status = %d, want 200", rec.Code)
+	}
+}
+
+func TestModelMappingRewritesAndLogs(t *testing.T) {
+	var gotModel string
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b struct {
+			Model string `json:"model"`
+		}
+		json.NewDecoder(r.Body).Decode(&b)
+		gotModel = b.Model
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":100,"completion_tokens":10}}`)
+	})
+	srv := httptest.NewServer(up)
+	t.Cleanup(srv.Close)
+	st, _ := store.Open(":memory:")
+	t.Cleanup(func() { st.Close() })
+	cfg := &config.Config{
+		MasterKey: "mk",
+		Defaults:  config.Defaults{Retry: config.Retry{MaxRetries: 0, BaseDelay: time.Millisecond}},
+		Providers: []config.Provider{{
+			Name: "up", BaseURL: srv.URL, APIKey: "x",
+			ModelMap: map[string]string{"alias": "gpt-5.4"},
+		}},
+	}
+	p := New(cfg, st, testPricing(), srv.Client(), nil)
+	plain, display, _ := keys.Generate()
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"up"})
+
+	rec := do(t, p, plain, "/v1/chat/completions", `{"model":"alias","messages":[]}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if gotModel != "gpt-5.4" {
+		t.Errorf("upstream received model %q, want gpt-5.4 (mapped)", gotModel)
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 || logs[0].Model != "alias" || logs[0].MappedModel != "gpt-5.4" {
+		t.Fatalf("log model/mapped = %+v", logs[0])
+	}
+	// Priced by the mapped (effective) model.
+	if logs[0].Cost == 0 {
+		t.Error("expected non-zero cost via mapped-model pricing")
+	}
+}
+
+func TestAttemptsLoggedAndHeaders(t *testing.T) {
+	var calls atomic.Int32
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) <= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	})
+	p, st, key := harness(t, up)
+
+	rec := do(t, p, key, "/v1/x", `{"model":"gpt-5.4"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if got := rec.Header().Get(headerAttempts); got != "3" {
+		t.Errorf("X-AGL-Attempts = %q, want 3", got)
+	}
+	if got := rec.Header().Get(headerProvider); got != "up" {
+		t.Errorf("X-AGL-Provider = %q, want up", got)
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if logs[0].Attempts != 3 {
+		t.Errorf("logged attempts = %d, want 3", logs[0].Attempts)
+	}
+}
+
+func TestProviderFailureErrorIsClear(t *testing.T) {
+	st, _ := store.Open(":memory:")
+	t.Cleanup(func() { st.Close() })
+	cfg := &config.Config{
+		MasterKey: "mk",
+		Defaults:  config.Defaults{Retry: config.Retry{MaxRetries: 2, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}},
+		Providers: []config.Provider{{Name: "dead", BaseURL: "http://127.0.0.1:1"}},
+	}
+	p := New(cfg, st, testPricing(), &http.Client{Timeout: 500 * time.Millisecond}, nil)
+	plain, display, _ := keys.Generate()
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"dead"})
+
+	rec := do(t, p, plain, "/v1/x", `{"model":"gpt-5.4"}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if rec.Header().Get(headerErrorSource) != sourceProvider {
+		t.Errorf("error source = %q, want provider", rec.Header().Get(headerErrorSource))
+	}
+	if rec.Header().Get(headerAttempts) != "3" {
+		t.Errorf("attempts header = %q, want 3", rec.Header().Get(headerAttempts))
+	}
+	var body struct {
+		Error struct {
+			Message  string `json:"message"`
+			Source   string `json:"source"`
+			Provider string `json:"provider"`
+			Attempts int    `json:"attempts"`
+		} `json:"error"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &body)
+	if body.Error.Source != sourceProvider || body.Error.Attempts != 3 || body.Error.Provider != "dead" {
+		t.Errorf("error body = %+v", body.Error)
+	}
+	if !strings.Contains(body.Error.Message, "3 attempt") || !strings.Contains(body.Error.Message, "dead") {
+		t.Errorf("message not clear: %q", body.Error.Message)
+	}
+	// Logged with the failure reason and attempt count.
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 || logs[0].Attempts != 3 || logs[0].Error == "" {
+		t.Errorf("failure log = %+v", logs)
+	}
+}
+
+func TestUpstreamErrorMarkedProviderSource(t *testing.T) {
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	})
+	p, st, key := harness(t, up)
+	rec := do(t, p, key, "/v1/x", `{"model":"gpt-5.4"}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if rec.Header().Get(headerErrorSource) != sourceProvider {
+		t.Errorf("error source = %q, want provider", rec.Header().Get(headerErrorSource))
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 || logs[0].Error == "" {
+		t.Errorf("expected logged error reason, got %+v", logs)
 	}
 }

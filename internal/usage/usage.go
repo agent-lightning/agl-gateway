@@ -23,6 +23,30 @@ func RequestModel(body []byte) string {
 	return probe.Model
 }
 
+// SetModel rewrites the top-level "model" field of a JSON request body to model, preserving
+// every other field byte-for-byte (only the top-level object is re-serialized). It returns
+// the original body unchanged with ok=false when the body is not a JSON object containing a
+// "model" field.
+func SetModel(body []byte, model string) (out []byte, ok bool) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return body, false
+	}
+	if _, has := fields["model"]; !has {
+		return body, false
+	}
+	enc, err := json.Marshal(model)
+	if err != nil {
+		return body, false
+	}
+	fields["model"] = enc
+	rewritten, err := json.Marshal(fields)
+	if err != nil {
+		return body, false
+	}
+	return rewritten, true
+}
+
 // rawUsage mirrors the union of usage fields across providers. Pointers distinguish
 // "absent" from "zero".
 type rawUsage struct {

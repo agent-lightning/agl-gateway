@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/kiki/agl-gateway/internal/pricing"
@@ -12,6 +13,37 @@ func TestRequestModel(t *testing.T) {
 	}
 	if got := RequestModel([]byte(`not json`)); got != "" {
 		t.Errorf("RequestModel(garbage) = %q, want empty", got)
+	}
+}
+
+func TestSetModel(t *testing.T) {
+	// Rewrites model and preserves other fields (including nested values) exactly.
+	in := []byte(`{"model":"alias","stream":true,"seed":123456789,"messages":[{"role":"user","content":"hi"}]}`)
+	out, ok := SetModel(in, "real-model")
+	if !ok {
+		t.Fatal("SetModel returned ok=false")
+	}
+	if RequestModel(out) != "real-model" {
+		t.Errorf("model not rewritten: %s", out)
+	}
+	for _, want := range []string{`"stream":true`, `"seed":123456789`, `"content":"hi"`} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("rewritten body lost %s: %s", want, out)
+		}
+	}
+}
+
+func TestSetModelNoModelField(t *testing.T) {
+	in := []byte(`{"messages":[]}`)
+	out, ok := SetModel(in, "x")
+	if ok {
+		t.Error("expected ok=false when no model field")
+	}
+	if string(out) != string(in) {
+		t.Errorf("body changed: %s", out)
+	}
+	if _, ok := SetModel([]byte(`not json`), "x"); ok {
+		t.Error("expected ok=false for non-JSON body")
 	}
 }
 

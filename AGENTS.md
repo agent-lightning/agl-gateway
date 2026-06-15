@@ -59,6 +59,16 @@ Packages:
 - **Master key compared in constant time** (`crypto/subtle`).
 - **Forward the original path + query unchanged**; only the `Authorization` header (and
   configured provider headers) are rewritten. Hop-by-hop headers are stripped both ways.
+- **Model mapping is best-effort and provider-scoped.** `provider.model_map` rewrites only
+  the top-level `model` field (via `usage.SetModel`, which preserves every other field
+  byte-for-byte); the original and mapped model are both logged, and cost prefers the mapped
+  (effective) model, falling back to the requested one.
+- **Failures are classified.** Every failure tells the client whether it was a `provider` or
+  `gateway` fault, with the attempt count, via both the JSON body and `X-AGL-*` headers.
+  Provider responses (incl. surviving 4xx/5xx) pass through; only gateway-side problems are
+  synthesized. The attempt count and reason are written to the log.
+- **Deleting a key cascades to its logs** in a transaction, then runs `incremental_vacuum`
+  to release space (`auto_vacuum=INCREMENTAL` is set at DB creation).
 
 ## Conventions
 
@@ -83,7 +93,11 @@ row with sane TTFT/tokens/cost (see the smoke test pattern referenced in the REA
 ## Adding things
 
 - **New provider:** config only — add to `providers:`. No code.
+- **Model mapping:** config only — add `model_map:` under a provider. No code.
 - **New model price:** config only — add to `pricing:`.
+- **Schema change:** add the column to the `CREATE TABLE` in `store.migrate` *and* an
+  `ensureColumn` call so existing databases upgrade in place; extend `RequestLog`, the
+  `INSERT`, and the `QueryLogs` `SELECT`/scan together.
 - **New usage shape:** extend `internal/usage` (`rawUsage`/`usageEnvelope`/`normalize`) and
   add a focused test with a real-ish payload. Keep it best-effort and provider-neutral.
 - **New admin endpoint:** add to `Admin.Handler`, keep it behind the master-key middleware,

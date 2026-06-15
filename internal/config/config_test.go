@@ -129,3 +129,29 @@ func TestProviderLookup(t *testing.T) {
 		t.Error("ProviderNames missing openai")
 	}
 }
+
+func TestExampleConfigParses(t *testing.T) {
+	c, err := Load("../../config.example.yaml")
+	if err != nil {
+		t.Fatalf("example config failed to load: %v", err)
+	}
+	// Model mapping is parsed.
+	if c.Provider("openai").ModelMap["gpt-fast"] != "gpt-5-mini" {
+		t.Errorf("model_map not parsed: %+v", c.Provider("openai").ModelMap)
+	}
+	// Base models are priced; context/effort variants are intentionally excluded.
+	priced := make(map[string]bool)
+	for _, p := range c.Pricing {
+		priced[p.Model] = true
+	}
+	for _, base := range []string{"gpt-5.4", "claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"} {
+		if !priced[base] {
+			t.Errorf("expected base model %q to be priced", base)
+		}
+	}
+	for _, variant := range []string{"claude-opus-4-7-200k", "claude-opus-4-8-232k", "claude-haiku-4-5-20251001", "codex-auto-review"} {
+		if priced[variant] {
+			t.Errorf("variant %q should not be in the example pricing", variant)
+		}
+	}
+}

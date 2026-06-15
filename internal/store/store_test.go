@@ -15,6 +15,50 @@ func newTestStore(t *testing.T) *Store {
 	return s
 }
 
+func TestDeleteKeyCascadesLogs(t *testing.T) {
+	s := newTestStore(t)
+	k, err := s.CreateKey("dev", "h", "p", []string{"openai"})
+	if err != nil {
+		t.Fatalf("CreateKey: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if err := s.InsertLog(&RequestLog{APIKeyID: k.ID, KeyName: "dev", Provider: "openai", Model: "m"}); err != nil {
+			t.Fatalf("InsertLog: %v", err)
+		}
+	}
+	// A log for a different key must survive.
+	s.InsertLog(&RequestLog{APIKeyID: k.ID + 1, KeyName: "other", Provider: "openai", Model: "m"})
+
+	if _, err := s.DeleteKey(k.ID); err != nil {
+		t.Fatalf("DeleteKey: %v", err)
+	}
+	gone, _ := s.QueryLogs(LogFilter{APIKeyID: k.ID})
+	if len(gone) != 0 {
+		t.Errorf("expected logs cascade-deleted, got %d", len(gone))
+	}
+	remaining, _ := s.QueryLogs(LogFilter{})
+	if len(remaining) != 1 {
+		t.Errorf("unrelated logs affected: %d remaining, want 1", len(remaining))
+	}
+}
+
+func TestLogMappedModelAndAttempts(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.InsertLog(&RequestLog{
+		APIKeyID: 1, KeyName: "dev", Provider: "openai",
+		Model: "alias", MappedModel: "gpt-5.4", Attempts: 3, StatusCode: 200,
+	}); err != nil {
+		t.Fatalf("InsertLog: %v", err)
+	}
+	logs, _ := s.QueryLogs(LogFilter{})
+	if len(logs) != 1 {
+		t.Fatalf("logs = %d", len(logs))
+	}
+	if logs[0].MappedModel != "gpt-5.4" || logs[0].Attempts != 3 {
+		t.Errorf("round-trip mismatch: %+v", logs[0])
+	}
+}
+
 func TestKeyLifecycle(t *testing.T) {
 	s := newTestStore(t)
 

@@ -29,8 +29,10 @@ type RequestLog struct {
 	KeyName          string    `json:"key_name"`
 	Provider         string    `json:"provider"`
 	Model            string    `json:"model"`
+	MappedModel      string    `json:"mapped_model"`
 	StatusCode       int       `json:"status_code"`
 	Streaming        bool      `json:"streaming"`
+	Attempts         int       `json:"attempts"`
 	TTFTMillis       int64     `json:"ttft_ms"`
 	DurationMillis   int64     `json:"duration_ms"`
 	InputTokens      int       `json:"input_tokens"`
@@ -92,6 +94,11 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) migrate() error {
+	// auto_vacuum must be set before any table exists; it is a no-op on a populated DB.
+	// It lets incremental_vacuum (run after cascade deletes) return freed pages to the OS.
+	if _, err := s.db.Exec(`PRAGMA auto_vacuum=INCREMENTAL;`); err != nil {
+		return fmt.Errorf("migrate (auto_vacuum): %w", err)
+	}
 	const schema = `
 CREATE TABLE IF NOT EXISTS api_keys (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,8 +115,10 @@ CREATE TABLE IF NOT EXISTS request_logs (
     key_name           TEXT NOT NULL,
     provider           TEXT NOT NULL,
     model              TEXT NOT NULL,
+    mapped_model       TEXT NOT NULL DEFAULT '',
     status_code        INTEGER NOT NULL,
     streaming          INTEGER NOT NULL,
+    attempts           INTEGER NOT NULL DEFAULT 0,
     ttft_ms            INTEGER NOT NULL,
     duration_ms        INTEGER NOT NULL,
     input_tokens       INTEGER NOT NULL,
@@ -125,6 +134,38 @@ CREATE INDEX IF NOT EXISTS idx_logs_api_key_id ON request_logs(api_key_id);
 `
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
+	}
+	// Additive columns for databases created by older versions.
+	if err := s.ensureColumn("request_logs", "mapped_model", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("request_logs", "attempts", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ensureColumn adds a column to a table if it does not already exist.
+func (s *Store) ensureColumn(table, column, decl string) error {
+	rows, err := s.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, decl)); err != nil {
+		return fmt.Errorf("add column %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -181,13 +222,30 @@ func (s *Store) ListKeys() ([]APIKey, error) {
 	return keys, rows.Err()
 }
 
-// DeleteKey removes the key with the given id. It reports whether a row was deleted.
+// DeleteKey removes the key with the given id and cascades to every request log bound to
+// it, then returns freed pages to the OS. It reports whether a key row was deleted.
 func (s *Store) DeleteKey(id int64) (bool, error) {
-	res, err := s.db.Exec(`DELETE FROM api_keys WHERE id = ?`, id)
+	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
 	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM request_logs WHERE api_key_id = ?`, id); err != nil {
+		return false, err
+	}
+	res, err := tx.Exec(`DELETE FROM api_keys WHERE id = ?`, id)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
 	n, _ := res.RowsAffected()
+	if n > 0 {
+		// Best-effort: reclaim the space freed by the deleted logs.
+		_, _ = s.db.Exec(`PRAGMA incremental_vacuum;`)
+	}
 	return n > 0, nil
 }
 
@@ -224,11 +282,12 @@ func (s *Store) InsertLog(l *RequestLog) error {
 	}
 	_, err := s.db.Exec(`
 INSERT INTO request_logs
- (api_key_id, key_name, provider, model, status_code, streaming, ttft_ms, duration_ms,
-  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost, error, created_at)
- VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		l.APIKeyID, l.KeyName, l.Provider, l.Model, l.StatusCode, b2i(l.Streaming),
-		l.TTFTMillis, l.DurationMillis, l.InputTokens, l.OutputTokens, l.CacheReadTokens,
+ (api_key_id, key_name, provider, model, mapped_model, status_code, streaming, attempts,
+  ttft_ms, duration_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+  cost, error, created_at)
+ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		l.APIKeyID, l.KeyName, l.Provider, l.Model, l.MappedModel, l.StatusCode, b2i(l.Streaming),
+		l.Attempts, l.TTFTMillis, l.DurationMillis, l.InputTokens, l.OutputTokens, l.CacheReadTokens,
 		l.CacheWriteTokens, l.Cost, l.Error, l.CreatedAt.UnixMilli(),
 	)
 	if err != nil {
@@ -239,9 +298,9 @@ INSERT INTO request_logs
 
 // QueryLogs returns request logs matching the filter, newest first.
 func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
-	q := `SELECT id, api_key_id, key_name, provider, model, status_code, streaming, ttft_ms,
-	             duration_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-	             cost, error, created_at
+	q := `SELECT id, api_key_id, key_name, provider, model, mapped_model, status_code, streaming,
+	             attempts, ttft_ms, duration_ms, input_tokens, output_tokens, cache_read_tokens,
+	             cache_write_tokens, cost, error, created_at
 	      FROM request_logs WHERE 1=1`
 	var args []any
 	if f.APIKeyID > 0 {
@@ -279,8 +338,8 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 			streaming int
 			createdMs int64
 		)
-		if err := rows.Scan(&l.ID, &l.APIKeyID, &l.KeyName, &l.Provider, &l.Model,
-			&l.StatusCode, &streaming, &l.TTFTMillis, &l.DurationMillis, &l.InputTokens,
+		if err := rows.Scan(&l.ID, &l.APIKeyID, &l.KeyName, &l.Provider, &l.Model, &l.MappedModel,
+			&l.StatusCode, &streaming, &l.Attempts, &l.TTFTMillis, &l.DurationMillis, &l.InputTokens,
 			&l.OutputTokens, &l.CacheReadTokens, &l.CacheWriteTokens, &l.Cost, &l.Error,
 			&createdMs); err != nil {
 			return nil, err

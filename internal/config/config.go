@@ -48,6 +48,10 @@ type Provider struct {
 	APIKey string `yaml:"api_key"`
 	// Headers are extra headers added to every upstream request.
 	Headers map[string]string `yaml:"headers"`
+	// ModelMap rewrites the request's "model" field before forwarding: a request for a
+	// key in this map is sent upstream with the mapped value instead. Both the original
+	// and mapped model are logged.
+	ModelMap map[string]string `yaml:"model_map"`
 	// Retry overrides Defaults.Retry for this provider. Nil fields fall back to defaults.
 	Retry *Retry `yaml:"retry"`
 }

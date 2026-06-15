@@ -13,19 +13,25 @@ work transparently.
 
 - **Key-based routing.** Each gateway API key is bound to one or more providers. Requests
   are routed to a randomly chosen bound provider.
+- **Model mapping.** A provider can rewrite the request's `model` to an upstream name before
+  forwarding; both the requested and mapped model are logged.
 - **Retries with backoff + jitter.** Network errors and HTTP 429/5xx are retried per a
   per-provider (or default) policy: `base_delay * 2^attempt` capped at `max_delay`, with
   full jitter. Retries never happen after bytes have reached the client.
+- **Clear failures.** On failure the client gets a structured error stating the attempt
+  count and whether it was a **provider** or **gateway** fault, plus `X-AGL-*` response
+  headers. The attempt count and failure reason are recorded in the log.
 - **Transparent proxying.** Plain JSON and `text/event-stream` are streamed through
   unchanged, flushed per chunk.
-- **Best-effort metering.** Model, input/output/cache-read/cache-write tokens, TTFT, total
-  duration, status, and computed cost are logged for every request — extracted from OpenAI
-  Chat/Responses and Anthropic Messages payloads (streaming or not) without coupling to any
-  endpoint.
+- **Best-effort metering.** Model, mapped model, attempts, input/output/cache-read/cache-write
+  tokens, TTFT, total duration, status, error, and computed cost are logged for every
+  request — extracted from OpenAI Chat/Responses and Anthropic Messages payloads (streaming
+  or not) without coupling to any endpoint.
 - **Cost computation.** Per-model token pricing in the config yields a dollar cost per
   request and aggregate stats.
 - **One master key** authenticates the admin API and the web portal.
 - **Web portal** for managing keys and inspecting logs/stats.
+- **Deleting a key cascades** to its logs, reclaiming database space.
 - **Pure Go.** Builds with `go build` — no cgo, no external services (SQLite via
   `modernc.org/sqlite`).
 
@@ -68,9 +74,11 @@ defaults:
   retry: { max_retries: 3, base_delay: 200ms, max_delay: 10s }
 providers:
   - name: openai
-    base_url: http://copilot-api:4141
-    api_key: dummy            # injected as the upstream Authorization bearer token
-    headers: {}               # optional extra upstream headers
+    base_url: https://api.openai.com
+    api_key: sk-…            # injected as the upstream Authorization bearer token
+    headers: {}              # optional extra upstream headers (e.g. anthropic x-api-key)
+    model_map:               # optional: rewrite the request model before forwarding
+      gpt-fast: gpt-5-mini
     retry: { max_retries: 5 } # optional per-provider override
 pricing:
   - model: gpt-5.4
@@ -79,6 +87,22 @@ pricing:
     cache_read_input_token_cost: 2.5e-7
     cache_creation_input_token_cost: 6.25e-6   # Anthropic-style cache writes
 ```
+
+## Failure semantics
+
+When a request cannot be completed the gateway makes the cause explicit:
+
+- **Provider failure** — the upstream was unreachable after every retry, or returned a
+  surviving 429/5xx. The response carries `X-AGL-Error-Source: provider`,
+  `X-AGL-Provider`, and `X-AGL-Attempts`. If no HTTP response was obtained at all, the body
+  is `{"error":{"message":"agl-gateway: upstream provider \"openai\" is unreachable after N
+  attempt(s): …","source":"provider","provider":"openai","attempts":N}}`. Otherwise the
+  upstream's own status and body pass through, annotated with those headers.
+- **Gateway failure** — a missing/invalid key, a key bound to no configured provider, or an
+  internal error. `source` is `gateway` and the message is prefixed `agl-gateway:`.
+
+Successful responses also carry `X-AGL-Provider` and `X-AGL-Attempts`, so a request that
+quietly succeeded only after retries is still visible.
 
 ## HTTP surface
 
