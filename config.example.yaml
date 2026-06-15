@@ -1,0 +1,67 @@
+# agl-gateway example configuration.
+# Copy to config.yaml and edit. Run with: gateway -config config.yaml
+
+server:
+  addr: ":8080"
+
+# The single master key authenticates the /admin API and the web portal.
+# Generate something long and random, e.g. `openssl rand -hex 32`.
+master_key: "mk-change-me-to-a-long-random-secret"
+
+# SQLite database path. WAL files are created alongside it.
+database: "./gateway.db"
+
+# Default retry policy. Each upstream attempt that fails with a network error or an
+# HTTP 429/5xx is retried up to max_retries times, waiting an exponential backoff
+# (base_delay * 2^attempt, capped at max_delay) with full jitter between attempts.
+defaults:
+  retry:
+    max_retries: 3
+    base_delay: 200ms
+    max_delay: 10s
+
+# Upstream providers. An API key is bound to one or more of these by name; each request
+# is routed to a randomly chosen bound provider. The gateway forwards the original request
+# path and body unchanged, replacing the client's Authorization header with the provider's
+# api_key (or the headers below).
+providers:
+  - name: copilot-openai
+    base_url: http://copilot-api:4141
+    api_key: dummy
+    # Optional extra headers added to every upstream request.
+    # headers:
+    #   X-Custom: value
+    # Optional per-provider retry override (unset fields fall back to defaults.retry).
+    retry:
+      max_retries: 5
+
+  - name: copilot-anthropic
+    base_url: http://copilot-api:4141
+    api_key: dummy
+
+# Per-model token pricing, used to compute the cost of each request. Field names mirror the
+# new-api schema. Cached-token rates fall back to input_cost_per_token when omitted.
+pricing:
+  - model: gpt-5.4
+    input_cost_per_token: 2.5e-6
+    output_cost_per_token: 1.5e-5
+    cache_read_input_token_cost: 2.5e-7
+  - model: gpt-5-mini
+    input_cost_per_token: 2.5e-7
+    output_cost_per_token: 2e-6
+    cache_read_input_token_cost: 2.5e-8
+  - model: claude-opus-4-8
+    input_cost_per_token: 5e-6
+    output_cost_per_token: 2.5e-5
+    cache_read_input_token_cost: 5e-7
+    cache_creation_input_token_cost: 6.25e-6
+  - model: claude-sonnet-4-6
+    input_cost_per_token: 3e-6
+    output_cost_per_token: 1.5e-5
+    cache_read_input_token_cost: 3e-7
+    cache_creation_input_token_cost: 3.75e-6
+  - model: claude-haiku-4-5
+    input_cost_per_token: 1e-6
+    output_cost_per_token: 5e-6
+    cache_read_input_token_cost: 1e-7
+    cache_creation_input_token_cost: 1.25e-6
