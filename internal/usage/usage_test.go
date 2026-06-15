@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kiki/agl-gateway/internal/pricing"
+	"github.com/agent-lightning/agl-gateway/internal/pricing"
 )
 
 func TestRequestModel(t *testing.T) {

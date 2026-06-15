@@ -1,7 +1,7 @@
 // Package pricing computes the monetary cost of a request from normalized token usage.
 package pricing
 
-import "github.com/kiki/agl-gateway/internal/config"
+import "github.com/agent-lightning/agl-gateway/internal/config"
 
 // Usage is provider-normalized token usage. All fields are non-overlapping counts so
 // that cost is a simple linear combination:

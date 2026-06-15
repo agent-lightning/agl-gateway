@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/kiki/agl-gateway/internal/config"
+	"github.com/agent-lightning/agl-gateway/internal/config"
 )
 
 func approx(a, b float64) bool { return math.Abs(a-b) < 1e-12 }

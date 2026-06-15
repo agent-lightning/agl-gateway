@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kiki/agl-gateway/internal/config"
-	"github.com/kiki/agl-gateway/internal/keys"
-	"github.com/kiki/agl-gateway/internal/store"
+	"github.com/agent-lightning/agl-gateway/internal/config"
+	"github.com/agent-lightning/agl-gateway/internal/keys"
+	"github.com/agent-lightning/agl-gateway/internal/store"
 )
 
 // Admin is the control-plane HTTP handler set.

@@ -12,13 +12,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kiki/agl-gateway/internal/admin"
-	"github.com/kiki/agl-gateway/internal/config"
-	"github.com/kiki/agl-gateway/internal/portal"
-	"github.com/kiki/agl-gateway/internal/pricing"
-	"github.com/kiki/agl-gateway/internal/proxy"
-	"github.com/kiki/agl-gateway/internal/server"
-	"github.com/kiki/agl-gateway/internal/store"
+	"github.com/agent-lightning/agl-gateway/internal/admin"
+	"github.com/agent-lightning/agl-gateway/internal/config"
+	"github.com/agent-lightning/agl-gateway/internal/portal"
+	"github.com/agent-lightning/agl-gateway/internal/pricing"
+	"github.com/agent-lightning/agl-gateway/internal/proxy"
+	"github.com/agent-lightning/agl-gateway/internal/server"
+	"github.com/agent-lightning/agl-gateway/internal/store"
 )
 
 func main() {

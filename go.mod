@@ -1,4 +1,4 @@
-module github.com/kiki/agl-gateway
+module github.com/agent-lightning/agl-gateway
 
 go 1.25.0
 

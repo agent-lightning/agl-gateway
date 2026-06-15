@@ -17,11 +17,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kiki/agl-gateway/internal/config"
-	"github.com/kiki/agl-gateway/internal/keys"
-	"github.com/kiki/agl-gateway/internal/pricing"
-	"github.com/kiki/agl-gateway/internal/store"
-	"github.com/kiki/agl-gateway/internal/usage"
+	"github.com/agent-lightning/agl-gateway/internal/config"
+	"github.com/agent-lightning/agl-gateway/internal/keys"
+	"github.com/agent-lightning/agl-gateway/internal/pricing"
+	"github.com/agent-lightning/agl-gateway/internal/store"
+	"github.com/agent-lightning/agl-gateway/internal/usage"
 )
 
 // Response headers the gateway adds so clients can see how a request was handled.

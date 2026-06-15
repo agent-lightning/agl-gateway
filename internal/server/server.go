@@ -6,8 +6,8 @@ package server
 import (
 	"net/http"
 
-	"github.com/kiki/agl-gateway/internal/admin"
-	"github.com/kiki/agl-gateway/internal/proxy"
+	"github.com/agent-lightning/agl-gateway/internal/admin"
+	"github.com/agent-lightning/agl-gateway/internal/proxy"
 )
 
 // New returns the top-level HTTP handler. portal may be nil to disable the web portal.

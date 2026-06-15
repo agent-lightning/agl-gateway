@@ -8,7 +8,7 @@ import (
 	"bytes"
 	"encoding/json"
 
-	"github.com/kiki/agl-gateway/internal/pricing"
+	"github.com/agent-lightning/agl-gateway/internal/pricing"
 )
 
 // MaxBufferBytes caps how much of a non-streaming response body is retained for parsing.
