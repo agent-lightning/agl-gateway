@@ -378,7 +378,9 @@ func TestProviderFailureErrorIsClear(t *testing.T) {
 
 func TestUpstreamErrorMarkedProviderSource(t *testing.T) {
 	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadGateway)
+		io.WriteString(w, `{"error":{"message":"upstream exploded","type":"server_error"}}`)
 	})
 	p, st, key := harness(t, up)
 	rec := do(t, p, key, "/v1/x", `{"model":"gpt-5.4"}`)
@@ -388,8 +390,36 @@ func TestUpstreamErrorMarkedProviderSource(t *testing.T) {
 	if rec.Header().Get(headerErrorSource) != sourceProvider {
 		t.Errorf("error source = %q, want provider", rec.Header().Get(headerErrorSource))
 	}
+	// The upstream's own error body must be recorded, not just the generic summary.
 	logs, _ := st.QueryLogs(store.LogFilter{})
-	if len(logs) != 1 || logs[0].Error == "" {
-		t.Errorf("expected logged error reason, got %+v", logs)
+	if len(logs) != 1 {
+		t.Fatalf("logs = %d", len(logs))
+	}
+	if !strings.Contains(logs[0].Error, "upstream exploded") {
+		t.Errorf("logged error missing upstream body: %q", logs[0].Error)
+	}
+	if !strings.Contains(logs[0].Error, "HTTP 502") {
+		t.Errorf("logged error missing status summary: %q", logs[0].Error)
+	}
+}
+
+func TestUpstream4xxBodyCaptured(t *testing.T) {
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"error":{"message":"model `+"`gpt-5.5`"+` is not supported","code":"model_not_found"}}`)
+	})
+	p, st, key := harness(t, up)
+	rec := do(t, p, key, "/v1/chat/completions", `{"model":"gpt-5.5"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	// Client still receives the upstream body verbatim.
+	if !strings.Contains(rec.Body.String(), "model_not_found") {
+		t.Errorf("client body = %q", rec.Body.String())
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if !strings.Contains(logs[0].Error, "model_not_found") {
+		t.Errorf("logged error missing upstream reason: %q", logs[0].Error)
 	}
 }

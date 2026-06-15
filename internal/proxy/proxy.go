@@ -37,6 +37,10 @@ const (
 	sourceProvider = "provider"
 )
 
+// maxErrorBodyCapture bounds how much of an upstream error response body is copied into the
+// request log. Provider error payloads (e.g. an OpenAI invalid_request_error JSON) are small.
+const maxErrorBodyCapture = 2048
+
 // hopByHop headers are connection-specific and must not be forwarded.
 var hopByHop = map[string]bool{
 	"Connection":          true,
@@ -233,14 +237,15 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 		w.Header().Set(headerErrorSource, sourceProvider)
 	}
-	if resp.StatusCode >= 400 {
-		logRow.Error = fmt.Sprintf("upstream provider %q returned HTTP %d after %d attempt(s)",
-			prov.Name, resp.StatusCode, attempts)
-	}
+	isErr := resp.StatusCode >= 400
 	w.WriteHeader(resp.StatusCode)
 
 	acc := usage.NewAccumulator(streaming)
-	ttft, gotByte := streamBody(w, resp.Body, acc, start)
+	captureLimit := 0
+	if isErr {
+		captureLimit = maxErrorBodyCapture // keep a snippet of the error body for the log
+	}
+	ttft, gotByte, head := streamBody(w, resp.Body, acc, start, captureLimit)
 
 	u, _ := acc.Finalize()
 	// Price by the requested model (the alias the client asked for); only fall back to the
@@ -252,6 +257,14 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 
 	logRow.StatusCode = resp.StatusCode
 	logRow.Streaming = streaming
+	if isErr {
+		msg := fmt.Sprintf("upstream provider %q returned HTTP %d after %d attempt(s)",
+			prov.Name, resp.StatusCode, attempts)
+		if snippet := strings.Join(strings.Fields(string(head)), " "); snippet != "" {
+			msg += ": " + snippet
+		}
+		logRow.Error = msg
+	}
 	if gotByte {
 		logRow.TTFTMillis = ttft.Milliseconds()
 	}
@@ -271,8 +284,10 @@ func (p *Proxy) save(row *store.RequestLog) {
 }
 
 // streamBody copies upstream->client, flushing each chunk (for SSE liveness), tees bytes
-// into the usage accumulator, and reports time-to-first-byte measured from reqStart.
-func streamBody(w http.ResponseWriter, body io.Reader, acc *usage.Accumulator, reqStart time.Time) (ttft time.Duration, gotByte bool) {
+// into the usage accumulator, and reports time-to-first-byte measured from reqStart. When
+// captureLimit > 0 it also returns up to that many leading bytes of the body (used to log
+// the upstream's error payload).
+func streamBody(w http.ResponseWriter, body io.Reader, acc *usage.Accumulator, reqStart time.Time, captureLimit int) (ttft time.Duration, gotByte bool, head []byte) {
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {
@@ -283,15 +298,22 @@ func streamBody(w http.ResponseWriter, body io.Reader, acc *usage.Accumulator, r
 				gotByte = true
 			}
 			_, _ = acc.Write(buf[:n])
+			if captureLimit > 0 && len(head) < captureLimit {
+				room := captureLimit - len(head)
+				if room > n {
+					room = n
+				}
+				head = append(head, buf[:room]...)
+			}
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				return ttft, gotByte
+				return ttft, gotByte, head
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
 		}
 		if err != nil {
-			return ttft, gotByte
+			return ttft, gotByte, head
 		}
 	}
 }
