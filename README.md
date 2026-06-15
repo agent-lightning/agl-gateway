@@ -133,8 +133,10 @@ cache-write — so cost is a simple linear combination of per-token rates. OpenA
 cached tokens *within* the prompt/input total (the gateway subtracts them out); Anthropic
 counts cache reads/creations separately (kept as-is). For SSE, usage fields are combined
 across events by maximum, so Anthropic's split `message_start` (input/cache) and
-`message_delta` (output) events reassemble correctly. Models without configured pricing are
-still logged, at zero cost.
+`message_delta` (output) events reassemble correctly. When `model_map` is in effect, cost is
+priced by the **requested** model (the alias), falling back to the mapped upstream model only
+when the alias has no configured price. Models without configured pricing are still logged,
+at zero cost.
 
 ## Development
 

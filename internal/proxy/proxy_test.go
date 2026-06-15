@@ -266,9 +266,41 @@ func TestModelMappingRewritesAndLogs(t *testing.T) {
 	if len(logs) != 1 || logs[0].Model != "alias" || logs[0].MappedModel != "gpt-5.4" {
 		t.Fatalf("log model/mapped = %+v", logs[0])
 	}
-	// Priced by the mapped (effective) model.
+	// Requested "alias" is unpriced here, so cost falls back to the mapped model's price.
 	if logs[0].Cost == 0 {
-		t.Error("expected non-zero cost via mapped-model pricing")
+		t.Error("expected non-zero cost via mapped-model fallback pricing")
+	}
+}
+
+func TestPricingPrefersRequestedAlias(t *testing.T) {
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1000,"completion_tokens":0}}`)
+	})
+	srv := httptest.NewServer(up)
+	t.Cleanup(srv.Close)
+	st, _ := store.Open(":memory:")
+	t.Cleanup(func() { st.Close() })
+	// Both the requested alias and the mapped model are priced, at different rates.
+	prices := pricing.New([]config.ModelPricing{
+		{Model: "alias", InputCostPerToken: 1e-6},
+		{Model: "gpt-5.4", InputCostPerToken: 9e-6},
+	})
+	cfg := &config.Config{
+		MasterKey: "mk",
+		Defaults:  config.Defaults{Retry: config.Retry{MaxRetries: 0}},
+		Providers: []config.Provider{{Name: "up", BaseURL: srv.URL, APIKey: "x",
+			ModelMap: map[string]string{"alias": "gpt-5.4"}}},
+	}
+	p := New(cfg, st, prices, srv.Client(), nil)
+	plain, display, _ := keys.Generate()
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"up"})
+
+	do(t, p, plain, "/v1/x", `{"model":"alias","messages":[]}`)
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	// 1000 input tokens billed at the alias rate (1e-6), not the mapped rate (9e-6).
+	if want := 1000 * 1e-6; logs[0].Cost < want-1e-12 || logs[0].Cost > want+1e-12 {
+		t.Errorf("cost = %v, want %v (requested-alias rate)", logs[0].Cost, want)
 	}
 }
 

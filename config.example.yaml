@@ -77,10 +77,6 @@ pricing:
     input_cost_per_token: 5e-6
     output_cost_per_token: 3e-5
     cache_read_input_token_cost: 5e-7
-  - model: mai-code-1-flash
-    input_cost_per_token: 7.5e-7
-    output_cost_per_token: 4.5e-6
-    cache_read_input_token_cost: 7.5e-8
 
   # --- Anthropic / Claude family (cache_creation = 5-minute cache write rate) ---
   - model: claude-opus-4-8

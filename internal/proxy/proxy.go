@@ -243,9 +243,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	ttft, gotByte := streamBody(w, resp.Body, acc, start)
 
 	u, _ := acc.Finalize()
-	u.Model = effectiveModel
-	if !p.prices.Has(effectiveModel) && p.prices.Has(model) {
-		u.Model = model // fall back to the requested model's price if the mapped one is unpriced
+	// Price by the requested model (the alias the client asked for); only fall back to the
+	// mapped upstream model when the requested one has no configured price.
+	u.Model = model
+	if !p.prices.Has(model) && p.prices.Has(effectiveModel) {
+		u.Model = effectiveModel
 	}
 
 	logRow.StatusCode = resp.StatusCode

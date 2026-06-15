@@ -61,8 +61,9 @@ Packages:
   configured provider headers) are rewritten. Hop-by-hop headers are stripped both ways.
 - **Model mapping is best-effort and provider-scoped.** `provider.model_map` rewrites only
   the top-level `model` field (via `usage.SetModel`, which preserves every other field
-  byte-for-byte); the original and mapped model are both logged, and cost prefers the mapped
-  (effective) model, falling back to the requested one.
+  byte-for-byte); the original and mapped model are both logged, and cost is priced by the
+  requested model (the alias), falling back to the mapped upstream model only when the
+  requested one is unpriced.
 - **Failures are classified.** Every failure tells the client whether it was a `provider` or
   `gateway` fault, with the attempt count, via both the JSON body and `X-AGL-*` headers.
   Provider responses (incl. surviving 4xx/5xx) pass through; only gateway-side problems are
