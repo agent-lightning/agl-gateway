@@ -1,0 +1,305 @@
+// Package proxy implements the gateway's data plane: it authenticates an inbound API key,
+// routes the request to one of the key's bound providers, retries failed upstream attempts
+// with exponential backoff + jitter, transparently streams the response (SSE or plain),
+// and records best-effort request metadata and cost.
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"math/rand/v2"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/kiki/agl-gateway/internal/config"
+	"github.com/kiki/agl-gateway/internal/keys"
+	"github.com/kiki/agl-gateway/internal/pricing"
+	"github.com/kiki/agl-gateway/internal/store"
+	"github.com/kiki/agl-gateway/internal/usage"
+)
+
+// hopByHop headers are connection-specific and must not be forwarded.
+var hopByHop = map[string]bool{
+	"Connection":          true,
+	"Keep-Alive":          true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
+}
+
+// Proxy is the routing/forwarding handler.
+type Proxy struct {
+	cfg    *config.Config
+	store  *store.Store
+	prices *pricing.Table
+	client *http.Client
+	logger *slog.Logger
+}
+
+// New constructs a Proxy. A nil client uses a sensible default; a nil logger discards logs.
+func New(cfg *config.Config, st *store.Store, prices *pricing.Table, client *http.Client, logger *slog.Logger) *Proxy {
+	if client == nil {
+		client = &http.Client{Transport: http.DefaultTransport}
+	}
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
+	return &Proxy{cfg: cfg, store: st, prices: prices, client: client, logger: logger}
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"message": msg}})
+}
+
+// ServeHTTP authenticates, routes, forwards, and logs a single request.
+func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
+	presented := presentedKey(r)
+	if presented == "" {
+		writeError(w, http.StatusUnauthorized, "missing API key")
+		return
+	}
+	key, err := p.store.KeyByHash(keys.Hash(presented))
+	if err != nil {
+		p.logger.Error("key lookup failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if key == nil || key.Disabled {
+		writeError(w, http.StatusUnauthorized, "invalid API key")
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "could not read request body")
+		return
+	}
+	model := usage.RequestModel(body)
+
+	prov := p.pickProvider(key)
+	if prov == nil {
+		p.logger.Error("key bound to no valid provider", "key_id", key.ID, "providers", key.Providers)
+		writeError(w, http.StatusBadGateway, "no upstream provider available for this key")
+		return
+	}
+
+	p.forward(w, r, body, key, prov, model, start)
+}
+
+// pickProvider chooses a random provider, among those bound to the key, that still exists
+// in the configuration.
+func (p *Proxy) pickProvider(key *store.APIKey) *config.Provider {
+	valid := make([]*config.Provider, 0, len(key.Providers))
+	for _, name := range key.Providers {
+		if cp := p.cfg.Provider(name); cp != nil {
+			valid = append(valid, cp)
+		}
+	}
+	if len(valid) == 0 {
+		return nil
+	}
+	return valid[rand.IntN(len(valid))]
+}
+
+// forward runs the retry loop and streams the final response.
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key *store.APIKey, prov *config.Provider, model string, start time.Time) {
+	retry := prov.ResolvedRetry(p.cfg.Defaults.Retry)
+	target := strings.TrimRight(prov.BaseURL, "/") + r.URL.Path
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+
+	logRow := &store.RequestLog{
+		APIKeyID: key.ID, KeyName: key.Name, Provider: prov.Name, Model: model,
+	}
+
+	var resp *http.Response
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
+		if err != nil {
+			lastErr = err
+			break
+		}
+		copyRequestHeaders(req, r, prov)
+
+		resp, err = p.client.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt < retry.MaxRetries && r.Context().Err() == nil {
+				if !sleepBackoff(r.Context(), retry, attempt) {
+					lastErr = r.Context().Err()
+					break
+				}
+				continue
+			}
+			break
+		}
+		if isRetryable(resp.StatusCode) && attempt < retry.MaxRetries {
+			drain(resp)
+			if !sleepBackoff(r.Context(), retry, attempt) {
+				lastErr = r.Context().Err()
+				resp = nil
+				break
+			}
+			continue
+		}
+		lastErr = nil
+		break
+	}
+
+	if resp == nil {
+		msg := "upstream request failed"
+		if lastErr != nil {
+			msg = lastErr.Error()
+		}
+		logRow.StatusCode = http.StatusBadGateway
+		logRow.Error = msg
+		logRow.DurationMillis = time.Since(start).Milliseconds()
+		p.save(logRow)
+		writeError(w, http.StatusBadGateway, msg)
+		return
+	}
+	defer resp.Body.Close()
+
+	streaming := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+	copyResponseHeaders(w, resp)
+	w.WriteHeader(resp.StatusCode)
+
+	acc := usage.NewAccumulator(streaming)
+	ttft, gotByte := streamBody(w, resp.Body, acc, start)
+
+	u, _ := acc.Finalize()
+	u.Model = model
+
+	logRow.StatusCode = resp.StatusCode
+	logRow.Streaming = streaming
+	if gotByte {
+		logRow.TTFTMillis = ttft.Milliseconds()
+	}
+	logRow.DurationMillis = time.Since(start).Milliseconds()
+	logRow.InputTokens = u.InputTokens
+	logRow.OutputTokens = u.OutputTokens
+	logRow.CacheReadTokens = u.CacheReadTokens
+	logRow.CacheWriteTokens = u.CacheWriteTokens
+	logRow.Cost = p.prices.Cost(u)
+	p.save(logRow)
+}
+
+func (p *Proxy) save(row *store.RequestLog) {
+	if err := p.store.InsertLog(row); err != nil {
+		p.logger.Error("failed to write request log", "err", err)
+	}
+}
+
+// streamBody copies upstream->client, flushing each chunk (for SSE liveness), tees bytes
+// into the usage accumulator, and reports time-to-first-byte measured from reqStart.
+func streamBody(w http.ResponseWriter, body io.Reader, acc *usage.Accumulator, reqStart time.Time) (ttft time.Duration, gotByte bool) {
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := body.Read(buf)
+		if n > 0 {
+			if !gotByte {
+				ttft = time.Since(reqStart)
+				gotByte = true
+			}
+			_, _ = acc.Write(buf[:n])
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return ttft, gotByte
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			return ttft, gotByte
+		}
+	}
+}
+
+func presentedKey(r *http.Request) string {
+	if h := r.Header.Get("Authorization"); h != "" {
+		return strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
+	}
+	if h := r.Header.Get("X-Api-Key"); h != "" {
+		return strings.TrimSpace(h)
+	}
+	return ""
+}
+
+func copyRequestHeaders(req *http.Request, src *http.Request, prov *config.Provider) {
+	for k, vv := range src.Header {
+		if hopByHop[http.CanonicalHeaderKey(k)] || http.CanonicalHeaderKey(k) == "Authorization" {
+			continue
+		}
+		for _, v := range vv {
+			req.Header.Add(k, v)
+		}
+	}
+	if prov.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+prov.APIKey)
+	} else {
+		req.Header.Del("Authorization")
+	}
+	for k, v := range prov.Headers {
+		req.Header.Set(k, v)
+	}
+}
+
+func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
+	for k, vv := range resp.Header {
+		if hopByHop[http.CanonicalHeaderKey(k)] {
+			continue
+		}
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+}
+
+func isRetryable(status int) bool {
+	return status == http.StatusTooManyRequests || status >= 500
+}
+
+// sleepBackoff waits for an exponential backoff with full jitter. It returns false if the
+// context is cancelled during the wait.
+func sleepBackoff(ctx context.Context, r config.Retry, attempt int) bool {
+	d := r.BaseDelay
+	for i := 0; i < attempt; i++ {
+		d *= 2
+		if d >= r.MaxDelay {
+			d = r.MaxDelay
+			break
+		}
+	}
+	if d <= 0 {
+		d = r.BaseDelay
+	}
+	// Full jitter: sleep a random duration in [0, d].
+	wait := time.Duration(rand.Int64N(int64(d) + 1))
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+func drain(resp *http.Response) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	resp.Body.Close()
+}
