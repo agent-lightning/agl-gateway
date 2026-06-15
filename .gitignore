@@ -1,0 +1,6 @@
+# agl-gateway
+*.db
+*.db-shm
+*.db-wal
+/gateway
+/dist
