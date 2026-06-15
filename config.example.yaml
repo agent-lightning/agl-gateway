@@ -24,6 +24,13 @@ defaults:
 # is routed to a randomly chosen bound provider. The gateway forwards the original request
 # path and body unchanged, replacing the client's Authorization header with the provider's
 # api_key (or the headers below).
+#
+# IMPORTANT: base_url must be the bare origin (scheme + host + optional port) WITHOUT a
+# path. The gateway appends the client's full request path verbatim, so the "/v1" comes
+# from the client (e.g. /v1/chat/completions, /v1/messages). Include it here and you get a
+# doubled path:
+#   base_url: https://api.openai.com      + /v1/chat/completions -> .../v1/chat/completions  (correct)
+#   base_url: https://api.openai.com/v1   + /v1/chat/completions -> .../v1/v1/chat/completions (wrong)
 providers:
   - name: openai
     base_url: https://api.openai.com
