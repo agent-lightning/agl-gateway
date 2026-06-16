@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1
 
 # ---- build ----
-# golang:1.25-trixie is the latest Go on the latest Debian (13 "trixie"). The only
+# golang:1.26-trixie is the latest Go on the latest Debian (13 "trixie"). The only
 # third-party deps are pure Go (modernc.org/sqlite, gopkg.in/yaml.v3), so CGO stays
 # off and the result is a fully static binary.
-FROM golang:1.25-trixie AS build
+FROM golang:1.26-trixie AS build
 WORKDIR /src
 
 # Download modules first so they cache across source-only changes.
