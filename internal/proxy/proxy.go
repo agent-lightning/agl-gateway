@@ -82,6 +82,33 @@ func New(cfg *config.Config, st *store.Store, prices *pricing.Table, client *htt
 
 // gatewayError writes a structured JSON error and the X-AGL-* headers describing whether
 // the failure was the gateway's or an upstream provider's, and how many attempts were made.
+// errorType maps an HTTP status to an error-type string that is valid in both the OpenAI
+// (/v1/responses, /v1/chat/completions) and Anthropic (/v1/messages) error vocabularies, so
+// typed SDK clients can deserialize a gateway-synthesized error without crashing.
+func errorType(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "invalid_request_error"
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusRequestTimeout:
+		return "timeout_error"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	default:
+		return "api_error"
+	}
+}
+
+// gatewayError writes a gateway-synthesized JSON error. The body is shaped to satisfy both
+// the OpenAI and Anthropic error schemas at once: a top-level `type:"error"` and an inner
+// `error` object carrying `type` + `message` (the fields both SDKs read). The gateway's own
+// diagnostics (source, attempts, provider) ride along on the inner object and the X-AGL-*
+// headers; unknown fields are ignored by both SDKs.
 func gatewayError(w http.ResponseWriter, status int, source, provider, msg string, attempts int) {
 	w.Header().Set("Content-Type", "application/json")
 	if provider != "" {
@@ -92,11 +119,16 @@ func gatewayError(w http.ResponseWriter, status int, source, provider, msg strin
 	}
 	w.Header().Set(headerErrorSource, source)
 	w.WriteHeader(status)
-	body := map[string]any{"message": msg, "source": source, "attempts": attempts}
-	if provider != "" {
-		body["provider"] = provider
+	errObj := map[string]any{
+		"type":     errorType(status),
+		"message":  msg,
+		"source":   source,
+		"attempts": attempts,
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"error": body})
+	if provider != "" {
+		errObj["provider"] = provider
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": errObj})
 }
 
 // ServeHTTP authenticates, routes, forwards, and logs a single request.
@@ -216,7 +248,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 			}
 			break
 		}
-		if isRetryable(resp.StatusCode) && attempt < retry.MaxRetries {
+		if retryable(resp) && attempt < retry.MaxRetries {
 			drain(resp)
 			if !sleepBackoff(r.Context(), retry, attempt) {
 				lastErr = r.Context().Err()
@@ -257,7 +289,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	w.Header().Set(headerAttempts, strconv.Itoa(attempts))
 	// An upstream error status that survived retries is reported as a provider failure so
 	// the client can distinguish it from a gateway problem.
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+	if retryableStatus(resp.StatusCode) {
 		w.Header().Set(headerErrorSource, sourceProvider)
 	}
 	isErr := resp.StatusCode >= 400
@@ -384,8 +416,39 @@ func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
 	}
 }
 
-func isRetryable(status int) bool {
-	return status == http.StatusTooManyRequests || status >= 500
+// litellmTagBugMarker is a substring of a known LiteLLM bug: it intermittently rejects a
+// valid request with a spurious 401 about the model's tag configuration (e.g. "Not allowed
+// to access model due to tags configuration. Passed model=… and tags=[…]"). The request
+// succeeds on retry, so we treat that specific 401 as transient.
+const litellmTagBugMarker = "due to tags configuration"
+
+// retryableStatus reports whether a status code is transient and worth retrying on its own:
+// request timeout (408), rate limit (429), and any 5xx. These are also the statuses reported
+// to the client as a provider-side failure when they survive the retry loop.
+func retryableStatus(status int) bool {
+	return status == http.StatusRequestTimeout ||
+		status == http.StatusTooManyRequests ||
+		status >= 500
+}
+
+// retryable reports whether an upstream response should be retried. 408, 429 and 5xx always
+// are. A 401 is retried only when its body matches the known LiteLLM tag-config bug above.
+// Detecting that requires reading the body, so the consumed bytes are restored to resp.Body
+// (via a MultiReader) for the pass-through path when we decide not to retry.
+func retryable(resp *http.Response) bool {
+	if retryableStatus(resp.StatusCode) {
+		return true
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		return false
+	}
+	orig := resp.Body
+	head, _ := io.ReadAll(io.LimitReader(orig, maxErrorBodyCapture))
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(head), orig), orig}
+	return bytes.Contains(head, []byte(litellmTagBugMarker))
 }
 
 // sleepBackoff waits for an exponential backoff with full jitter. It returns false if the

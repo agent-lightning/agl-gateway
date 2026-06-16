@@ -175,6 +175,125 @@ func TestRetryExhaustedReturnsUpstreamError(t *testing.T) {
 	}
 }
 
+// A LiteLLM tag-config 401 is a known transient bug: retry it, and a later success passes
+// through normally.
+func TestRetryOnLiteLLMTagBug401(t *testing.T) {
+	var calls atomic.Int32
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			io.WriteString(w, `{"error":{"message":"Not allowed to access model due to tags configuration. Passed model=gpt-5.4-mini and tags=['gcr']"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true}`)
+	})
+	p, st, key := harness(t, up)
+
+	rec := do(t, p, key, "/v1/x", `{"model":"gpt-5.4"}`)
+	if got := calls.Load(); got != 2 {
+		t.Errorf("upstream calls = %d, want 2 (one retry)", got)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 || logs[0].StatusCode != http.StatusOK || logs[0].Attempts != 2 {
+		t.Errorf("expected one 200 log with 2 attempts, got %+v", logs)
+	}
+}
+
+// An unrelated 401 must NOT be retried, and its body must pass through unchanged.
+func TestNoRetryOnGeneric401(t *testing.T) {
+	var calls atomic.Int32
+	const body = `{"error":{"message":"invalid api key"}}`
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusUnauthorized)
+		io.WriteString(w, body)
+	})
+	p, st, key := harness(t, up)
+
+	rec := do(t, p, key, "/v1/x", `{"model":"gpt-5.4"}`)
+	if got := calls.Load(); got != 1 {
+		t.Errorf("upstream calls = %d, want 1 (no retry)", got)
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", rec.Code)
+	}
+	if rec.Body.String() != body {
+		t.Errorf("body = %q, want %q (must pass through unchanged)", rec.Body.String(), body)
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 || logs[0].StatusCode != http.StatusUnauthorized || logs[0].Attempts != 1 {
+		t.Errorf("expected one 401 log with 1 attempt, got %+v", logs)
+	}
+}
+
+// A 408 from the upstream is transient and must be retried like 429/5xx.
+func TestRetryOn408(t *testing.T) {
+	var calls atomic.Int32
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusRequestTimeout)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true}`)
+	})
+	p, st, key := harness(t, up)
+
+	rec := do(t, p, key, "/v1/x", `{"model":"gpt-5.4"}`)
+	if got := calls.Load(); got != 2 {
+		t.Errorf("upstream calls = %d, want 2 (one retry)", got)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 || logs[0].StatusCode != http.StatusOK || logs[0].Attempts != 2 {
+		t.Errorf("expected one 200 log with 2 attempts, got %+v", logs)
+	}
+}
+
+// Gateway-synthesized errors must carry a schema that both the OpenAI (/v1/responses) and
+// Anthropic (/v1/messages) SDKs can deserialize: top-level type:"error" plus error.type and
+// error.message, while keeping our diagnostics.
+func TestGatewayErrorSchema(t *testing.T) {
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+	p, _, _ := harness(t, up)
+
+	// Invalid key -> gateway-synthesized 401, never reaching the upstream.
+	rec := do(t, p, "sk-gw-bogus", "/v1/messages", `{"model":"claude-x"}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	var body struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type     string `json:"type"`
+			Message  string `json:"message"`
+			Source   string `json:"source"`
+			Attempts int    `json:"attempts"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("error body is not JSON: %v", err)
+	}
+	if body.Type != "error" {
+		t.Errorf("top-level type = %q, want \"error\" (Anthropic schema)", body.Type)
+	}
+	if body.Error.Type != "authentication_error" {
+		t.Errorf("error.type = %q, want authentication_error", body.Error.Type)
+	}
+	if body.Error.Message == "" {
+		t.Errorf("error.message is empty")
+	}
+	if body.Error.Source != sourceGateway {
+		t.Errorf("error.source = %q, want gateway", body.Error.Source)
+	}
+}
+
 func TestNetworkErrorReturns502(t *testing.T) {
 	st, _ := store.Open(":memory:")
 	t.Cleanup(func() { st.Close() })

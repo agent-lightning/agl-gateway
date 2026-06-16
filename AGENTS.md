@@ -29,7 +29,7 @@ OpenAI-compatible `/v1/models` to list models. The data plane stays endpoint-agn
 
 ```
 client ──► proxy ──┐ auth (sha256 key lookup) ──► pick bound provider (X-AGL-Provider header, else random)
-                   ├─ retry loop (backoff+jitter on net err / 429 / 5xx)
+                   ├─ retry loop (backoff+jitter on net err / 408 / 429 / 5xx / LiteLLM tag-bug 401)
                    └─ stream upstream→client (SSE flushed), tee into usage.Accumulator
                                                   └─► pricing.Cost ─► store.InsertLog
 ```
@@ -79,7 +79,10 @@ Packages:
 ## Conventions
 
 - Plain `net/http` + `http.ServeMux` with Go 1.22 method+wildcard patterns. No router libs.
-- Errors to clients are JSON `{"error":{"message":"…"}}`.
+- Errors to clients are JSON. Gateway-synthesized errors use a shape valid for both the
+  OpenAI and Anthropic SDKs: `{"type":"error","error":{"type":"…","message":"…", …}}` (the
+  inner object also carries `source`/`attempts`/`provider`). Upstream provider errors pass
+  through verbatim.
 - Timestamps stored as unix millis; exposed as RFC3339 in JSON.
 - `gofmt` everything. Match the existing comment density and naming.
 
