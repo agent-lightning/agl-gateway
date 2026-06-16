@@ -168,9 +168,16 @@ func Summarize(ok bool, body []byte) string {
 		} `json:"error"`
 	}
 	if json.Unmarshal(body, &e) == nil && e.Error.Message != "" {
-		return truncate(e.Error.Message, 80)
+		return collapse(e.Error.Message)
 	}
-	return truncate(strings.TrimSpace(string(body)), 80)
+	return collapse(strings.TrimSpace(string(body)))
+}
+
+// collapse squeezes runs of whitespace to single spaces so a detail reads as one tidy line.
+// It does not truncate — callers that render in a fixed width (e.g. the CLI table) clip it
+// themselves, while the portal shows it in full.
+func collapse(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // ParsePatterns splits a comma-separated glob list, trimming blanks.
@@ -214,12 +221,4 @@ func GlobMatch(pattern, s string) bool {
 		s = s[i+len(mid):]
 	}
 	return strings.HasSuffix(s, parts[len(parts)-1])
-}
-
-func truncate(s string, n int) string {
-	s = strings.Join(strings.Fields(s), " ")
-	if len(s) > n {
-		return s[:n-1] + "…"
-	}
-	return s
 }

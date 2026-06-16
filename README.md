@@ -128,7 +128,7 @@ by the gateway and never forwarded upstream.
 | GET    | `/admin/logs`       | `?limit&offset&api_key_id&provider&since` |
 | GET    | `/admin/stats`      | `?api_key_id&since` — aggregates grouped by key + model |
 | GET    | `/admin/providers`  | configured providers + their models (see below) |
-| POST   | `/admin/test`       | run the model test server-side (body: `{provider,exclude,path,max_tokens,concurrency,stream}`, all optional) |
+| POST   | `/admin/test`       | run the model test server-side; streams NDJSON progress events (body: `{provider,exclude,path,max_tokens,concurrency,stream}`, all optional) |
 | GET    | `/healthz`          | liveness (no auth) |
 
 `since` accepts an RFC3339 timestamp, a Go duration window (e.g. `24h`), or unix millis.
@@ -158,10 +158,13 @@ go build -o modelcheck ./cmd/modelcheck
 ```
 
 The same test is available **in the web portal** (the "Test models" tab) and as a control-plane
-endpoint, `POST /admin/test`, which runs it server-side by driving the proxy in-process. The
-per-model logic — endpoint selection, request body, and result interpretation — is shared by
-the CLI and the endpoint via the `internal/probe` package, so both behave identically. Either
-path sends real requests through the gateway, so a test run produces `request_logs` entries.
+endpoint, `POST /admin/test`, which runs it server-side by driving the proxy in-process and
+streams newline-delimited JSON events (`start`, one `result` per probe, `done`) so the portal
+fills in rows live. The per-model logic — endpoint selection, request body, and result
+interpretation — is shared by the CLI and the endpoint via the `internal/probe` package, so
+both behave identically. The probes run under a temporary key that is deleted when the run
+finishes, which cascades away the request logs they produced — so a test run leaves no
+lasting `request_logs` entries.
 
 ## How metering works
 

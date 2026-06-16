@@ -37,6 +37,7 @@
   label.f { display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted); }
   .checks { display:flex; gap:14px; flex-wrap:wrap; }
   .checks label { display:flex; gap:5px; align-items:center; color:var(--fg); }
+  td.wrap { white-space:normal; word-break:break-word; min-width:220px; }
 </style>
 </head>
 <body>
@@ -240,7 +241,7 @@ async function loadLogs(){
       <td class="num">${l.ttft_ms}ms</td><td class="num">${l.duration_ms}ms</td>
       <td class="num">${l.input_tokens}</td><td class="num">${l.output_tokens}</td>
       <td class="num">${l.cache_read_tokens}</td><td class="num">${l.cache_write_tokens}</td>
-      <td class="num">${fmtCost(l.cost)}</td><td class="danger">${esc(l.error)}</td></tr>`).join("")
+      <td class="num">${fmtCost(l.cost)}</td><td class="wrap danger">${esc(l.error)}</td></tr>`).join("")
       || `<tr><td colspan="16" class="muted">no requests logged</td></tr>`;
     setStatus(true);
   }catch(e){ toast(e.message,false); }
@@ -276,6 +277,16 @@ async function loadTestProviders(){
   }catch(e){ toast(e.message,false); }
 }
 
+function testRowHtml(r){
+  return `<tr>
+    <td style="color:${r.ok?'var(--ok)':'var(--danger)'}">${r.ok?"ok":"FAIL"}</td>
+    <td>${esc(r.provider)}</td><td>${esc(r.model)}</td>
+    <td class="muted">${esc(r.endpoint)}</td>
+    <td style="color:${r.status>=200&&r.status<300?'var(--ok)':'var(--danger)'}">${r.status||"—"}</td>
+    <td class="num">${esc(r.attempts||"-")}</td><td class="num">${r.duration_ms}ms</td>
+    <td class="wrap ${r.ok?'muted':'danger'}">${esc(r.detail)}</td></tr>`;
+}
+
 async function runTest(){
   const btn = $("#testrun");
   const body = {
@@ -284,24 +295,53 @@ async function runTest(){
     max_tokens: Number($("#testmaxtokens").value) || 16,
     concurrency: Number($("#testconcurrency").value) || 8,
   };
-  btn.disabled = true; const label = btn.textContent; btn.textContent = "Running…";
-  $("#testbody").innerHTML = `<tr><td colspan="8" class="muted">testing models…</td></tr>`;
-  $("#testsummary").textContent = "Running — this sends one request per model and may take a while.";
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = "Running…";
+  const rowsEl = $("#testbody"); rowsEl.innerHTML = "";
+  let total=0, done=0, passed=0, failed=0, skipped=0;
+  const summary = ()=>{ $("#testsummary").innerHTML =
+    `Running… <b>${done}/${total}</b> — <span style="color:var(--ok)">${passed} ok</span>, <span style="color:var(--danger)">${failed} failed</span>${skipped?`, ${skipped} skipped`:""}`; };
+  $("#testsummary").textContent = "Discovering models…";
+
   try{
-    const res = await api("POST","/admin/test",body);
-    const rows = (res.results||[]).map(r=>`<tr>
-      <td style="color:${r.ok?'var(--ok)':'var(--danger)'}">${r.ok?"ok":"FAIL"}</td>
-      <td>${esc(r.provider)}</td><td>${esc(r.model)}</td>
-      <td class="muted">${esc(r.endpoint)}</td>
-      <td style="color:${r.status>=200&&r.status<300?'var(--ok)':'var(--danger)'}">${r.status||"—"}</td>
-      <td class="num">${esc(r.attempts||"-")}</td><td class="num">${r.duration_ms}ms</td>
-      <td class="${r.ok?'muted':'danger'}">${esc(r.detail)}</td></tr>`).join("");
-    $("#testbody").innerHTML = rows || `<tr><td colspan="8" class="muted">no models tested</td></tr>`;
-    const skipped = res.skipped ? `, ${res.skipped} skipped` : "";
-    $("#testsummary").innerHTML = `<b style="color:${res.failed?'var(--danger)':'var(--ok)'}">${res.passed} passed, ${res.failed} failed</b>${skipped}.`;
+    // Stream newline-delimited JSON events so rows appear as each probe completes.
+    const r = await fetch("/admin/test", { method:"POST",
+      headers:{ "Authorization":"Bearer "+MASTER, "Content-Type":"application/json" },
+      body: JSON.stringify(body) });
+    if(r.status===401){ setStatus(false); throw new Error("unauthorized — check master key"); }
+    if(!r.ok){ let m="request failed"; try{ m=(await r.json()).error.message; }catch{} throw new Error(m); }
+
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for(;;){
+      const { value, done:streamDone } = await reader.read();
+      if(streamDone) break;
+      buf += dec.decode(value, { stream:true });
+      let nl;
+      while((nl = buf.indexOf("\n")) >= 0){
+        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl+1);
+        if(!line) continue;
+        const ev = JSON.parse(line);
+        if(ev.type==="start"){
+          total = ev.total||0; skipped = ev.skipped||0;
+          if(total===0) rowsEl.innerHTML = `<tr><td colspan="8" class="muted">no models to test${skipped?` (${skipped} excluded)`:""}</td></tr>`;
+          summary();
+        } else if(ev.type==="result"){
+          const x = ev.result; done++; x.ok ? passed++ : failed++;
+          rowsEl.insertAdjacentHTML("beforeend", testRowHtml(x));
+          summary();
+        } else if(ev.type==="done"){
+          skipped = ev.skipped||skipped;
+          $("#testsummary").innerHTML = `<b style="color:${ev.failed?'var(--danger)':'var(--ok)'}">${ev.passed||0} passed, ${ev.failed||0} failed</b>${skipped?`, ${skipped} skipped`:""}.`;
+        } else if(ev.type==="error"){
+          throw new Error(ev.message||"test failed");
+        }
+      }
+    }
     setStatus(true);
   }catch(e){
-    $("#testbody").innerHTML = `<tr><td colspan="8" class="danger">${esc(e.message)}</td></tr>`;
+    if(!rowsEl.children.length) rowsEl.innerHTML = `<tr><td colspan="8" class="danger">${esc(e.message)}</td></tr>`;
+    $("#testsummary").innerHTML = `<span class="danger">${esc(e.message)}</span>`;
     toast(e.message,false);
   }finally{ btn.disabled = false; btn.textContent = label; }
 }

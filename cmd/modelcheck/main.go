@@ -198,7 +198,16 @@ func printProgress(done, total, counterW, provW, modelW int, r probe.Result) {
 		status = strconv.Itoa(r.Status)
 	}
 	fmt.Printf("[%*d/%d] %s  %-*s  %-*s  %-13s  %3s  %6dms  %s\n",
-		counterW, done, total, mark, provW, r.Provider, modelW, r.Model, r.Endpoint, status, r.DurationMS, r.Detail)
+		counterW, done, total, mark, provW, r.Provider, modelW, r.Model, r.Endpoint, status, r.DurationMS, clip(r.Detail, 100))
+}
+
+// clip shortens a one-line detail for the fixed-width terminal table; the portal shows the
+// full text. (probe.Summarize no longer truncates, so display width is each caller's choice.)
+func clip(s string, n int) string {
+	if len([]rune(s)) > n {
+		return string([]rune(s)[:n-1]) + "…"
+	}
+	return s
 }
 
 // printFailures prints a sorted table of just the failed probes, since streamed lines arrive
@@ -227,7 +236,7 @@ func printFailures(results []probe.Result) {
 		if tries == "" {
 			tries = "-"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\n", r.Provider, r.Model, r.Endpoint, r.Status, tries, r.Detail)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\n", r.Provider, r.Model, r.Endpoint, r.Status, tries, clip(r.Detail, 100))
 	}
 	tw.Flush()
 }

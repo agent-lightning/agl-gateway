@@ -305,7 +305,8 @@ type testRequest struct {
 // provider's models, mints a temporary gateway key bound to them, and probes every model by
 // driving the real data-plane proxy (pinning the provider with X-AGL-Provider) so routing,
 // retry, logging, and metering all behave exactly as a live request would. The temporary key
-// is deleted afterwards. Results are returned as JSON for the portal to render.
+// is deleted afterwards. Results stream back as newline-delimited JSON events (a "start",
+// one "result" per completed probe, then "done") so the portal can show live progress.
 func (a *Admin) test(w http.ResponseWriter, r *http.Request) {
 	if a.dataPlane == nil {
 		writeJSON(w, http.StatusServiceUnavailable, errBody("model testing is unavailable"))
@@ -352,8 +353,21 @@ func (a *Admin) test(w http.ResponseWriter, r *http.Request) {
 			nameSet[p.Name] = true
 		}
 	}
+
+	// From here on we stream NDJSON; any earlier failure is still a normal JSON error.
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	flusher, _ := w.(http.Flusher)
+	enc := json.NewEncoder(w)
+	emit := func(ev testEvent) {
+		_ = enc.Encode(ev) // Encode appends '\n', giving newline-delimited JSON
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	emit(testEvent{Type: "start", Total: len(jobs), Skipped: skipped})
 	if len(jobs) == 0 {
-		writeJSON(w, http.StatusOK, testResponse{Results: []probe.Result{}, Skipped: skipped})
+		emit(testEvent{Type: "done", Skipped: skipped})
 		return
 	}
 
@@ -366,13 +380,13 @@ func (a *Admin) test(w http.ResponseWriter, r *http.Request) {
 	plain, display, err := keys.Generate()
 	if err != nil {
 		a.logger.Error("model-test key generation failed", "err", err)
-		writeJSON(w, http.StatusInternalServerError, errBody("could not generate test key"))
+		emit(testEvent{Type: "error", Message: "could not generate test key"})
 		return
 	}
 	k, err := a.store.CreateKey("modeltest-"+time.Now().UTC().Format("20060102-150405"), keys.Hash(plain), display, names)
 	if err != nil {
 		a.logger.Error("model-test key creation failed", "err", err)
-		writeJSON(w, http.StatusInternalServerError, errBody("could not create test key"))
+		emit(testEvent{Type: "error", Message: "could not create test key"})
 		return
 	}
 	defer func() {
@@ -392,33 +406,32 @@ func (a *Admin) test(w http.ResponseWriter, r *http.Request) {
 		return rec.Code, rec.Header().Get("X-AGL-Attempts"), rec.Body.Bytes(), nil
 	}
 
+	// onResult runs on a single goroutine, so streaming each result needs no locking.
+	passed := 0
 	results := probe.Pool(jobs, req.Concurrency, func(j probe.Job) probe.Result {
 		return probe.Probe(ctx, j, req.Path, req.MaxTokens, req.Stream, send)
-	}, nil)
-
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].Provider != results[j].Provider {
-			return results[i].Provider < results[j].Provider
-		}
-		return results[i].Model < results[j].Model
-	})
-	passed := 0
-	for _, res := range results {
+	}, func(res probe.Result) {
 		if res.OK {
 			passed++
 		}
-	}
-	writeJSON(w, http.StatusOK, testResponse{
-		Results: results, Passed: passed, Failed: len(results) - passed, Skipped: skipped,
+		r := res
+		emit(testEvent{Type: "result", Result: &r})
 	})
+
+	emit(testEvent{Type: "done", Passed: passed, Failed: len(results) - passed, Skipped: skipped})
 }
 
-// testResponse is the JSON returned by POST /admin/test.
-type testResponse struct {
-	Results []probe.Result `json:"results"`
-	Passed  int            `json:"passed"`
-	Failed  int            `json:"failed"`
-	Skipped int            `json:"skipped"`
+// testEvent is one newline-delimited JSON record streamed by POST /admin/test. Type is
+// "start" (Total/Skipped set), "result" (Result set), "done" (Passed/Failed/Skipped set), or
+// "error" (Message set, emitted mid-stream when setup fails after the response has begun).
+type testEvent struct {
+	Type    string        `json:"type"`
+	Total   int           `json:"total,omitempty"`
+	Passed  int           `json:"passed,omitempty"`
+	Failed  int           `json:"failed,omitempty"`
+	Skipped int           `json:"skipped,omitempty"`
+	Result  *probe.Result `json:"result,omitempty"`
+	Message string        `json:"message,omitempty"`
 }
 
 // --- helpers ---

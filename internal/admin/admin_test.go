@@ -232,26 +232,49 @@ func TestModelTestEndpoint(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 	}
-	var resp testResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode: %v", err)
+	if ct := rec.Header().Get("Content-Type"); ct != "application/x-ndjson" {
+		t.Errorf("content-type = %q, want application/x-ndjson", ct)
 	}
-	if resp.Skipped != 1 || resp.Passed != 2 || resp.Failed != 0 || len(resp.Results) != 2 {
-		t.Fatalf("summary = %+v", resp)
+
+	// Parse the newline-delimited event stream.
+	var start, done *testEvent
+	results := map[string]probe.Result{}
+	for _, line := range strings.Split(strings.TrimSpace(rec.Body.String()), "\n") {
+		var ev testEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("decode event %q: %v", line, err)
+		}
+		switch ev.Type {
+		case "start":
+			e := ev
+			start = &e
+		case "result":
+			results[ev.Result.Model] = *ev.Result
+		case "done":
+			e := ev
+			done = &e
+		default:
+			t.Errorf("unexpected event type %q", ev.Type)
+		}
 	}
-	// Results sorted by (provider, model); endpoints chosen per model.
-	byModel := map[string]probe.Result{}
-	for _, r := range resp.Results {
-		byModel[r.Model] = r
+	if start == nil || done == nil {
+		t.Fatalf("missing start/done events (start=%v done=%v)", start, done)
 	}
-	if byModel["claude-opus-4-8"].Endpoint != "/v1/messages" {
-		t.Errorf("claude endpoint = %q", byModel["claude-opus-4-8"].Endpoint)
+	if start.Total != 2 || start.Skipped != 1 {
+		t.Errorf("start = %+v, want total=2 skipped=1", start)
 	}
-	if byModel["gpt-5.4"].Endpoint != "/v1/responses" {
-		t.Errorf("gpt endpoint = %q", byModel["gpt-5.4"].Endpoint)
+	if done.Passed != 2 || done.Failed != 0 || done.Skipped != 1 || len(results) != 2 {
+		t.Fatalf("done = %+v, results=%d", done, len(results))
 	}
-	if byModel["gpt-5.4"].Detail != "in=4 out=1" || byModel["gpt-5.4"].Attempts != "1" {
-		t.Errorf("gpt result = %+v", byModel["gpt-5.4"])
+	// Endpoints chosen per model.
+	if results["claude-opus-4-8"].Endpoint != "/v1/messages" {
+		t.Errorf("claude endpoint = %q", results["claude-opus-4-8"].Endpoint)
+	}
+	if results["gpt-5.4"].Endpoint != "/v1/responses" {
+		t.Errorf("gpt endpoint = %q", results["gpt-5.4"].Endpoint)
+	}
+	if results["gpt-5.4"].Detail != "in=4 out=1" || results["gpt-5.4"].Attempts != "1" {
+		t.Errorf("gpt result = %+v", results["gpt-5.4"])
 	}
 	if !sawAuth || !seenProviders["p"] {
 		t.Errorf("data plane auth=%v providers=%v", sawAuth, seenProviders)
