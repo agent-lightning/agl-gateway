@@ -87,14 +87,53 @@ Packages:
 
 ```sh
 go build ./...
-go test ./...
+go test ./...                          # all packages have tests
 go vet ./...
 go run ./cmd/gateway -config config.yaml
 ```
 
+Build the binaries from source:
+
+```sh
+go build -o gateway ./cmd/gateway
+go build -o modelcheck ./cmd/modelcheck   # optional model-test harness, see below
+```
+
 End-to-end check: run a mock upstream, point a provider at it, create a key via
 `/admin/keys`, send a streaming and a non-streaming request, and confirm a `request_logs`
-row with sane TTFT/tokens/cost (see the smoke test pattern referenced in the README).
+row with sane TTFT/tokens/cost.
+
+### `cmd/modelcheck`
+
+`cmd/modelcheck` exercises every model of every provider through a running gateway: it reads
+`/admin/providers`, mints a temporary gateway key, sends one small request per
+`(provider, model)` (pinned with `X-AGL-Provider`, run in parallel), streams a `[done/total]`
+pass/fail line as each completes, prints a failures table, deletes the key, and exits
+non-zero if anything failed. The endpoint is chosen per model: `claude*` models go to
+`/v1/messages` as Anthropic Messages requests, everything else to `/v1/responses` as OpenAI
+Responses requests.
+
+```sh
+go build -o modelcheck ./cmd/modelcheck
+./modelcheck -url http://localhost:8080 -master-key "$AGL_MASTER_KEY"
+# -concurrency N     parallel probes (default 8)  -path /v1/chat/completions  force one endpoint
+# -provider <name>   only that provider           -max-tokens N               probe size (default 16)
+# -exclude globs     skip models (default gpt-image*, comma-separated)  -stream  send stream:true
+```
+
+The same run is exposed in-process via `POST /admin/test` (and the portal's "Test models"
+tab), which drives the proxy directly and streams newline-delimited JSON events (`start`,
+one `result` per probe, `done`). Per-model logic — endpoint selection, request body, result
+interpretation — is shared by the CLI and the endpoint via `internal/probe`, so both behave
+identically.
+
+### Docker image
+
+The image is a static binary on Debian slim (non-root, ~13 MB layer for the binary). It
+expects a config at `/data/config.yaml` and keeps the SQLite database in `/data`. Build it
+locally with `docker build -t agl-gateway .`. Pushing a `v*` tag builds and publishes a
+multi-arch image (linux/amd64 + linux/arm64) to GHCR via the publish-on-tag workflow (see
+[Versioning](#versioning)).
 
 ## Versioning
 
