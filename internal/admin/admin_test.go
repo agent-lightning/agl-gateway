@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/agent-lightning/agl-gateway/internal/config"
 	"github.com/agent-lightning/agl-gateway/internal/store"
@@ -25,7 +27,7 @@ func newAdmin(t *testing.T) (http.Handler, *store.Store) {
 		MasterKey: master,
 		Providers: []config.Provider{{Name: "openai", BaseURL: "http://x"}, {Name: "anthropic", BaseURL: "http://y"}},
 	}
-	return New(cfg, st, nil).Handler(), st
+	return New(cfg, st, nil, nil).Handler(), st
 }
 
 func req(t *testing.T, h http.Handler, method, path, key, body string) *httptest.ResponseRecorder {
@@ -124,10 +126,64 @@ func TestLogsAndStats(t *testing.T) {
 	}
 
 	rec = req(t, h, "GET", "/admin/providers", master, "")
-	var provs []string
+	var provs []providerInfo
 	json.Unmarshal(rec.Body.Bytes(), &provs)
 	if len(provs) != 2 {
 		t.Errorf("providers = %+v, want 2", provs)
+	}
+}
+
+func TestProvidersDiscoversModels(t *testing.T) {
+	// One upstream serves an OpenAI-style /v1/models list; assert it is discovered, unioned
+	// with the provider's model_map aliases, deduped, and sorted. The second provider is
+	// unreachable and must report an error without failing the request.
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"object":"list","data":[{"id":"gpt-5.4"},{"id":"gpt-5-mini"}]}`))
+	})
+	srv := httptest.NewServer(up)
+	t.Cleanup(srv.Close)
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	cfg := &config.Config{
+		MasterKey: master,
+		Providers: []config.Provider{
+			{Name: "openai", BaseURL: srv.URL, ModelMap: map[string]string{"gpt-fast": "gpt-5-mini"}},
+			{Name: "dead", BaseURL: "http://127.0.0.1:1"},
+		},
+	}
+	h := New(cfg, st, &http.Client{Timeout: 2 * time.Second}, nil).Handler()
+
+	rec := req(t, h, "GET", "/admin/providers", master, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var provs []providerInfo
+	if err := json.Unmarshal(rec.Body.Bytes(), &provs); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	byName := map[string]providerInfo{}
+	for _, p := range provs {
+		byName[p.Name] = p
+	}
+	openai := byName["openai"]
+	want := []string{"gpt-5-mini", "gpt-5.4", "gpt-fast"} // discovered ∪ alias, sorted
+	if openai.Error != "" {
+		t.Errorf("openai unexpected error: %q", openai.Error)
+	}
+	if strings.Join(openai.Models, ",") != strings.Join(want, ",") {
+		t.Errorf("openai models = %v, want %v", openai.Models, want)
+	}
+	if dead := byName["dead"]; dead.Error == "" {
+		t.Errorf("dead provider should report a probe error, got %+v", dead)
 	}
 }
 

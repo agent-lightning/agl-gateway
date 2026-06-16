@@ -3,5 +3,6 @@
 *.db-shm
 *.db-wal
 /gateway
+/modelcheck
 /dist
 /config.yaml

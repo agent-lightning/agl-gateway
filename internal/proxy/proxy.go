@@ -25,11 +25,18 @@ import (
 )
 
 // Response headers the gateway adds so clients can see how a request was handled.
+// headerProvider is dual-purpose: on a response it reports the provider that served the
+// request; on a request it lets the client pin which of the key's bound providers to use.
 const (
 	headerProvider    = "X-AGL-Provider"
 	headerAttempts    = "X-AGL-Attempts"
 	headerErrorSource = "X-AGL-Error-Source"
 )
+
+// controlHeaderPrefix marks the gateway's own X-AGL-* headers. Such headers are stripped
+// from a request before it is forwarded upstream so client-supplied control headers (e.g.
+// the provider selector) never leak to the provider.
+const controlHeaderPrefix = "X-Agl-" // canonicalized form of "X-AGL-"
 
 // Error sources, reported to the client so it can tell a provider failure from a gateway one.
 const (
@@ -119,30 +126,46 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	model := usage.RequestModel(body)
 
-	prov := p.pickProvider(key)
-	if prov == nil {
+	valid := p.validProviders(key)
+	if len(valid) == 0 {
 		p.logger.Error("key bound to no valid provider", "key_id", key.ID, "providers", key.Providers)
 		gatewayError(w, http.StatusBadGateway, sourceGateway, "",
 			"agl-gateway: no upstream provider is configured for this API key", 0)
 		return
 	}
 
+	// A client may pin the provider via the X-AGL-Provider request header; it must name one
+	// of the key's bound providers. Otherwise a bound provider is chosen at random.
+	var prov *config.Provider
+	if requested := strings.TrimSpace(r.Header.Get(headerProvider)); requested != "" {
+		for _, cp := range valid {
+			if cp.Name == requested {
+				prov = cp
+				break
+			}
+		}
+		if prov == nil {
+			gatewayError(w, http.StatusBadRequest, sourceGateway, "",
+				fmt.Sprintf("agl-gateway: provider %q is not bound to this API key", requested), 0)
+			return
+		}
+	} else {
+		prov = valid[rand.IntN(len(valid))]
+	}
+
 	p.forward(w, r, body, key, prov, model, start)
 }
 
-// pickProvider chooses a random provider, among those bound to the key, that still exists
-// in the configuration.
-func (p *Proxy) pickProvider(key *store.APIKey) *config.Provider {
+// validProviders returns the providers bound to the key that still exist in the
+// configuration, preserving the key's binding order.
+func (p *Proxy) validProviders(key *store.APIKey) []*config.Provider {
 	valid := make([]*config.Provider, 0, len(key.Providers))
 	for _, name := range key.Providers {
 		if cp := p.cfg.Provider(name); cp != nil {
 			valid = append(valid, cp)
 		}
 	}
-	if len(valid) == 0 {
-		return nil
-	}
-	return valid[rand.IntN(len(valid))]
+	return valid
 }
 
 // forward applies model mapping, runs the retry loop, and streams the final response.
@@ -330,7 +353,10 @@ func presentedKey(r *http.Request) string {
 
 func copyRequestHeaders(req *http.Request, src *http.Request, prov *config.Provider) {
 	for k, vv := range src.Header {
-		if hopByHop[http.CanonicalHeaderKey(k)] || http.CanonicalHeaderKey(k) == "Authorization" {
+		ck := http.CanonicalHeaderKey(k)
+		// Strip hop-by-hop headers, the client's Authorization (replaced below), and the
+		// gateway's own X-AGL-* control headers so they never reach the upstream provider.
+		if hopByHop[ck] || ck == "Authorization" || strings.HasPrefix(ck, controlHeaderPrefix) {
 			continue
 		}
 		for _, v := range vv {

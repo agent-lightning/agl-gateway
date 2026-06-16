@@ -403,6 +403,74 @@ func TestUpstreamErrorMarkedProviderSource(t *testing.T) {
 	}
 }
 
+func TestProviderSelectionHeader(t *testing.T) {
+	// Two upstreams; a key bound to both. The X-AGL-Provider header must pin the choice,
+	// and the header must not leak to the upstream.
+	var aHits, bHits atomic.Int32
+	var gotControlHeader string
+	mk := func(hits *atomic.Int32) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			if v := r.Header.Get("X-AGL-Provider"); v != "" {
+				gotControlHeader = v
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+		})
+	}
+	srvA := httptest.NewServer(mk(&aHits))
+	srvB := httptest.NewServer(mk(&bHits))
+	t.Cleanup(srvA.Close)
+	t.Cleanup(srvB.Close)
+
+	st, _ := store.Open(":memory:")
+	t.Cleanup(func() { st.Close() })
+	cfg := &config.Config{
+		MasterKey: "mk",
+		Defaults:  config.Defaults{Retry: config.Retry{MaxRetries: 0}},
+		Providers: []config.Provider{
+			{Name: "a", BaseURL: srvA.URL, APIKey: "x"},
+			{Name: "b", BaseURL: srvB.URL, APIKey: "x"},
+		},
+	}
+	p := New(cfg, st, testPricing(), srvA.Client(), nil)
+	plain, display, _ := keys.Generate()
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"a", "b"})
+
+	send := func(provider string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/x", strings.NewReader(`{"model":"gpt-5.4"}`))
+		req.Header.Set("Authorization", "Bearer "+plain)
+		if provider != "" {
+			req.Header.Set("X-AGL-Provider", provider)
+		}
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Pin provider "b": only B should be hit, and it must not see the control header.
+	for i := 0; i < 5; i++ {
+		if rec := send("b"); rec.Code != 200 {
+			t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+		}
+	}
+	if aHits.Load() != 0 || bHits.Load() != 5 {
+		t.Errorf("hits a=%d b=%d, want a=0 b=5", aHits.Load(), bHits.Load())
+	}
+	if gotControlHeader != "" {
+		t.Errorf("upstream saw control header X-AGL-Provider=%q, want it stripped", gotControlHeader)
+	}
+
+	// An unbound provider is a 400 gateway error.
+	rec := send("ghost")
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("unbound provider status = %d, want 400", rec.Code)
+	}
+	if rec.Header().Get(headerErrorSource) != sourceGateway {
+		t.Errorf("error source = %q, want gateway", rec.Header().Get(headerErrorSource))
+	}
+}
+
 func TestUpstream4xxBodyCaptured(t *testing.T) {
 	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

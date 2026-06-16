@@ -39,6 +39,7 @@ work transparently.
 
 ```sh
 go build -o gateway ./cmd/gateway
+go build -o modelcheck ./cmd/modelcheck   # optional: model test harness (see below)
 cp config.example.yaml config.yaml      # then edit master_key, providers, pricing
 ./gateway -config config.yaml
 ```
@@ -112,6 +113,11 @@ quietly succeeded only after retries is still visible.
 |--------|-------|-------|
 | any    | `/*`  | Authenticated by gateway key (`Authorization: Bearer` or `x-api-key`), proxied to a bound provider. |
 
+A key bound to several providers is normally routed to a randomly chosen one. To pin a
+specific provider, send the `X-AGL-Provider: <name>` request header — it must name one of
+the key's bound providers (otherwise the request is rejected `400`). The header is consumed
+by the gateway and never forwarded upstream.
+
 ### Control plane (master key)
 
 | Method | Path                | Body / query |
@@ -121,10 +127,32 @@ quietly succeeded only after retries is still visible.
 | DELETE | `/admin/keys/{id}`  | delete a key |
 | GET    | `/admin/logs`       | `?limit&offset&api_key_id&provider&since` |
 | GET    | `/admin/stats`      | `?api_key_id&since` — aggregates grouped by key + model |
-| GET    | `/admin/providers`  | configured provider names |
+| GET    | `/admin/providers`  | configured providers + their models (see below) |
 | GET    | `/healthz`          | liveness (no auth) |
 
 `since` accepts an RFC3339 timestamp, a Go duration window (e.g. `24h`), or unix millis.
+
+`GET /admin/providers` returns `[{"name","models":[...],"error":"…"}]`. The model list is
+discovered live and best-effort from each provider's OpenAI-compatible `/v1/models`
+endpoint (probed concurrently, using that provider's own credentials) unioned with its
+configured `model_map` aliases. A provider whose probe fails still appears, with `error`
+set and `models` limited to any aliases.
+
+### Testing every model
+
+`cmd/modelcheck` exercises every model of every provider through a running gateway: it reads
+`/admin/providers`, mints a temporary gateway key, sends one small request per
+`(provider, model)` (pinned with `X-AGL-Provider`), prints a pass/fail table, deletes the
+key, and exits non-zero if anything failed. The endpoint is chosen per model: `claude*`
+models are sent as Anthropic Messages requests to `/v1/messages`, everything else as OpenAI
+Responses requests to `/v1/responses`.
+
+```sh
+go build -o modelcheck ./cmd/modelcheck
+./modelcheck -url http://localhost:8080 -master-key "$AGL_MASTER_KEY"
+# -provider <name>   only that provider      -path /v1/chat/completions  force one endpoint
+# -max-tokens N      probe size (default 16)  -stream                    send stream:true
+```
 
 ## How metering works
 
@@ -149,6 +177,7 @@ Layout:
 
 ```
 cmd/gateway        entrypoint (config load, wiring, graceful shutdown)
+cmd/modelcheck     test every provider's models through a running gateway
 internal/config    YAML load, defaults, validation
 internal/pricing   normalized Usage → cost
 internal/store     SQLite: api_keys + request_logs, CRUD/query/stats

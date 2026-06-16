@@ -3,12 +3,17 @@
 package admin
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/agent-lightning/agl-gateway/internal/config"
@@ -20,15 +25,20 @@ import (
 type Admin struct {
 	cfg    *config.Config
 	store  *store.Store
+	client *http.Client
 	logger *slog.Logger
 }
 
-// New builds an Admin handler.
-func New(cfg *config.Config, st *store.Store, logger *slog.Logger) *Admin {
+// New builds an Admin handler. A nil client uses a sensible default; a nil logger discards
+// logs. The client is used only to discover provider models from upstream /v1/models.
+func New(cfg *config.Config, st *store.Store, client *http.Client, logger *slog.Logger) *Admin {
+	if client == nil {
+		client = &http.Client{Transport: http.DefaultTransport}
+	}
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &Admin{cfg: cfg, store: st, logger: logger}
+	return &Admin{cfg: cfg, store: st, client: client, logger: logger}
 }
 
 // Handler returns the routed, master-key-authenticated control-plane handler.
@@ -167,12 +177,106 @@ func (a *Admin) stats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, st)
 }
 
+// providerModelsTimeout bounds how long the providers endpoint waits on all upstream
+// /v1/models probes combined.
+const providerModelsTimeout = 15 * time.Second
+
+// providerInfo is one entry of the GET /admin/providers response: a configured provider and
+// the models it exposes. Error is set (and Models may be empty) when the model probe failed.
+type providerInfo struct {
+	Name   string   `json:"name"`
+	Models []string `json:"models"`
+	Error  string   `json:"error,omitempty"`
+}
+
+// modelList is the OpenAI-/Anthropic-compatible shape of a /v1/models response; only the
+// model id is needed.
+type modelList struct {
+	Data []struct {
+		ID string `json:"id"`
+	} `json:"data"`
+}
+
+// providers lists the configured providers and, best-effort, the models each exposes.
+// Models are discovered live from every provider's OpenAI-compatible /v1/models endpoint
+// (probed concurrently) and unioned with the provider's model_map aliases, which are also
+// valid requestable models. A probe failure is reported per provider, never fatally.
 func (a *Admin) providers(w http.ResponseWriter, r *http.Request) {
-	names := make([]string, 0, len(a.cfg.Providers))
-	for _, p := range a.cfg.Providers {
-		names = append(names, p.Name)
+	ctx, cancel := context.WithTimeout(r.Context(), providerModelsTimeout)
+	defer cancel()
+
+	out := make([]providerInfo, len(a.cfg.Providers))
+	var wg sync.WaitGroup
+	for i := range a.cfg.Providers {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			p := &a.cfg.Providers[i]
+			info := providerInfo{Name: p.Name, Models: []string{}}
+
+			models, err := a.fetchModels(ctx, p)
+			if err != nil {
+				info.Error = err.Error()
+				a.logger.Warn("provider model discovery failed", "provider", p.Name, "err", err)
+			}
+
+			// Union discovered models with model_map aliases, deduped and sorted.
+			set := make(map[string]bool, len(models)+len(p.ModelMap))
+			for _, m := range models {
+				set[m] = true
+			}
+			for alias := range p.ModelMap {
+				set[alias] = true
+			}
+			for m := range set {
+				info.Models = append(info.Models, m)
+			}
+			sort.Strings(info.Models)
+			out[i] = info
+		}(i)
 	}
-	writeJSON(w, http.StatusOK, names)
+	wg.Wait()
+
+	writeJSON(w, http.StatusOK, out)
+}
+
+// fetchModels queries a provider's OpenAI-compatible /v1/models endpoint, applying the same
+// upstream auth the proxy uses, and returns the model ids it lists. It is best-effort: any
+// transport, status, or parse failure is returned as an error for the caller to report.
+func (a *Admin) fetchModels(ctx context.Context, p *config.Provider) ([]string, error) {
+	target := strings.TrimRight(p.BaseURL, "/") + "/v1/models"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return nil, err
+	}
+	if p.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.APIKey)
+	}
+	for k, v := range p.Headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("/v1/models returned HTTP %d", resp.StatusCode)
+	}
+
+	var ml modelList
+	if err := json.Unmarshal(body, &ml); err != nil {
+		return nil, fmt.Errorf("parse /v1/models: %w", err)
+	}
+	ids := make([]string, 0, len(ml.Data))
+	for _, m := range ml.Data {
+		if m.ID != "" {
+			ids = append(ids, m.ID)
+		}
+	}
+	return ids, nil
 }
 
 // --- helpers ---

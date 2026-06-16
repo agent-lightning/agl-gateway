@@ -8,7 +8,9 @@ Guidance for AI agents and contributors working in this repository.
 constraint: it routes purely by inbound **API key**, and it must **not** grow knowledge of
 specific endpoint shapes (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`). It
 forwards the request path/body verbatim and extracts metadata on a *best-effort* basis.
-Keep that boundary intact — endpoint-specific logic does not belong here.
+Keep that boundary intact — endpoint-specific logic does not belong here. The sole, scoped
+exception is the **control plane**: `GET /admin/providers` probes each provider's
+OpenAI-compatible `/v1/models` to list models. The data plane stays endpoint-agnostic.
 
 ## Project principles
 
@@ -26,7 +28,7 @@ Keep that boundary intact — endpoint-specific logic does not belong here.
 ## Architecture (data flow)
 
 ```
-client ──► proxy ──┐ auth (sha256 key lookup) ──► pick random bound provider
+client ──► proxy ──┐ auth (sha256 key lookup) ──► pick bound provider (X-AGL-Provider header, else random)
                    ├─ retry loop (backoff+jitter on net err / 429 / 5xx)
                    └─ stream upstream→client (SSE flushed), tee into usage.Accumulator
                                                   └─► pricing.Cost ─► store.InsertLog
@@ -42,10 +44,11 @@ Packages:
 | `internal/usage`  | Best-effort model + usage extraction (OpenAI/Anthropic, JSON + SSE). |
 | `internal/keys`   | Mint + SHA-256-hash gateway keys. |
 | `internal/proxy`  | Data plane: auth, routing, retry, streaming, metering. |
-| `internal/admin`  | Master-key control plane (`/admin/*`). |
+| `internal/admin`  | Master-key control plane (`/admin/*`); `/admin/providers` probes upstream `/v1/models`. |
 | `internal/portal` | Embedded management/inspection SPA. |
 | `internal/server` | Top-level HTTP routing. |
 | `cmd/gateway`     | Entrypoint. |
+| `cmd/modelcheck`  | Probes every provider's models through a running gateway. |
 
 ## Key invariants — do not break these
 

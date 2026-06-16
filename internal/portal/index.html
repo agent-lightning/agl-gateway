@@ -157,7 +157,12 @@ async function loadProviders(){
   try{
     const provs = await api("GET","/admin/providers");
     $("#provchecks").innerHTML = provs.length
-      ? provs.map(p=>`<label><input type="checkbox" value="${esc(p)}"> ${esc(p)}</label>`).join("")
+      ? provs.map(p=>{
+          const models = p.models||[];
+          const label = p.error ? `${esc(p.name)} <span class="muted">(${esc(p.error)})</span>`
+                                : `${esc(p.name)} <span class="muted">(${models.length} models)</span>`;
+          return `<label title="${esc(models.join(', '))}"><input type="checkbox" value="${esc(p.name)}"> ${label}</label>`;
+        }).join("")
       : '<span class="muted">no providers configured</span>';
   }catch(e){ $("#provchecks").innerHTML = '<span class="muted">'+esc(e.message)+'</span>'; }
 }
