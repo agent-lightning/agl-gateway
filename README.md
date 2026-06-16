@@ -142,16 +142,18 @@ set and `models` limited to any aliases.
 
 `cmd/modelcheck` exercises every model of every provider through a running gateway: it reads
 `/admin/providers`, mints a temporary gateway key, sends one small request per
-`(provider, model)` (pinned with `X-AGL-Provider`), prints a pass/fail table, deletes the
-key, and exits non-zero if anything failed. The endpoint is chosen per model: `claude*`
-models are sent as Anthropic Messages requests to `/v1/messages`, everything else as OpenAI
-Responses requests to `/v1/responses`.
+`(provider, model)` (pinned with `X-AGL-Provider`, run in parallel), streams a `[done/total]`
+pass/fail line as each completes, prints a failures table, deletes the key, and exits
+non-zero if anything failed. The endpoint is chosen per model: `claude*` models are sent as
+Anthropic Messages requests to `/v1/messages`, everything else as OpenAI Responses requests
+to `/v1/responses`.
 
 ```sh
 go build -o modelcheck ./cmd/modelcheck
 ./modelcheck -url http://localhost:8080 -master-key "$AGL_MASTER_KEY"
-# -provider <name>   only that provider      -path /v1/chat/completions  force one endpoint
-# -max-tokens N      probe size (default 16)  -stream                    send stream:true
+# -concurrency N     parallel probes (default 8)  -path /v1/chat/completions  force one endpoint
+# -provider <name>   only that provider           -max-tokens N               probe size (default 16)
+# -stream            send stream:true
 ```
 
 ## How metering works

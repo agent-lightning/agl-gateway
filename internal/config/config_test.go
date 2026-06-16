@@ -144,12 +144,12 @@ func TestExampleConfigParses(t *testing.T) {
 	for _, p := range c.Pricing {
 		priced[p.Model] = true
 	}
-	for _, base := range []string{"gpt-5.4", "claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"} {
+	for _, base := range []string{"gpt-5-nano", "gpt-5.4", "gpt-5.4-nano", "claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5", "claude-haiku-4-5-20251001"} {
 		if !priced[base] {
 			t.Errorf("expected base model %q to be priced", base)
 		}
 	}
-	for _, variant := range []string{"claude-opus-4-7-200k", "claude-opus-4-8-232k", "claude-haiku-4-5-20251001", "codex-auto-review"} {
+	for _, variant := range []string{"claude-opus-4-7-200k", "claude-opus-4-8-232k", "codex-auto-review"} {
 		if priced[variant] {
 			t.Errorf("variant %q should not be in the example pricing", variant)
 		}

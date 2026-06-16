@@ -24,7 +24,10 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 )
@@ -59,6 +62,7 @@ func main() {
 	maxTokens := flag.Int("max-tokens", 16, "max_tokens for each probe request")
 	stream := flag.Bool("stream", false, "send stream:true and read the SSE response")
 	timeout := flag.Duration("timeout", 60*time.Second, "per-request timeout")
+	concurrency := flag.Int("concurrency", 8, "number of probes to run in parallel")
 	flag.Parse()
 
 	if *masterKey == "" {
@@ -95,40 +99,107 @@ func main() {
 		fatal("no models to test across %d provider(s)", len(providers))
 	}
 
-	// Mint a temporary key bound to every provider under test, and delete it on the way out.
-	keyID, gwKey, err := createKey(client, base, *masterKey, names)
-	if err != nil {
-		fatal("could not create temporary gateway key: %v", err)
-	}
-	defer func() {
-		if err := deleteKey(client, base, *masterKey, keyID); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not delete temporary key %d: %v\n", keyID, err)
+	// Run the probes inside a closure that returns an exit code, so the deferred deletion of
+	// the temporary key runs even when we finish with failures (os.Exit skips defers).
+	os.Exit(func() int {
+		// Mint a temporary key bound to every provider under test, deleted on the way out.
+		keyID, gwKey, err := createKey(client, base, *masterKey, names)
+		if err != nil {
+			fatal("could not create temporary gateway key: %v", err)
 		}
-	}()
+		defer func() {
+			if err := deleteKey(client, base, *masterKey, keyID); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not delete temporary key %d: %v\n", keyID, err)
+			}
+		}()
 
-	pathDesc := "auto (/v1/messages for claude*, else /v1/responses)"
-	if *path != "" {
-		pathDesc = *path
-	}
-	fmt.Printf("Testing %d model(s) across %d provider(s) via %s — path: %s\n\n", total, len(names), base, pathDesc)
+		pathDesc := "auto (/v1/messages for claude*, else /v1/responses)"
+		if *path != "" {
+			pathDesc = *path
+		}
 
-	var results []result
-	failures := 0
-	for _, p := range providers {
-		for _, model := range p.Models {
-			res := probe(client, base, *path, gwKey, p.Name, model, *maxTokens, *stream)
-			results = append(results, res)
-			if !res.ok {
-				failures++
+		// Flatten to a job list and learn column widths up front so streamed lines align.
+		jobs := make([]job, 0, total)
+		provW, modelW := 0, 0
+		for _, p := range providers {
+			for _, m := range p.Models {
+				jobs = append(jobs, job{p.Name, m})
+				provW = max(provW, len(p.Name))
+				modelW = max(modelW, len(m))
 			}
 		}
-	}
 
-	printResults(results)
-	fmt.Printf("\n%d passed, %d failed\n", len(results)-failures, failures)
-	if failures > 0 {
-		os.Exit(1)
+		workers := *concurrency
+		if workers < 1 {
+			workers = 1
+		}
+		if workers > len(jobs) {
+			workers = len(jobs)
+		}
+		fmt.Printf("Testing %d model(s) across %d provider(s) via %s — path: %s — concurrency %d\n\n",
+			total, len(names), base, pathDesc, workers)
+
+		// Fan out across a bounded worker pool, streaming each result as it completes.
+		done, failures := 0, 0
+		counterW := len(strconv.Itoa(len(jobs)))
+		results := runProbes(client, base, *path, gwKey, jobs, *maxTokens, workers, *stream, func(r result) {
+			done++
+			if !r.ok {
+				failures++
+			}
+			printProgress(done, len(jobs), counterW, provW, modelW, r)
+		})
+
+		fmt.Printf("\n%d passed, %d failed\n", len(results)-failures, failures)
+		if failures > 0 {
+			printFailures(results)
+			return 1
+		}
+		return 0
+	}())
+}
+
+// job is a single (provider, model) probe to run.
+type job struct{ provider, model string }
+
+// runProbes fans the jobs out across a bounded pool of `workers` goroutines, invoking
+// onResult for each completed probe in completion order, and returns every result. onResult
+// (which may be nil) runs on the single collecting goroutine, so it needs no locking.
+func runProbes(client *http.Client, base, path, gwKey string, jobs []job, maxTokens, workers int, stream bool, onResult func(result)) []result {
+	if workers < 1 {
+		workers = 1
 	}
+	jobCh := make(chan job)
+	resCh := make(chan result)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobCh {
+				resCh <- probe(client, base, path, gwKey, j.provider, j.model, maxTokens, stream)
+			}
+		}()
+	}
+	go func() {
+		for _, j := range jobs {
+			jobCh <- j
+		}
+		close(jobCh)
+	}()
+	go func() {
+		wg.Wait()
+		close(resCh)
+	}()
+
+	results := make([]result, 0, len(jobs))
+	for r := range resCh {
+		if onResult != nil {
+			onResult(r)
+		}
+		results = append(results, r)
+	}
+	return results
 }
 
 func probe(client *http.Client, base, explicitPath, gwKey, provider, model string, maxTokens int, stream bool) result {
@@ -234,20 +305,48 @@ func summarize(ok bool, body []byte) string {
 	return truncate(strings.TrimSpace(string(body)), 80)
 }
 
-func printResults(results []result) {
-	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "RESULT\tPROVIDER\tMODEL\tENDPOINT\tHTTP\tTRIES\tLATENCY\tDETAIL")
+// printProgress writes one aligned line for a completed probe, prefixed with a running
+// [done/total] counter so progress is visible as results stream in.
+func printProgress(done, total, counterW, provW, modelW int, r result) {
+	mark := "ok  "
+	if !r.ok {
+		mark = "FAIL"
+	}
+	status := "—"
+	if r.status > 0 {
+		status = strconv.Itoa(r.status)
+	}
+	fmt.Printf("[%*d/%d] %s  %-*s  %-*s  %-13s  %3s  %6dms  %s\n",
+		counterW, done, total, mark, provW, r.provider, modelW, r.model, r.endpoint, status, r.dur.Milliseconds(), r.detail)
+}
+
+// printFailures prints a sorted table of just the failed probes, since streamed lines arrive
+// in completion order and failures are easy to lose in a long run.
+func printFailures(results []result) {
+	fails := make([]result, 0)
 	for _, r := range results {
-		mark := "FAIL"
-		if r.ok {
-			mark = "ok"
+		if !r.ok {
+			fails = append(fails, r)
 		}
+	}
+	if len(fails) == 0 {
+		return
+	}
+	sort.Slice(fails, func(i, j int) bool {
+		if fails[i].provider != fails[j].provider {
+			return fails[i].provider < fails[j].provider
+		}
+		return fails[i].model < fails[j].model
+	})
+	fmt.Println("\nFailures:")
+	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "PROVIDER\tMODEL\tENDPOINT\tHTTP\tTRIES\tDETAIL")
+	for _, r := range fails {
 		tries := r.attempts
 		if tries == "" {
 			tries = "-"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%dms\t%s\n",
-			mark, r.provider, r.model, r.endpoint, r.status, tries, r.dur.Milliseconds(), r.detail)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\n", r.provider, r.model, r.endpoint, r.status, tries, r.detail)
 	}
 	tw.Flush()
 }

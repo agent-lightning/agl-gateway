@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -74,6 +76,76 @@ func TestSummarize(t *testing.T) {
 	if got := summarize(false, []byte("boom")); got != "boom" {
 		t.Errorf("raw error summary = %q", got)
 	}
+}
+
+func TestRunProbesConcurrencyAndCompleteness(t *testing.T) {
+	// Each probe sleeps briefly while the server tracks peak in-flight requests. With a pool
+	// of 4 workers over 12 jobs, peak concurrency must exceed 1 (proving parallelism) and
+	// every job must produce a result.
+	var inflight, peak int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := atomic.AddInt32(&inflight, 1)
+		for {
+			old := atomic.LoadInt32(&peak)
+			if cur <= old || atomic.CompareAndSwapInt32(&peak, old, cur) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		atomic.AddInt32(&inflight, -1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	jobs := make([]job, 0, 12)
+	for i := 0; i < 12; i++ {
+		jobs = append(jobs, job{provider: "p", model: "m"})
+	}
+
+	var mu sync.Mutex
+	callbackCount := 0
+	results := runProbes(srv.Client(), srv.URL, "/v1/responses", "k", jobs, 8, 4, false, func(r result) {
+		mu.Lock()
+		callbackCount++
+		mu.Unlock()
+	})
+
+	if len(results) != 12 || callbackCount != 12 {
+		t.Fatalf("results=%d callbacks=%d, want 12 each", len(results), callbackCount)
+	}
+	for _, r := range results {
+		if !r.ok {
+			t.Fatalf("probe failed: %+v", r)
+		}
+	}
+	if peak < 2 {
+		t.Errorf("peak in-flight = %d, want >1 (probes did not run in parallel)", peak)
+	}
+	if peak > 4 {
+		t.Errorf("peak in-flight = %d, want <=4 (worker pool not bounded)", peak)
+	}
+}
+
+func TestRunProbesClampsWorkers(t *testing.T) {
+	// workers below 1 must still run every job exactly once.
+	srv := fakeGatewaySimple(t)
+	jobs := []job{{provider: "p", model: "a"}, {provider: "p", model: "b"}}
+	results := runProbes(srv.Client(), srv.URL, "/v1/responses", "k", jobs, 8, 0, false, nil)
+	if len(results) != 2 {
+		t.Fatalf("results = %d, want 2", len(results))
+	}
+}
+
+// fakeGatewaySimple serves a minimal probe endpoint that always succeeds.
+func fakeGatewaySimple(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 func TestTruncate(t *testing.T) {

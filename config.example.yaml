@@ -60,6 +60,10 @@ providers:
 # new-api schema. Cached-token rates fall back to input_cost_per_token when omitted.
 pricing:
   # --- OpenAI / GPT family ---
+  - model: gpt-5-nano
+    input_cost_per_token: 5e-8
+    output_cost_per_token: 4e-7
+    cache_read_input_token_cost: 5e-9
   - model: gpt-5-mini
     input_cost_per_token: 2.5e-7
     output_cost_per_token: 2e-6
@@ -80,6 +84,10 @@ pricing:
     input_cost_per_token: 7.5e-7
     output_cost_per_token: 4.5e-6
     cache_read_input_token_cost: 7.5e-8
+  - model: gpt-5.4-nano
+    input_cost_per_token: 2e-7
+    output_cost_per_token: 1.25e-6
+    cache_read_input_token_cost: 2e-8
   - model: gpt-5.5
     input_cost_per_token: 5e-6
     output_cost_per_token: 3e-5
@@ -107,6 +115,11 @@ pricing:
     cache_read_input_token_cost: 3e-7
     cache_creation_input_token_cost: 3.75e-6
   - model: claude-haiku-4-5
+    input_cost_per_token: 1e-6
+    output_cost_per_token: 5e-6
+    cache_read_input_token_cost: 1e-7
+    cache_creation_input_token_cost: 1.25e-6
+  - model: claude-haiku-4-5-20251001
     input_cost_per_token: 1e-6
     output_cost_per_token: 5e-6
     cache_read_input_token_cost: 1e-7
