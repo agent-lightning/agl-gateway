@@ -22,7 +22,7 @@ func TestRouting(t *testing.T) {
 	}
 	prices := pricing.New(nil)
 	p := proxy.New(cfg, st, prices, nil, nil)
-	a := admin.New(cfg, st, nil, nil)
+	a := admin.New(cfg, st, nil, p, nil)
 
 	portal := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

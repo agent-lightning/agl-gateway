@@ -2,7 +2,7 @@
 // agl-gateway. It reads the provider/model inventory from the gateway's control plane
 // (GET /admin/providers), mints a temporary gateway key bound to those providers, then sends
 // one small request per (provider, model), pinning the provider with the X-AGL-Provider
-// header. Results are printed as a table and the process exits non-zero if any model failed.
+// header. Results stream as they complete and the process exits non-zero if any model failed.
 //
 // Usage:
 //
@@ -11,8 +11,8 @@
 //
 // The request path and body are chosen per model by default: models whose name starts with
 // "claude" are sent as an Anthropic Messages request to /v1/messages, everything else as an
-// OpenAI Responses request to /v1/responses. Override the path for every model with -path
-// (the body shape is then inferred from that path).
+// OpenAI Responses request to /v1/responses. Override the path for every model with -path.
+// The per-model logic is shared with the gateway's own /admin/test endpoint via internal/probe.
 package main
 
 import (
@@ -27,9 +27,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"text/tabwriter"
 	"time"
+
+	"github.com/agent-lightning/agl-gateway/internal/probe"
 )
 
 type providerInfo struct {
@@ -41,17 +42,6 @@ type providerInfo struct {
 type createKeyResp struct {
 	ID  int64  `json:"id"`
 	Key string `json:"key"`
-}
-
-type result struct {
-	provider string
-	model    string
-	endpoint string
-	status   int
-	attempts string
-	dur      time.Duration
-	detail   string
-	ok       bool
 }
 
 func main() {
@@ -70,7 +60,6 @@ func main() {
 		fatal("a master key is required: pass -master-key or set AGL_MASTER_KEY")
 	}
 	base := strings.TrimRight(*url, "/")
-
 	client := &http.Client{Timeout: *timeout}
 
 	providers, err := fetchProviders(client, base, *masterKey)
@@ -100,8 +89,8 @@ func main() {
 		fatal("no models to test across %d provider(s)", len(providers))
 	}
 
-	// Run the probes inside a closure that returns an exit code, so the deferred deletion of
-	// the temporary key runs even when we finish with failures (os.Exit skips defers).
+	// Run inside a closure that returns an exit code, so the deferred deletion of the
+	// temporary key runs even when we finish with failures (os.Exit skips defers).
 	os.Exit(func() int {
 		// Mint a temporary key bound to every provider under test, deleted on the way out.
 		keyID, gwKey, err := createKey(client, base, *masterKey, names)
@@ -119,26 +108,19 @@ func main() {
 			pathDesc = *path
 		}
 
-		// Parse the exclude globs once; models matching any are skipped (e.g. gpt-image*,
-		// which isn't a chat/responses model and would only produce spurious failures).
-		var patterns []string
-		for _, p := range strings.Split(*exclude, ",") {
-			if p = strings.TrimSpace(p); p != "" {
-				patterns = append(patterns, p)
-			}
-		}
-
-		// Flatten to a job list and learn column widths up front so streamed lines align.
-		jobs := make([]job, 0, total)
+		// Build the job list, applying the exclude globs, and learn column widths up front so
+		// the streamed lines align.
+		patterns := probe.ParsePatterns(*exclude)
+		jobs := make([]probe.Job, 0, total)
 		provW, modelW := 0, 0
 		skipped := 0
 		for _, p := range providers {
 			for _, m := range p.Models {
-				if excluded(patterns, m) {
+				if probe.Excluded(patterns, m) {
 					skipped++
 					continue
 				}
-				jobs = append(jobs, job{p.Name, m})
+				jobs = append(jobs, probe.Job{Provider: p.Name, Model: m})
 				provW = max(provW, len(p.Name))
 				modelW = max(modelW, len(m))
 			}
@@ -149,9 +131,6 @@ func main() {
 		}
 
 		workers := *concurrency
-		if workers < 1 {
-			workers = 1
-		}
 		if workers > len(jobs) {
 			workers = len(jobs)
 		}
@@ -163,11 +142,14 @@ func main() {
 			len(jobs), skipNote, len(names), base, pathDesc, workers)
 
 		// Fan out across a bounded worker pool, streaming each result as it completes.
+		send := gatewaySender(client, base, gwKey)
 		done, failures := 0, 0
 		counterW := len(strconv.Itoa(len(jobs)))
-		results := runProbes(client, base, *path, gwKey, jobs, *maxTokens, workers, *stream, func(r result) {
+		results := probe.Pool(jobs, workers, func(j probe.Job) probe.Result {
+			return probe.Probe(context.Background(), j, *path, *maxTokens, *stream, send)
+		}, func(r probe.Result) {
 			done++
-			if !r.ok {
+			if !r.OK {
 				failures++
 			}
 			printProgress(done, len(jobs), counterW, provW, modelW, r)
@@ -182,205 +164,49 @@ func main() {
 	}())
 }
 
-// job is a single (provider, model) probe to run.
-type job struct{ provider, model string }
-
-// runProbes fans the jobs out across a bounded pool of `workers` goroutines, invoking
-// onResult for each completed probe in completion order, and returns every result. onResult
-// (which may be nil) runs on the single collecting goroutine, so it needs no locking.
-func runProbes(client *http.Client, base, path, gwKey string, jobs []job, maxTokens, workers int, stream bool, onResult func(result)) []result {
-	if workers < 1 {
-		workers = 1
-	}
-	jobCh := make(chan job)
-	resCh := make(chan result)
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := range jobCh {
-				resCh <- probe(client, base, path, gwKey, j.provider, j.model, maxTokens, stream)
-			}
-		}()
-	}
-	go func() {
-		for _, j := range jobs {
-			jobCh <- j
+// gatewaySender delivers each probe through the running gateway: it posts to base+path with
+// the temporary gateway key and pins the provider via X-AGL-Provider.
+func gatewaySender(client *http.Client, base, gwKey string) probe.Sender {
+	return func(ctx context.Context, provider, path string, body []byte) (int, string, []byte, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, bytes.NewReader(body))
+		if err != nil {
+			return 0, "", nil, err
 		}
-		close(jobCh)
-	}()
-	go func() {
-		wg.Wait()
-		close(resCh)
-	}()
+		req.Header.Set("Authorization", "Bearer "+gwKey)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-AGL-Provider", provider)
 
-	results := make([]result, 0, len(jobs))
-	for r := range resCh {
-		if onResult != nil {
-			onResult(r)
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, "", nil, err
 		}
-		results = append(results, r)
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return resp.StatusCode, resp.Header.Get("X-AGL-Attempts"), b, nil
 	}
-	return results
-}
-
-// excluded reports whether model matches any of the glob patterns.
-func excluded(patterns []string, model string) bool {
-	for _, p := range patterns {
-		if globMatch(p, model) {
-			return true
-		}
-	}
-	return false
-}
-
-// globMatch matches s against a pattern using `*` as a wildcard (any run of characters).
-// A pattern with no `*` must match exactly. This is enough for model-name filters like
-// "gpt-image*" or "*-audio" without pulling in path-glob semantics.
-func globMatch(pattern, s string) bool {
-	parts := strings.Split(pattern, "*")
-	if len(parts) == 1 {
-		return pattern == s
-	}
-	if !strings.HasPrefix(s, parts[0]) {
-		return false
-	}
-	s = s[len(parts[0]):]
-	for _, mid := range parts[1 : len(parts)-1] {
-		i := strings.Index(s, mid)
-		if i < 0 {
-			return false
-		}
-		s = s[i+len(mid):]
-	}
-	return strings.HasSuffix(s, parts[len(parts)-1])
-}
-
-func probe(client *http.Client, base, explicitPath, gwKey, provider, model string, maxTokens int, stream bool) result {
-	path := resolvePath(explicitPath, model)
-	res := result{provider: provider, model: model, endpoint: path}
-
-	payload := buildBody(path, model, maxTokens, stream)
-
-	start := time.Now()
-	req, err := http.NewRequest(http.MethodPost, base+path, bytes.NewReader(payload))
-	if err != nil {
-		res.detail = err.Error()
-		return res
-	}
-	req.Header.Set("Authorization", "Bearer "+gwKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-AGL-Provider", provider) // pin the bound provider
-
-	resp, err := client.Do(req)
-	res.dur = time.Since(start)
-	if err != nil {
-		res.detail = err.Error()
-		return res
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-
-	res.status = resp.StatusCode
-	res.attempts = resp.Header.Get("X-AGL-Attempts")
-	res.ok = resp.StatusCode == http.StatusOK
-	res.detail = summarize(res.ok, body)
-	return res
-}
-
-// resolvePath picks the request path for a model. An explicit -path wins; otherwise claude*
-// models use Anthropic's /v1/messages and everything else uses OpenAI's /v1/responses.
-func resolvePath(explicit, model string) string {
-	if explicit != "" {
-		return explicit
-	}
-	if strings.HasPrefix(strings.ToLower(model), "claude") {
-		return "/v1/messages"
-	}
-	return "/v1/responses"
-}
-
-// buildBody constructs a minimal request body whose shape matches the endpoint inferred from
-// path: Anthropic Messages, OpenAI Responses, or (fallback) OpenAI Chat Completions.
-func buildBody(path, model string, maxTokens int, stream bool) []byte {
-	var body map[string]any
-	switch {
-	case strings.Contains(path, "/responses"):
-		body = map[string]any{"model": model, "input": "ping", "max_output_tokens": maxTokens}
-	case strings.Contains(path, "/messages"):
-		body = map[string]any{"model": model, "max_tokens": maxTokens,
-			"messages": []map[string]string{{"role": "user", "content": "ping"}}}
-	default: // chat completions and compatible
-		body = map[string]any{"model": model, "max_tokens": maxTokens,
-			"messages": []map[string]string{{"role": "user", "content": "ping"}}}
-	}
-	if stream {
-		body["stream"] = true
-	}
-	b, _ := json.Marshal(body)
-	return b
-}
-
-// summarize extracts a short, human-readable note from a response body: token usage on
-// success, or the provider/gateway error message on failure.
-func summarize(ok bool, body []byte) string {
-	if ok {
-		var u struct {
-			Usage struct {
-				PromptTokens     int `json:"prompt_tokens"`
-				CompletionTokens int `json:"completion_tokens"`
-				InputTokens      int `json:"input_tokens"`
-				OutputTokens     int `json:"output_tokens"`
-			} `json:"usage"`
-		}
-		if json.Unmarshal(body, &u) == nil {
-			in := u.Usage.PromptTokens
-			if in == 0 {
-				in = u.Usage.InputTokens
-			}
-			out := u.Usage.CompletionTokens
-			if out == 0 {
-				out = u.Usage.OutputTokens
-			}
-			if in > 0 || out > 0 {
-				return fmt.Sprintf("in=%d out=%d", in, out)
-			}
-		}
-		return "ok"
-	}
-	var e struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(body, &e) == nil && e.Error.Message != "" {
-		return truncate(e.Error.Message, 80)
-	}
-	return truncate(strings.TrimSpace(string(body)), 80)
 }
 
 // printProgress writes one aligned line for a completed probe, prefixed with a running
 // [done/total] counter so progress is visible as results stream in.
-func printProgress(done, total, counterW, provW, modelW int, r result) {
+func printProgress(done, total, counterW, provW, modelW int, r probe.Result) {
 	mark := "ok  "
-	if !r.ok {
+	if !r.OK {
 		mark = "FAIL"
 	}
 	status := "—"
-	if r.status > 0 {
-		status = strconv.Itoa(r.status)
+	if r.Status > 0 {
+		status = strconv.Itoa(r.Status)
 	}
 	fmt.Printf("[%*d/%d] %s  %-*s  %-*s  %-13s  %3s  %6dms  %s\n",
-		counterW, done, total, mark, provW, r.provider, modelW, r.model, r.endpoint, status, r.dur.Milliseconds(), r.detail)
+		counterW, done, total, mark, provW, r.Provider, modelW, r.Model, r.Endpoint, status, r.DurationMS, r.Detail)
 }
 
 // printFailures prints a sorted table of just the failed probes, since streamed lines arrive
 // in completion order and failures are easy to lose in a long run.
-func printFailures(results []result) {
-	fails := make([]result, 0)
+func printFailures(results []probe.Result) {
+	fails := make([]probe.Result, 0)
 	for _, r := range results {
-		if !r.ok {
+		if !r.OK {
 			fails = append(fails, r)
 		}
 	}
@@ -388,20 +214,20 @@ func printFailures(results []result) {
 		return
 	}
 	sort.Slice(fails, func(i, j int) bool {
-		if fails[i].provider != fails[j].provider {
-			return fails[i].provider < fails[j].provider
+		if fails[i].Provider != fails[j].Provider {
+			return fails[i].Provider < fails[j].Provider
 		}
-		return fails[i].model < fails[j].model
+		return fails[i].Model < fails[j].Model
 	})
 	fmt.Println("\nFailures:")
 	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(tw, "PROVIDER\tMODEL\tENDPOINT\tHTTP\tTRIES\tDETAIL")
 	for _, r := range fails {
-		tries := r.attempts
+		tries := r.Attempts
 		if tries == "" {
 			tries = "-"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\n", r.provider, r.model, r.endpoint, r.status, tries, r.detail)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\t%s\n", r.Provider, r.Model, r.Endpoint, r.Status, tries, r.Detail)
 	}
 	tw.Flush()
 }
@@ -473,14 +299,6 @@ func deleteKey(client *http.Client, base, masterKey string, id int64) error {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	return nil
-}
-
-func truncate(s string, n int) string {
-	s = strings.Join(strings.Fields(s), " ")
-	if len(s) > n {
-		return s[:n-1] + "…"
-	}
-	return s
 }
 
 func fatal(format string, args ...any) {

@@ -7,10 +7,12 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/agent-lightning/agl-gateway/internal/config"
+	"github.com/agent-lightning/agl-gateway/internal/probe"
 	"github.com/agent-lightning/agl-gateway/internal/store"
 )
 
@@ -27,7 +29,7 @@ func newAdmin(t *testing.T) (http.Handler, *store.Store) {
 		MasterKey: master,
 		Providers: []config.Provider{{Name: "openai", BaseURL: "http://x"}, {Name: "anthropic", BaseURL: "http://y"}},
 	}
-	return New(cfg, st, nil, nil).Handler(), st
+	return New(cfg, st, nil, nil, nil).Handler(), st
 }
 
 func req(t *testing.T, h http.Handler, method, path, key, body string) *httptest.ResponseRecorder {
@@ -160,7 +162,7 @@ func TestProvidersDiscoversModels(t *testing.T) {
 			{Name: "dead", BaseURL: "http://127.0.0.1:1"},
 		},
 	}
-	h := New(cfg, st, &http.Client{Timeout: 2 * time.Second}, nil).Handler()
+	h := New(cfg, st, &http.Client{Timeout: 2 * time.Second}, nil, nil).Handler()
 
 	rec := req(t, h, "GET", "/admin/providers", master, "")
 	if rec.Code != http.StatusOK {
@@ -184,6 +186,89 @@ func TestProvidersDiscoversModels(t *testing.T) {
 	}
 	if dead := byName["dead"]; dead.Error == "" {
 		t.Errorf("dead provider should report a probe error, got %+v", dead)
+	}
+}
+
+func TestModelTestEndpoint(t *testing.T) {
+	// Upstream advertises three models; gpt-image-1 must be excluded by default.
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"data":[{"id":"gpt-5.4"},{"id":"gpt-image-1"},{"id":"claude-opus-4-8"}]}`))
+	}))
+	t.Cleanup(up.Close)
+
+	// Fake data plane: assert each probe is authenticated and provider-pinned, echo usage.
+	var mu sync.Mutex
+	seenProviders := map[string]bool{}
+	var sawAuth bool
+	dataPlane := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seenProviders[r.Header.Get("X-AGL-Provider")] = true
+		if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+			sawAuth = true
+		}
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-AGL-Attempts", "1")
+		w.Write([]byte(`{"usage":{"input_tokens":4,"output_tokens":1}}`))
+	})
+
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	cfg := &config.Config{
+		MasterKey: master,
+		Providers: []config.Provider{{Name: "p", BaseURL: up.URL}},
+	}
+	h := New(cfg, st, &http.Client{Timeout: 2 * time.Second}, dataPlane, nil).Handler()
+
+	rec := req(t, h, "POST", "/admin/test", master, `{"exclude":"gpt-image*","concurrency":4}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var resp testResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Skipped != 1 || resp.Passed != 2 || resp.Failed != 0 || len(resp.Results) != 2 {
+		t.Fatalf("summary = %+v", resp)
+	}
+	// Results sorted by (provider, model); endpoints chosen per model.
+	byModel := map[string]probe.Result{}
+	for _, r := range resp.Results {
+		byModel[r.Model] = r
+	}
+	if byModel["claude-opus-4-8"].Endpoint != "/v1/messages" {
+		t.Errorf("claude endpoint = %q", byModel["claude-opus-4-8"].Endpoint)
+	}
+	if byModel["gpt-5.4"].Endpoint != "/v1/responses" {
+		t.Errorf("gpt endpoint = %q", byModel["gpt-5.4"].Endpoint)
+	}
+	if byModel["gpt-5.4"].Detail != "in=4 out=1" || byModel["gpt-5.4"].Attempts != "1" {
+		t.Errorf("gpt result = %+v", byModel["gpt-5.4"])
+	}
+	if !sawAuth || !seenProviders["p"] {
+		t.Errorf("data plane auth=%v providers=%v", sawAuth, seenProviders)
+	}
+
+	// The temporary key must be cleaned up.
+	ks, _ := st.ListKeys()
+	if len(ks) != 0 {
+		t.Errorf("temporary key not deleted: %+v", ks)
+	}
+}
+
+func TestModelTestUnavailableWithoutDataPlane(t *testing.T) {
+	h, _ := newAdmin(t) // newAdmin passes a nil data plane
+	rec := req(t, h, "POST", "/admin/test", master, `{}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rec.Code)
 	}
 }
 

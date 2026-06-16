@@ -128,6 +128,7 @@ by the gateway and never forwarded upstream.
 | GET    | `/admin/logs`       | `?limit&offset&api_key_id&provider&since` |
 | GET    | `/admin/stats`      | `?api_key_id&since` — aggregates grouped by key + model |
 | GET    | `/admin/providers`  | configured providers + their models (see below) |
+| POST   | `/admin/test`       | run the model test server-side (body: `{provider,exclude,path,max_tokens,concurrency,stream}`, all optional) |
 | GET    | `/healthz`          | liveness (no auth) |
 
 `since` accepts an RFC3339 timestamp, a Go duration window (e.g. `24h`), or unix millis.
@@ -155,6 +156,12 @@ go build -o modelcheck ./cmd/modelcheck
 # -provider <name>   only that provider           -max-tokens N               probe size (default 16)
 # -exclude globs     skip models (default gpt-image*, comma-separated)  -stream  send stream:true
 ```
+
+The same test is available **in the web portal** (the "Test models" tab) and as a control-plane
+endpoint, `POST /admin/test`, which runs it server-side by driving the proxy in-process. The
+per-model logic — endpoint selection, request body, and result interpretation — is shared by
+the CLI and the endpoint via the `internal/probe` package, so both behave identically. Either
+path sends real requests through the gateway, so a test run produces `request_logs` entries.
 
 ## How metering works
 
@@ -184,6 +191,7 @@ internal/config    YAML load, defaults, validation
 internal/pricing   normalized Usage → cost
 internal/store     SQLite: api_keys + request_logs, CRUD/query/stats
 internal/usage     best-effort usage/model extraction (JSON + SSE)
+internal/probe     shared model-probe logic (endpoint/body/summary), used by the CLI and /admin/test
 internal/keys      mint + sha256-hash API keys
 internal/proxy     auth, routing, retry, streaming, metering
 internal/admin     master-key control-plane handlers

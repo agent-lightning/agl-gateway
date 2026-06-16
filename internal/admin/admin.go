@@ -3,6 +3,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,27 +20,30 @@ import (
 
 	"github.com/agent-lightning/agl-gateway/internal/config"
 	"github.com/agent-lightning/agl-gateway/internal/keys"
+	"github.com/agent-lightning/agl-gateway/internal/probe"
 	"github.com/agent-lightning/agl-gateway/internal/store"
 )
 
 // Admin is the control-plane HTTP handler set.
 type Admin struct {
-	cfg    *config.Config
-	store  *store.Store
-	client *http.Client
-	logger *slog.Logger
+	cfg       *config.Config
+	store     *store.Store
+	client    *http.Client
+	dataPlane http.Handler // the proxy, driven in-process by the /admin/test endpoint
+	logger    *slog.Logger
 }
 
 // New builds an Admin handler. A nil client uses a sensible default; a nil logger discards
-// logs. The client is used only to discover provider models from upstream /v1/models.
-func New(cfg *config.Config, st *store.Store, client *http.Client, logger *slog.Logger) *Admin {
+// logs. The client discovers provider models from upstream /v1/models; dataPlane (the proxy)
+// is exercised in-process by POST /admin/test and may be nil to disable that endpoint.
+func New(cfg *config.Config, st *store.Store, client *http.Client, dataPlane http.Handler, logger *slog.Logger) *Admin {
 	if client == nil {
 		client = &http.Client{Transport: http.DefaultTransport}
 	}
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &Admin{cfg: cfg, store: st, client: client, logger: logger}
+	return &Admin{cfg: cfg, store: st, client: client, dataPlane: dataPlane, logger: logger}
 }
 
 // Handler returns the routed, master-key-authenticated control-plane handler.
@@ -50,6 +55,7 @@ func (a *Admin) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/logs", a.listLogs)
 	mux.HandleFunc("GET /admin/stats", a.stats)
 	mux.HandleFunc("GET /admin/providers", a.providers)
+	mux.HandleFunc("POST /admin/test", a.test)
 	return a.authMiddleware(mux)
 }
 
@@ -198,13 +204,17 @@ type modelList struct {
 }
 
 // providers lists the configured providers and, best-effort, the models each exposes.
-// Models are discovered live from every provider's OpenAI-compatible /v1/models endpoint
-// (probed concurrently) and unioned with the provider's model_map aliases, which are also
-// valid requestable models. A probe failure is reported per provider, never fatally.
 func (a *Admin) providers(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), providerModelsTimeout)
 	defer cancel()
+	writeJSON(w, http.StatusOK, a.discoverProviders(ctx))
+}
 
+// discoverProviders returns each configured provider with the models it exposes. Models are
+// discovered live from every provider's OpenAI-compatible /v1/models endpoint (probed
+// concurrently) and unioned with the provider's model_map aliases, which are also valid
+// requestable models. A probe failure is reported per provider, never fatally.
+func (a *Admin) discoverProviders(ctx context.Context) []providerInfo {
 	out := make([]providerInfo, len(a.cfg.Providers))
 	var wg sync.WaitGroup
 	for i := range a.cfg.Providers {
@@ -236,8 +246,7 @@ func (a *Admin) providers(w http.ResponseWriter, r *http.Request) {
 		}(i)
 	}
 	wg.Wait()
-
-	writeJSON(w, http.StatusOK, out)
+	return out
 }
 
 // fetchModels queries a provider's OpenAI-compatible /v1/models endpoint, applying the same
@@ -277,6 +286,139 @@ func (a *Admin) fetchModels(ctx context.Context, p *config.Provider) ([]string, 
 		}
 	}
 	return ids, nil
+}
+
+// modelTestTimeout bounds an entire /admin/test run (discovery + every probe).
+const modelTestTimeout = 5 * time.Minute
+
+// testRequest is the optional JSON body of POST /admin/test; every field has a default.
+type testRequest struct {
+	Provider    string  `json:"provider"`    // limit to one provider (default: all)
+	Exclude     *string `json:"exclude"`     // model-name globs to skip (nil → "gpt-image*")
+	Path        string  `json:"path"`        // force one endpoint (default: per-model)
+	MaxTokens   int     `json:"max_tokens"`  // probe size (default 16)
+	Concurrency int     `json:"concurrency"` // parallel probes (default 8)
+	Stream      bool    `json:"stream"`      // send stream:true
+}
+
+// test runs the same model check as the modelcheck CLI, but in-process: it discovers each
+// provider's models, mints a temporary gateway key bound to them, and probes every model by
+// driving the real data-plane proxy (pinning the provider with X-AGL-Provider) so routing,
+// retry, logging, and metering all behave exactly as a live request would. The temporary key
+// is deleted afterwards. Results are returned as JSON for the portal to render.
+func (a *Admin) test(w http.ResponseWriter, r *http.Request) {
+	if a.dataPlane == nil {
+		writeJSON(w, http.StatusServiceUnavailable, errBody("model testing is unavailable"))
+		return
+	}
+
+	req := testRequest{MaxTokens: 16, Concurrency: 8}
+	if r.Body != nil {
+		// An empty body is fine; defaults apply. Only a malformed body is an error.
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+			writeJSON(w, http.StatusBadRequest, errBody("invalid JSON body"))
+			return
+		}
+	}
+	if req.MaxTokens <= 0 {
+		req.MaxTokens = 16
+	}
+	if req.Concurrency <= 0 {
+		req.Concurrency = 8
+	}
+	exclude := "gpt-image*"
+	if req.Exclude != nil {
+		exclude = *req.Exclude
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), modelTestTimeout)
+	defer cancel()
+
+	// Build the job list from discovered models, applying the provider filter and exclude globs.
+	patterns := probe.ParsePatterns(exclude)
+	var jobs []probe.Job
+	skipped := 0
+	nameSet := map[string]bool{}
+	for _, p := range a.discoverProviders(ctx) {
+		if req.Provider != "" && p.Name != req.Provider {
+			continue
+		}
+		for _, m := range p.Models {
+			if probe.Excluded(patterns, m) {
+				skipped++
+				continue
+			}
+			jobs = append(jobs, probe.Job{Provider: p.Name, Model: m})
+			nameSet[p.Name] = true
+		}
+	}
+	if len(jobs) == 0 {
+		writeJSON(w, http.StatusOK, testResponse{Results: []probe.Result{}, Skipped: skipped})
+		return
+	}
+
+	names := make([]string, 0, len(nameSet))
+	for n := range nameSet {
+		names = append(names, n)
+	}
+
+	// A temporary key bound to the providers under test, deleted on the way out.
+	plain, display, err := keys.Generate()
+	if err != nil {
+		a.logger.Error("model-test key generation failed", "err", err)
+		writeJSON(w, http.StatusInternalServerError, errBody("could not generate test key"))
+		return
+	}
+	k, err := a.store.CreateKey("modeltest-"+time.Now().UTC().Format("20060102-150405"), keys.Hash(plain), display, names)
+	if err != nil {
+		a.logger.Error("model-test key creation failed", "err", err)
+		writeJSON(w, http.StatusInternalServerError, errBody("could not create test key"))
+		return
+	}
+	defer func() {
+		if _, err := a.store.DeleteKey(k.ID); err != nil {
+			a.logger.Warn("could not delete model-test key", "id", k.ID, "err", err)
+		}
+	}()
+
+	// Sender: deliver each probe through the proxy in-process, exactly as a client would.
+	send := func(ctx context.Context, provider, path string, body []byte) (int, string, []byte, error) {
+		hr := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body)).WithContext(ctx)
+		hr.Header.Set("Authorization", "Bearer "+plain)
+		hr.Header.Set("Content-Type", "application/json")
+		hr.Header.Set("X-AGL-Provider", provider)
+		rec := httptest.NewRecorder()
+		a.dataPlane.ServeHTTP(rec, hr)
+		return rec.Code, rec.Header().Get("X-AGL-Attempts"), rec.Body.Bytes(), nil
+	}
+
+	results := probe.Pool(jobs, req.Concurrency, func(j probe.Job) probe.Result {
+		return probe.Probe(ctx, j, req.Path, req.MaxTokens, req.Stream, send)
+	}, nil)
+
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Provider != results[j].Provider {
+			return results[i].Provider < results[j].Provider
+		}
+		return results[i].Model < results[j].Model
+	})
+	passed := 0
+	for _, res := range results {
+		if res.OK {
+			passed++
+		}
+	}
+	writeJSON(w, http.StatusOK, testResponse{
+		Results: results, Passed: passed, Failed: len(results) - passed, Skipped: skipped,
+	})
+}
+
+// testResponse is the JSON returned by POST /admin/test.
+type testResponse struct {
+	Results []probe.Result `json:"results"`
+	Passed  int            `json:"passed"`
+	Failed  int            `json:"failed"`
+	Skipped int            `json:"skipped"`
 }
 
 // --- helpers ---

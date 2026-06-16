@@ -19,4 +19,11 @@ func TestServesHTML(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "agl-gateway") {
 		t.Error("portal HTML missing expected content")
 	}
+	// The model-test UI must be wired up (tab + the endpoint it calls).
+	body := rec.Body.String()
+	for _, want := range []string{"Test models", "runTest", "/admin/test"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("portal HTML missing %q", want)
+		}
+	}
 }

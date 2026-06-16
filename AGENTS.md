@@ -43,12 +43,13 @@ Packages:
 | `internal/store`  | SQLite schema + `api_keys`/`request_logs` access. |
 | `internal/usage`  | Best-effort model + usage extraction (OpenAI/Anthropic, JSON + SSE). |
 | `internal/keys`   | Mint + SHA-256-hash gateway keys. |
+| `internal/probe`  | Shared model-probe logic (endpoint/body/summary, worker pool); used by `cmd/modelcheck` and `/admin/test`. |
 | `internal/proxy`  | Data plane: auth, routing, retry, streaming, metering. |
-| `internal/admin`  | Master-key control plane (`/admin/*`); `/admin/providers` probes upstream `/v1/models`. |
-| `internal/portal` | Embedded management/inspection SPA. |
+| `internal/admin`  | Master-key control plane (`/admin/*`); `/admin/providers` probes upstream `/v1/models`; `/admin/test` runs the model check in-process through the proxy. |
+| `internal/portal` | Embedded management/inspection SPA (keys, logs, stats, model test). |
 | `internal/server` | Top-level HTTP routing. |
 | `cmd/gateway`     | Entrypoint. |
-| `cmd/modelcheck`  | Probes every provider's models through a running gateway. |
+| `cmd/modelcheck`  | CLI that probes every provider's models through a running gateway. |
 
 ## Key invariants — do not break these
 

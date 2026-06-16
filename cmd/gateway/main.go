@@ -49,7 +49,7 @@ func run(configPath string, logger *slog.Logger) error {
 	httpClient := &http.Client{Transport: http.DefaultTransport}
 
 	p := proxy.New(cfg, st, prices, httpClient, logger)
-	a := admin.New(cfg, st, httpClient, logger)
+	a := admin.New(cfg, st, httpClient, p, logger)
 	handler := server.New(p, a, portal.Handler())
 
 	srv := &http.Server{

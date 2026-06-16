@@ -53,6 +53,7 @@
   <button data-tab="keys" class="active" onclick="show('keys')">API Keys</button>
   <button data-tab="logs" onclick="show('logs')">Logs</button>
   <button data-tab="stats" onclick="show('stats')">Stats</button>
+  <button data-tab="test" onclick="show('test')">Test models</button>
 </div>
 
 <main>
@@ -113,6 +114,28 @@
       </tr></thead><tbody id="statsbody"></tbody><tfoot id="statsfoot"></tfoot></table>
     </div>
   </section>
+
+  <section id="tab-test" class="hidden">
+    <div class="panel">
+      <div class="row">
+        <label class="f">Provider
+          <select id="testprovider"><option value="">all providers</option></select></label>
+        <label class="f grow">Exclude (globs)<input id="testexclude" value="gpt-image*" placeholder="gpt-image*,*-audio"></label>
+        <label class="f">Max tokens<input id="testmaxtokens" type="number" value="16" style="width:90px"></label>
+        <label class="f">Concurrency<input id="testconcurrency" type="number" value="8" style="width:90px"></label>
+        <button class="primary" id="testrun" onclick="runTest()">Run test</button>
+      </div>
+      <div class="muted" id="testsummary" style="margin-top:8px">
+        Sends one small request per model through the gateway (same as the modelcheck CLI). This creates request-log entries.
+      </div>
+    </div>
+    <div class="panel">
+      <table><thead><tr>
+        <th>Result</th><th>Provider</th><th>Model</th><th>Endpoint</th><th>Status</th>
+        <th class="num">Tries</th><th class="num">Dur</th><th>Detail</th>
+      </tr></thead><tbody id="testbody"><tr><td colspan="8" class="muted">run a test to see results</td></tr></tbody></table>
+    </div>
+  </section>
 </main>
 
 <div class="toast" id="toast"></div>
@@ -151,6 +174,7 @@ function show(tab){
   if(tab==="keys") loadKeys();
   if(tab==="logs") loadLogs();
   if(tab==="stats") loadStats();
+  if(tab==="test") loadTestProviders();
 }
 
 async function loadProviders(){
@@ -237,6 +261,49 @@ async function loadStats(){
       ? `<tr><th>Total</th><th></th><th class="num">${reqs}</th><th colspan="4"></th><th class="num">${fmtCost(total)}</th></tr>` : "";
     setStatus(true);
   }catch(e){ toast(e.message,false); }
+}
+
+async function loadTestProviders(){
+  try{
+    const provs = await api("GET","/admin/providers");
+    const sel = $("#testprovider"), cur = sel.value;
+    sel.innerHTML = `<option value="">all providers</option>` + provs.map(p=>{
+      const n=(p.models||[]).length;
+      return `<option value="${esc(p.name)}">${esc(p.name)} (${n} model${n===1?"":"s"})</option>`;
+    }).join("");
+    sel.value = cur;
+    setStatus(true);
+  }catch(e){ toast(e.message,false); }
+}
+
+async function runTest(){
+  const btn = $("#testrun");
+  const body = {
+    provider: $("#testprovider").value,
+    exclude: $("#testexclude").value,
+    max_tokens: Number($("#testmaxtokens").value) || 16,
+    concurrency: Number($("#testconcurrency").value) || 8,
+  };
+  btn.disabled = true; const label = btn.textContent; btn.textContent = "Running…";
+  $("#testbody").innerHTML = `<tr><td colspan="8" class="muted">testing models…</td></tr>`;
+  $("#testsummary").textContent = "Running — this sends one request per model and may take a while.";
+  try{
+    const res = await api("POST","/admin/test",body);
+    const rows = (res.results||[]).map(r=>`<tr>
+      <td style="color:${r.ok?'var(--ok)':'var(--danger)'}">${r.ok?"ok":"FAIL"}</td>
+      <td>${esc(r.provider)}</td><td>${esc(r.model)}</td>
+      <td class="muted">${esc(r.endpoint)}</td>
+      <td style="color:${r.status>=200&&r.status<300?'var(--ok)':'var(--danger)'}">${r.status||"—"}</td>
+      <td class="num">${esc(r.attempts||"-")}</td><td class="num">${r.duration_ms}ms</td>
+      <td class="${r.ok?'muted':'danger'}">${esc(r.detail)}</td></tr>`).join("");
+    $("#testbody").innerHTML = rows || `<tr><td colspan="8" class="muted">no models tested</td></tr>`;
+    const skipped = res.skipped ? `, ${res.skipped} skipped` : "";
+    $("#testsummary").innerHTML = `<b style="color:${res.failed?'var(--danger)':'var(--ok)'}">${res.passed} passed, ${res.failed} failed</b>${skipped}.`;
+    setStatus(true);
+  }catch(e){
+    $("#testbody").innerHTML = `<tr><td colspan="8" class="danger">${esc(e.message)}</td></tr>`;
+    toast(e.message,false);
+  }finally{ btn.disabled = false; btn.textContent = label; }
 }
 
 function refresh(){ if(!MASTER){ setStatus(false); return; } loadProviders(); loadKeys(); }
