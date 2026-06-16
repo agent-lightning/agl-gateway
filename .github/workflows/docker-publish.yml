@@ -48,6 +48,9 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          # github.ref_name is the pushed tag (e.g. v1.2.3); stamp it into the binary.
+          build-args: |
+            VERSION=${{ github.ref_name }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

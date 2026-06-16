@@ -48,6 +48,7 @@ Packages:
 | `internal/admin`  | Master-key control plane (`/admin/*`); `/admin/providers` probes upstream `/v1/models`; `/admin/test` runs the model check in-process through the proxy. |
 | `internal/portal` | Embedded management/inspection SPA (keys, logs, stats, model test). |
 | `internal/server` | Top-level HTTP routing. |
+| `internal/version`| Build version string (`var Version`), stamped via `-ldflags` at release. |
 | `cmd/gateway`     | Entrypoint. |
 | `cmd/modelcheck`  | CLI that probes every provider's models through a running gateway. |
 
@@ -94,6 +95,23 @@ go run ./cmd/gateway -config config.yaml
 End-to-end check: run a mock upstream, point a provider at it, create a key via
 `/admin/keys`, send a streaming and a non-streaming request, and confirm a `request_logs`
 row with sane TTFT/tokens/cost (see the smoke test pattern referenced in the README).
+
+## Versioning
+
+The version lives in one place: `var Version` in `internal/version`. It is `"dev"` for any
+local or source build and is overridden at build time via the linker — nothing imports a
+hardcoded number, so there is no constant to keep in sync.
+
+- **What surfaces it:** `GET /healthz` returns `{"status":"ok","version":"…"}`, `gateway
+  -version` prints it, and it is logged on startup.
+- **How releases stamp it:** the Dockerfile takes a `VERSION` build-arg and passes it via
+  `-ldflags "-X …/internal/version.Version=$VERSION"`. The publish-on-tag workflow
+  (`.github/workflows/docker-publish.yml`) sets `VERSION` from the pushed git tag, so a
+  released image reports its tag.
+- **To bump the version:** tag the commit (`git tag vX.Y.Z && git push origin vX.Y.Z`).
+  Follow semver. The tag drives both the GHCR image tags and the stamped version — do **not**
+  edit `internal/version` to set a release number. For a manual/local stamped build:
+  `go build -ldflags "-X github.com/agent-lightning/agl-gateway/internal/version.Version=vX.Y.Z" ./cmd/gateway`.
 
 ## Adding things
 

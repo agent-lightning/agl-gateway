@@ -30,10 +30,10 @@ func TestRouting(t *testing.T) {
 	})
 	h := New(p, a, portal)
 
-	// Health check.
+	// Health check reports status and the (unstamped) build version.
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
-	if rec.Code != http.StatusOK || rec.Body.String() != `{"status":"ok"}` {
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"status":"ok","version":"dev"}` {
 		t.Errorf("healthz = %d %q", rec.Code, rec.Body.String())
 	}
 

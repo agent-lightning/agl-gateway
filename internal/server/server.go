@@ -5,9 +5,11 @@ package server
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/agent-lightning/agl-gateway/internal/admin"
 	"github.com/agent-lightning/agl-gateway/internal/proxy"
+	"github.com/agent-lightning/agl-gateway/internal/version"
 )
 
 // New returns the top-level HTTP handler. portal may be nil to disable the web portal.
@@ -16,7 +18,8 @@ func New(p *proxy.Proxy, a *admin.Admin, portal http.Handler) http.Handler {
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		// strconv.Quote JSON-escapes the version string (it may be any tag).
+		_, _ = w.Write([]byte(`{"status":"ok","version":` + strconv.Quote(version.Version) + `}`))
 	})
 
 	// Control plane (more specific than "/", so it wins for /admin/* paths).

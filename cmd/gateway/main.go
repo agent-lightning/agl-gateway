@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -19,11 +20,18 @@ import (
 	"github.com/agent-lightning/agl-gateway/internal/proxy"
 	"github.com/agent-lightning/agl-gateway/internal/server"
 	"github.com/agent-lightning/agl-gateway/internal/store"
+	"github.com/agent-lightning/agl-gateway/internal/version"
 )
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to the YAML configuration file")
+	showVersion := flag.Bool("version", false, "print the gateway version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version.Version)
+		return
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -61,6 +69,7 @@ func run(configPath string, logger *slog.Logger) error {
 	errCh := make(chan error, 1)
 	go func() {
 		logger.Info("agl-gateway listening",
+			"version", version.Version,
 			"addr", cfg.Server.Addr, "providers", len(cfg.Providers), "database", cfg.Database)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err

@@ -13,8 +13,12 @@ RUN go mod download
 
 COPY . .
 # Static, stripped binary. The portal SPA is embedded via go:embed, so no extra assets
-# need to be copied into the runtime image.
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway
+# need to be copied into the runtime image. VERSION is stamped into the binary so it is
+# reported by GET /healthz and `gateway -version`; it defaults to "dev" for local builds.
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags="-s -w -X github.com/agent-lightning/agl-gateway/internal/version.Version=${VERSION}" \
+    -o /out/gateway ./cmd/gateway
 
 # ---- run ----
 # Latest Debian stable (slim). ca-certificates is required for outbound HTTPS to the
