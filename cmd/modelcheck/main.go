@@ -59,6 +59,7 @@ func main() {
 	masterKey := flag.String("master-key", os.Getenv("AGL_MASTER_KEY"), "gateway master key (or set AGL_MASTER_KEY)")
 	path := flag.String("path", "", "request path for every model (default: auto — /v1/messages for claude*, else /v1/responses)")
 	providerFilter := flag.String("provider", "", "only test this provider (default: all)")
+	exclude := flag.String("exclude", "gpt-image*", "comma-separated model-name globs to skip (e.g. gpt-image*,*-audio)")
 	maxTokens := flag.Int("max-tokens", 16, "max_tokens for each probe request")
 	stream := flag.Bool("stream", false, "send stream:true and read the SSE response")
 	timeout := flag.Duration("timeout", 60*time.Second, "per-request timeout")
@@ -118,15 +119,33 @@ func main() {
 			pathDesc = *path
 		}
 
+		// Parse the exclude globs once; models matching any are skipped (e.g. gpt-image*,
+		// which isn't a chat/responses model and would only produce spurious failures).
+		var patterns []string
+		for _, p := range strings.Split(*exclude, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				patterns = append(patterns, p)
+			}
+		}
+
 		// Flatten to a job list and learn column widths up front so streamed lines align.
 		jobs := make([]job, 0, total)
 		provW, modelW := 0, 0
+		skipped := 0
 		for _, p := range providers {
 			for _, m := range p.Models {
+				if excluded(patterns, m) {
+					skipped++
+					continue
+				}
 				jobs = append(jobs, job{p.Name, m})
 				provW = max(provW, len(p.Name))
 				modelW = max(modelW, len(m))
 			}
+		}
+		if len(jobs) == 0 {
+			fmt.Printf("No models to test: all %d discovered model(s) were excluded by %q\n", total, *exclude)
+			return 0
 		}
 
 		workers := *concurrency
@@ -136,8 +155,12 @@ func main() {
 		if workers > len(jobs) {
 			workers = len(jobs)
 		}
-		fmt.Printf("Testing %d model(s) across %d provider(s) via %s — path: %s — concurrency %d\n\n",
-			total, len(names), base, pathDesc, workers)
+		skipNote := ""
+		if skipped > 0 {
+			skipNote = fmt.Sprintf(" (skipped %d matching %q)", skipped, *exclude)
+		}
+		fmt.Printf("Testing %d model(s)%s across %d provider(s) via %s — path: %s — concurrency %d\n\n",
+			len(jobs), skipNote, len(names), base, pathDesc, workers)
 
 		// Fan out across a bounded worker pool, streaming each result as it completes.
 		done, failures := 0, 0
@@ -200,6 +223,38 @@ func runProbes(client *http.Client, base, path, gwKey string, jobs []job, maxTok
 		results = append(results, r)
 	}
 	return results
+}
+
+// excluded reports whether model matches any of the glob patterns.
+func excluded(patterns []string, model string) bool {
+	for _, p := range patterns {
+		if globMatch(p, model) {
+			return true
+		}
+	}
+	return false
+}
+
+// globMatch matches s against a pattern using `*` as a wildcard (any run of characters).
+// A pattern with no `*` must match exactly. This is enough for model-name filters like
+// "gpt-image*" or "*-audio" without pulling in path-glob semantics.
+func globMatch(pattern, s string) bool {
+	parts := strings.Split(pattern, "*")
+	if len(parts) == 1 {
+		return pattern == s
+	}
+	if !strings.HasPrefix(s, parts[0]) {
+		return false
+	}
+	s = s[len(parts[0]):]
+	for _, mid := range parts[1 : len(parts)-1] {
+		i := strings.Index(s, mid)
+		if i < 0 {
+			return false
+		}
+		s = s[i+len(mid):]
+	}
+	return strings.HasSuffix(s, parts[len(parts)-1])
 }
 
 func probe(client *http.Client, base, explicitPath, gwKey, provider, model string, maxTokens int, stream bool) result {

@@ -153,7 +153,7 @@ go build -o modelcheck ./cmd/modelcheck
 ./modelcheck -url http://localhost:8080 -master-key "$AGL_MASTER_KEY"
 # -concurrency N     parallel probes (default 8)  -path /v1/chat/completions  force one endpoint
 # -provider <name>   only that provider           -max-tokens N               probe size (default 16)
-# -stream            send stream:true
+# -exclude globs     skip models (default gpt-image*, comma-separated)  -stream  send stream:true
 ```
 
 ## How metering works

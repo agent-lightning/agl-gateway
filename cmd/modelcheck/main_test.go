@@ -148,6 +148,41 @@ func fakeGatewaySimple(t *testing.T) *httptest.Server {
 	return srv
 }
 
+func TestGlobMatchAndExcluded(t *testing.T) {
+	cases := []struct {
+		pattern, s string
+		want       bool
+	}{
+		{"gpt-image*", "gpt-image-1", true},
+		{"gpt-image*", "gpt-image-1-mini", true},
+		{"gpt-image*", "gpt-image", true},
+		{"gpt-image*", "gpt-5.4", false},
+		{"gpt-image*", "my-gpt-image-1", false}, // prefix-anchored
+		{"*-audio", "gpt-4o-audio", true},
+		{"*-audio", "gpt-4o", false},
+		{"a*b*c", "axxbyyc", true},
+		{"a*b*c", "axxc", false},
+		{"gpt-5.4", "gpt-5.4", true}, // no wildcard: exact
+		{"gpt-5.4", "gpt-5.4-mini", false},
+	}
+	for _, c := range cases {
+		if got := globMatch(c.pattern, c.s); got != c.want {
+			t.Errorf("globMatch(%q,%q) = %v, want %v", c.pattern, c.s, got, c.want)
+		}
+	}
+
+	patterns := []string{"gpt-image*", "*-audio"}
+	if !excluded(patterns, "gpt-image-1") || !excluded(patterns, "gpt-4o-audio") {
+		t.Error("excluded should match either pattern")
+	}
+	if excluded(patterns, "gpt-5.4") {
+		t.Error("gpt-5.4 should not be excluded")
+	}
+	if excluded(nil, "anything") {
+		t.Error("no patterns should exclude nothing")
+	}
+}
+
 func TestTruncate(t *testing.T) {
 	if got := truncate("a   b\nc", 80); got != "a b c" {
 		t.Errorf("truncate collapses whitespace = %q", got)
