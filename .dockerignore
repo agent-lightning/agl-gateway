@@ -1,0 +1,22 @@
+# VCS / CI
+.git
+.gitignore
+.github
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Local runtime artifacts (never bake these into the image)
+*.db
+*.db-shm
+*.db-wal
+config.yaml
+/gateway
+/modelcheck
+/dist
+
+# Docs / editor cruft
+*.md
+.vscode
+.idea

@@ -63,6 +63,35 @@ curl localhost:8080/v1/chat/completions \
 Open the portal at <http://localhost:8080/portal> and paste the master key to manage keys
 and browse logs/stats.
 
+## Docker
+
+The image is a static binary on Debian slim (non-root, ~13 MB layer for the binary). It
+expects a config at `/data/config.yaml` and keeps the SQLite database in `/data`, so mount
+your config read-only and persist `/data`.
+
+```sh
+docker build -t agl-gateway .
+docker run -p 8080:8080 \
+  -v "$PWD/config.yaml:/data/config.yaml:ro" \
+  -v agl-data:/data \
+  agl-gateway
+```
+
+Or with Compose ([`compose.yaml`](compose.yaml)):
+
+```sh
+cp config.example.yaml config.yaml   # edit master_key, providers, pricing
+docker compose up -d
+```
+
+Pushing a `v*` tag builds and publishes a multi-arch image (linux/amd64 + linux/arm64) to
+the GitHub Container Registry via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml):
+
+```sh
+docker run -p 8080:8080 -v "$PWD/config.yaml:/data/config.yaml:ro" -v agl-data:/data \
+  ghcr.io/agent-lightning/agl-gateway:latest
+```
+
 ## Configuration
 
 See [`config.example.yaml`](config.example.yaml) for a fully commented example. Shape:

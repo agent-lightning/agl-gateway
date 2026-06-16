@@ -1,0 +1,23 @@
+# Example Docker Compose for agl-gateway.
+#
+#   1. cp config.example.yaml config.yaml   # then edit master_key, providers, pricing
+#   2. docker compose up -d
+#   3. open http://localhost:8080/portal
+#
+# config.yaml is mounted read-only; the SQLite database persists in the named volume.
+
+services:
+  gateway:
+    # Build from this repo, or pin the published image instead:
+    #   image: ghcr.io/agent-lightning/agl-gateway:latest
+    build: .
+    image: agl-gateway
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/data/config.yaml:ro
+      - agl-data:/data
+    restart: unless-stopped
+
+volumes:
+  agl-data:
