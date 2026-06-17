@@ -15,7 +15,7 @@ func TestResolvePath(t *testing.T) {
 		{"", "Claude-Sonnet", "/v1/messages"}, // case-insensitive
 		{"", "gpt-5.4", "/v1/responses"},
 		{"", "gpt-5.2", "/v1/chat/completions"},
-		{"", "GPT-5.2", "/v1/chat/completions"}, // case-insensitive
+		{"", "GPT-5.2", "/v1/chat/completions"},                             // case-insensitive
 		{"/v1/chat/completions", "claude-opus-4-8", "/v1/chat/completions"}, // explicit wins
 	}
 	for _, c := range cases {
