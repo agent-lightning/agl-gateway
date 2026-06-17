@@ -103,13 +103,18 @@ func Pool(jobs []Job, workers int, do func(Job) Result, onResult func(Result)) [
 }
 
 // ResolvePath picks the request path for a model. An explicit override wins; otherwise claude*
-// models use Anthropic's /v1/messages and everything else uses OpenAI's /v1/responses.
+// models use Anthropic's /v1/messages, gpt-5.2 uses OpenAI's /v1/chat/completions, and
+// everything else uses OpenAI's /v1/responses.
 func ResolvePath(explicit, model string) string {
 	if explicit != "" {
 		return explicit
 	}
-	if strings.HasPrefix(strings.ToLower(model), "claude") {
+	lower := strings.ToLower(model)
+	if strings.HasPrefix(lower, "claude") {
 		return "/v1/messages"
+	}
+	if strings.HasPrefix(lower, "gpt-5.2") {
+		return "/v1/chat/completions"
 	}
 	return "/v1/responses"
 }
