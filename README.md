@@ -12,11 +12,13 @@ transparently.
 ## Features
 
 - **Key-based routing.** Each gateway API key is bound to one or more providers. Requests
-  are routed to a randomly chosen bound provider, or pinned to one with a request header.
+  follow the key's provider-selection policy (start at the first-bound or a random provider;
+  retry in round-robin or random order), or are pinned to one provider with a request header.
 - **Model mapping.** A provider can rewrite the request's `model` to an upstream name before
   forwarding; both the requested and mapped model are logged.
 - **Retries with backoff + jitter.** Network errors and HTTP 429/5xx are retried per a
-  per-provider (or default) policy. Retries never happen after bytes have reached the client.
+  per-provider (or default) policy, failing over to the key's other bound providers. Retries
+  never happen after bytes have reached the client.
 - **Clear failures.** On failure the client gets a structured error stating the attempt
   count and whether it was a **provider** or **gateway** fault, plus `X-AGL-*` response
   headers.
@@ -60,6 +62,12 @@ curl -X POST localhost:8080/admin/keys \
   -d '{"name":"my-app","providers":["openai"]}'
 # -> {"id":1,"name":"my-app","key":"sk-gw-…","prefix":"sk-gw-…","providers":["openai"],…}
 #    The plaintext "key" is shown only once.
+#
+# A multi-provider key may set its provider-selection policy (used when no provider is
+# pinned). provider_start ∈ first|random, provider_order ∈ round_robin|random
+# (defaults: first / round_robin):
+#   -d '{"name":"my-app","providers":["openai","azure"],
+#        "provider_start":"first","provider_order":"round_robin"}'
 
 # Use it. The path and body are forwarded to the provider's base_url verbatim.
 curl localhost:8080/v1/chat/completions \
@@ -104,10 +112,14 @@ Send requests to the gateway exactly as you would to the upstream provider — t
 query, and body are forwarded verbatim. Authenticate with a gateway key via either
 `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
-A key bound to several providers is normally routed to a randomly chosen one. To pin a
-specific provider, send the `X-AGL-Provider: <name>` request header — it must name one of
-the key's bound providers (otherwise the request is rejected `400`). The header is consumed
-by the gateway and never forwarded upstream.
+A key bound to several providers is routed by its policy: the first attempt uses the
+first-bound provider (`provider_start: first`) or a random one (`random`), and each retry
+fails over to the next provider in `round_robin` (binding order) or `random` order. The
+retry budget comes from the starting provider's policy, so every provider is tried once only
+when `max_retries >= providers-1`. To bypass the policy and pin a specific provider, send the
+`X-AGL-Provider: <name>` request header — it must name one of the key's bound providers
+(otherwise the request is rejected `400`) and disables failover. The header is consumed by
+the gateway and never forwarded upstream.
 
 Successful responses carry `X-AGL-Provider` and `X-AGL-Attempts`, so a request that quietly
 succeeded only after retries is still visible.
@@ -141,7 +153,7 @@ $MASTER_KEY`).
 
 | Method | Path                | Body / query |
 |--------|---------------------|--------------|
-| POST   | `/admin/keys`       | `{"name","providers":[...]}` → returns the plaintext key once |
+| POST   | `/admin/keys`       | `{"name","providers":[...],"provider_start","provider_order"}` → returns the plaintext key once |
 | GET    | `/admin/keys`       | list keys (no secret) |
 | DELETE | `/admin/keys/{id}`  | delete a key (cascades to its logs, reclaiming space) |
 | GET    | `/admin/logs`       | `?limit&offset&api_key_id&provider&since` |

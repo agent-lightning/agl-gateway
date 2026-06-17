@@ -155,3 +155,21 @@ func TestExampleConfigParses(t *testing.T) {
 		}
 	}
 }
+
+func TestRoutingPolicyValidators(t *testing.T) {
+	if !ValidStart(StartFirst) || !ValidStart(StartRandom) {
+		t.Error("ValidStart should accept first and random")
+	}
+	if ValidStart("nope") || ValidStart("") {
+		t.Error("ValidStart should reject unknown/empty values")
+	}
+	if !ValidOrder(OrderRoundRobin) || !ValidOrder(OrderRandom) {
+		t.Error("ValidOrder should accept round_robin and random")
+	}
+	if ValidOrder("nope") || ValidOrder("") {
+		t.Error("ValidOrder should reject unknown/empty values")
+	}
+	if DefaultStart != StartFirst || DefaultOrder != OrderRoundRobin {
+		t.Errorf("defaults = %q/%q, want first/round_robin", DefaultStart, DefaultOrder)
+	}
+}

@@ -28,8 +28,8 @@ OpenAI-compatible `/v1/models` to list models. The data plane stays endpoint-agn
 ## Architecture (data flow)
 
 ```
-client ──► proxy ──┐ auth (sha256 key lookup) ──► pick bound provider (X-AGL-Provider header, else random)
-                   ├─ retry loop (backoff+jitter on net err / 408 / 429 / 5xx / LiteLLM tag-bug 401 / LiteLLM-Azure "unsupported" 400)
+client ──► proxy ──┐ auth (sha256 key lookup) ──► build provider sequence (X-AGL-Provider pins one, else the key's start/order policy)
+                   ├─ retry loop (backoff+jitter on net err / 408 / 429 / 5xx / LiteLLM tag-bug 401 / LiteLLM-Azure "unsupported" 400); each retry fails over to the next provider in the sequence
                    └─ stream upstream→client (SSE flushed), tee into usage.Accumulator
                                                   └─► pricing.Cost ─► store.InsertLog
 ```
@@ -69,6 +69,14 @@ Packages:
   byte-for-byte); the original and mapped model are both logged, and cost is priced by the
   requested model (the alias), falling back to the mapped upstream model only when the
   requested one is unpriced.
+- **Provider selection is per-key and policy-driven.** When a request does not pin a
+  provider via `X-AGL-Provider`, the key's `provider_start` (`first`|`random`) and
+  `provider_order` (`round_robin`|`random`) build the ordered sequence the retry loop walks;
+  each retry fails over to the next provider in that sequence (wrapping if the attempt budget
+  exceeds the provider count). A pinned `X-AGL-Provider` uses exactly that one provider with
+  no failover. The retry budget (`MaxRetries`/backoff) comes from the *starting* provider, so
+  every provider is tried once only when `MaxRetries >= len(providers)-1`. The provider logged
+  and reported in `X-AGL-Provider` is the one that served (or was last tried).
 - **Failures are classified.** Every failure tells the client whether it was a `provider` or
   `gateway` fault, with the attempt count, via both the JSON body and `X-AGL-*` headers.
   Provider responses (incl. surviving 4xx/5xx) pass through; only gateway-side problems are

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -43,7 +44,7 @@ func harness(t *testing.T, upstream http.Handler) (*Proxy, *store.Store, string)
 	p := New(cfg, st, testPricing(), srv.Client(), nil)
 
 	plain, display, _ := keys.Generate()
-	if _, err := st.CreateKey("dev", keys.Hash(plain), display, []string{"up"}); err != nil {
+	if _, err := st.CreateKey("dev", keys.Hash(plain), display, []string{"up"}, config.StartFirst, config.OrderRoundRobin); err != nil {
 		t.Fatalf("create key: %v", err)
 	}
 	return p, st, plain
@@ -362,7 +363,7 @@ func TestNetworkErrorReturns502(t *testing.T) {
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 	p := New(cfg, st, testPricing(), client, nil)
 	plain, display, _ := keys.Generate()
-	st.CreateKey("dev", keys.Hash(plain), display, []string{"dead"})
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"dead"}, config.StartFirst, config.OrderRoundRobin)
 
 	rec := do(t, p, plain, "/v1/x", `{"model":"gpt-5.4"}`)
 	if rec.Code != http.StatusBadGateway {
@@ -396,7 +397,7 @@ func TestUnknownProviderNamesIgnored(t *testing.T) {
 	p, st, _ := harness(t, up)
 	// Key bound to one bogus and one real provider -> must route to the real one.
 	plain, display, _ := keys.Generate()
-	st.CreateKey("mix", keys.Hash(plain), display, []string{"ghost", "up"})
+	st.CreateKey("mix", keys.Hash(plain), display, []string{"ghost", "up"}, config.StartFirst, config.OrderRoundRobin)
 
 	if rec := do(t, p, plain, "/v1/x", `{"model":"gpt-5.4"}`); rec.Code != 200 {
 		t.Errorf("status = %d, want 200", rec.Code)
@@ -428,7 +429,7 @@ func TestModelMappingRewritesAndLogs(t *testing.T) {
 	}
 	p := New(cfg, st, testPricing(), srv.Client(), nil)
 	plain, display, _ := keys.Generate()
-	st.CreateKey("dev", keys.Hash(plain), display, []string{"up"})
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"up"}, config.StartFirst, config.OrderRoundRobin)
 
 	rec := do(t, p, plain, "/v1/chat/completions", `{"model":"alias","messages":[]}`)
 	if rec.Code != 200 {
@@ -469,7 +470,7 @@ func TestPricingPrefersRequestedAlias(t *testing.T) {
 	}
 	p := New(cfg, st, prices, srv.Client(), nil)
 	plain, display, _ := keys.Generate()
-	st.CreateKey("dev", keys.Hash(plain), display, []string{"up"})
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"up"}, config.StartFirst, config.OrderRoundRobin)
 
 	do(t, p, plain, "/v1/x", `{"model":"alias","messages":[]}`)
 	logs, _ := st.QueryLogs(store.LogFilter{})
@@ -517,7 +518,7 @@ func TestProviderFailureErrorIsClear(t *testing.T) {
 	}
 	p := New(cfg, st, testPricing(), &http.Client{Timeout: 500 * time.Millisecond}, nil)
 	plain, display, _ := keys.Generate()
-	st.CreateKey("dev", keys.Hash(plain), display, []string{"dead"})
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"dead"}, config.StartFirst, config.OrderRoundRobin)
 
 	rec := do(t, p, plain, "/v1/x", `{"model":"gpt-5.4"}`)
 	if rec.Code != http.StatusBadGateway {
@@ -610,7 +611,7 @@ func TestProviderSelectionHeader(t *testing.T) {
 	}
 	p := New(cfg, st, testPricing(), srvA.Client(), nil)
 	plain, display, _ := keys.Generate()
-	st.CreateKey("dev", keys.Hash(plain), display, []string{"a", "b"})
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"a", "b"}, config.StartFirst, config.OrderRoundRobin)
 
 	send := func(provider string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/v1/x", strings.NewReader(`{"model":"gpt-5.4"}`))
@@ -664,5 +665,101 @@ func TestUpstream4xxBodyCaptured(t *testing.T) {
 	logs, _ := st.QueryLogs(store.LogFilter{})
 	if !strings.Contains(logs[0].Error, "model_not_found") {
 		t.Errorf("logged error missing upstream reason: %q", logs[0].Error)
+	}
+}
+
+func names(seq []*config.Provider) []string {
+	out := make([]string, len(seq))
+	for i, p := range seq {
+		out[i] = p.Name
+	}
+	return out
+}
+
+func TestProviderSequence(t *testing.T) {
+	valid := []*config.Provider{{Name: "a"}, {Name: "b"}, {Name: "c"}}
+
+	// first/round_robin is deterministic binding order.
+	if got := names(providerSequence(valid, config.StartFirst, config.OrderRoundRobin)); !reflect.DeepEqual(got, []string{"a", "b", "c"}) {
+		t.Errorf("first/round_robin = %v, want [a b c]", got)
+	}
+	// first/random keeps the first-bound provider in front.
+	for i := 0; i < 20; i++ {
+		got := names(providerSequence(valid, config.StartFirst, config.OrderRandom))
+		if got[0] != "a" {
+			t.Errorf("first/random head = %q, want a", got[0])
+		}
+		assertPermutation(t, got)
+	}
+	// random orders preserve membership.
+	for i := 0; i < 20; i++ {
+		assertPermutation(t, names(providerSequence(valid, config.StartRandom, config.OrderRoundRobin)))
+		assertPermutation(t, names(providerSequence(valid, config.StartRandom, config.OrderRandom)))
+	}
+	// A single provider is returned unchanged regardless of policy.
+	one := []*config.Provider{{Name: "solo"}}
+	if got := names(providerSequence(one, config.StartRandom, config.OrderRandom)); !reflect.DeepEqual(got, []string{"solo"}) {
+		t.Errorf("single = %v, want [solo]", got)
+	}
+}
+
+func assertPermutation(t *testing.T, got []string) {
+	t.Helper()
+	want := map[string]bool{"a": true, "b": true, "c": true}
+	if len(got) != 3 {
+		t.Fatalf("len = %d, want 3 (%v)", len(got), got)
+	}
+	seen := map[string]bool{}
+	for _, n := range got {
+		if !want[n] || seen[n] {
+			t.Errorf("not a permutation of a,b,c: %v", got)
+		}
+		seen[n] = true
+	}
+}
+
+func TestFailoverToNextProvider(t *testing.T) {
+	// Provider "a" always fails with a retryable 503; "b" succeeds. A first/round_robin key
+	// must fail over from a to b and report b as the serving provider.
+	var aHits, bHits atomic.Int32
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		aHits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	t.Cleanup(srvA.Close)
+	t.Cleanup(srvB.Close)
+
+	st, _ := store.Open(":memory:")
+	t.Cleanup(func() { st.Close() })
+	cfg := &config.Config{
+		MasterKey: "mk",
+		Defaults:  config.Defaults{Retry: config.Retry{MaxRetries: 3, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}},
+		Providers: []config.Provider{
+			{Name: "a", BaseURL: srvA.URL, APIKey: "x"},
+			{Name: "b", BaseURL: srvB.URL, APIKey: "x"},
+		},
+	}
+	p := New(cfg, st, testPricing(), srvA.Client(), nil)
+	plain, display, _ := keys.Generate()
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"a", "b"}, config.StartFirst, config.OrderRoundRobin)
+
+	rec := do(t, p, plain, "/v1/x", `{"model":"gpt-5.4"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if aHits.Load() != 1 || bHits.Load() != 1 {
+		t.Errorf("hits a=%d b=%d, want a=1 b=1", aHits.Load(), bHits.Load())
+	}
+	if got := rec.Header().Get(headerProvider); got != "b" {
+		t.Errorf("served provider header = %q, want b", got)
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 || logs[0].Provider != "b" || logs[0].Attempts != 2 {
+		t.Fatalf("log = %+v, want provider=b attempts=2", logs[0])
 	}
 }

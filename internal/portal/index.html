@@ -65,12 +65,14 @@
         <label class="f grow">Providers
           <div class="checks" id="provchecks"><span class="muted">connect to load providers</span></div>
         </label>
+        <label class="f">Start<select id="newstart"><option value="first">first</option><option value="random">random</option></select></label>
+        <label class="f">Retry order<select id="neworder"><option value="round_robin">round robin</option><option value="random">random</option></select></label>
         <button class="primary" onclick="createKey()">Create key</button>
       </div>
       <div id="newkeybox"></div>
     </div>
     <div class="panel">
-      <table><thead><tr><th>ID</th><th>Name</th><th>Prefix</th><th>Providers</th><th>Created</th><th></th></tr></thead>
+      <table><thead><tr><th>ID</th><th>Name</th><th>Prefix</th><th>Providers</th><th>Policy</th><th>Created</th><th></th></tr></thead>
       <tbody id="keysbody"></tbody></table>
     </div>
   </section>
@@ -198,9 +200,10 @@ async function loadKeys(){
     $("#keysbody").innerHTML = keys.map(k=>`<tr>
       <td>${k.id}</td><td>${esc(k.name)}</td><td><code>${esc(k.prefix)}…</code></td>
       <td>${(k.providers||[]).map(p=>`<span class="pill">${esc(p)}</span>`).join(" ")}</td>
+      <td class="muted">${esc(k.provider_start||"")} · ${esc(k.provider_order||"")}</td>
       <td class="muted">${fmtTime(k.created_at)}</td>
       <td><button class="danger" onclick="delKey(${k.id})">delete</button></td></tr>`).join("")
-      || `<tr><td colspan="6" class="muted">no keys yet</td></tr>`;
+      || `<tr><td colspan="7" class="muted">no keys yet</td></tr>`;
     setStatus(true);
   }catch(e){ toast(e.message,false); }
 }
@@ -208,10 +211,12 @@ async function loadKeys(){
 async function createKey(){
   const name = $("#newname").value.trim();
   const providers = [...document.querySelectorAll("#provchecks input:checked")].map(i=>i.value);
+  const provider_start = $("#newstart").value;
+  const provider_order = $("#neworder").value;
   if(!name) return toast("name required", false);
   if(!providers.length) return toast("select at least one provider", false);
   try{
-    const k = await api("POST","/admin/keys",{name, providers});
+    const k = await api("POST","/admin/keys",{name, providers, provider_start, provider_order});
     $("#newkeybox").innerHTML = `<div class="keybox">New key for <b>${esc(k.name)}</b> — copy it now, it won't be shown again:<br><code>${esc(k.key)}</code></div>`;
     $("#newname").value="";
     document.querySelectorAll("#provchecks input:checked").forEach(i=>i.checked=false);

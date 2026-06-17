@@ -167,25 +167,26 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// A client may pin the provider via the X-AGL-Provider request header; it must name one
-	// of the key's bound providers. Otherwise a bound provider is chosen at random.
-	var prov *config.Provider
+	// of the key's bound providers, and no cross-provider failover is attempted. Otherwise
+	// the key's provider-selection policy builds the ordered sequence of providers to try.
+	var sequence []*config.Provider
 	if requested := strings.TrimSpace(r.Header.Get(headerProvider)); requested != "" {
 		for _, cp := range valid {
 			if cp.Name == requested {
-				prov = cp
+				sequence = []*config.Provider{cp}
 				break
 			}
 		}
-		if prov == nil {
+		if sequence == nil {
 			gatewayError(w, http.StatusBadRequest, sourceGateway, "",
 				fmt.Sprintf("agl-gateway: provider %q is not bound to this API key", requested), 0)
 			return
 		}
 	} else {
-		prov = valid[rand.IntN(len(valid))]
+		sequence = providerSequence(valid, key.ProviderStart, key.ProviderOrder)
 	}
 
-	p.forward(w, r, body, key, prov, model, start)
+	p.forward(w, r, body, key, sequence, model, start)
 }
 
 // validProviders returns the providers bound to the key that still exist in the
@@ -200,34 +201,75 @@ func (p *Proxy) validProviders(key *store.APIKey) []*config.Provider {
 	return valid
 }
 
-// forward applies model mapping, runs the retry loop, and streams the final response.
-func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key *store.APIKey, prov *config.Provider, model string, start time.Time) {
-	retry := prov.ResolvedRetry(p.cfg.Defaults.Retry)
-	target := strings.TrimRight(prov.BaseURL, "/") + r.URL.Path
-	if r.URL.RawQuery != "" {
-		target += "?" + r.URL.RawQuery
+// providerSequence orders a key's valid providers into the sequence of attempts the retry
+// loop walks when no provider is pinned. "start" fixes the first provider (the first-bound
+// one, or a random one); "order" determines how the rest follow — binding order for
+// round-robin (optionally rotated to a random start), shuffled for random.
+func providerSequence(valid []*config.Provider, start, order string) []*config.Provider {
+	seq := make([]*config.Provider, len(valid))
+	copy(seq, valid)
+	n := len(seq)
+	if n <= 1 {
+		return seq
 	}
-
-	// Model mapping: rewrite the request's model to the provider's upstream name.
-	sendBody := body
-	effectiveModel := model
-	mappedModel := ""
-	if to, ok := prov.ModelMap[model]; ok && to != "" && to != model {
-		if rewritten, done := usage.SetModel(body, to); done {
-			sendBody = rewritten
-			mappedModel = to
-			effectiveModel = to
+	switch order {
+	case config.OrderRandom:
+		if start == config.StartRandom {
+			rand.Shuffle(n, func(i, j int) { seq[i], seq[j] = seq[j], seq[i] })
+		} else {
+			// Keep the first-bound provider in front; shuffle the rest.
+			rand.Shuffle(n-1, func(i, j int) { seq[i+1], seq[j+1] = seq[j+1], seq[i+1] })
+		}
+	default: // round-robin: binding order, rotated to a random start when start=random.
+		if start == config.StartRandom {
+			k := rand.IntN(n)
+			rot := make([]*config.Provider, 0, n)
+			rot = append(rot, seq[k:]...)
+			rot = append(rot, seq[:k]...)
+			seq = rot
 		}
 	}
+	return seq
+}
 
-	logRow := &store.RequestLog{
-		APIKeyID: key.ID, KeyName: key.Name, Provider: prov.Name, Model: model, MappedModel: mappedModel,
-	}
+// forward applies model mapping, runs the retry loop (failing over across the provider
+// sequence), and streams the final response.
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key *store.APIKey, sequence []*config.Provider, model string, start time.Time) {
+	// The retry budget (attempt count + backoff) travels with the starting provider; each
+	// retry advances to the next provider in the sequence, wrapping if the budget exceeds
+	// the provider count.
+	retry := sequence[0].ResolvedRetry(p.cfg.Defaults.Retry)
 
-	var resp *http.Response
-	var lastErr error
-	attempts := 0
+	logRow := &store.RequestLog{APIKeyID: key.ID, KeyName: key.Name, Model: model}
+
+	var (
+		resp           *http.Response
+		lastErr        error
+		prov           *config.Provider
+		sendBody       []byte
+		effectiveModel string
+		mappedModel    string
+		attempts       int
+	)
 	for attempt := 0; ; attempt++ {
+		prov = sequence[attempt%len(sequence)]
+
+		// Target and model mapping are provider-scoped, so recompute them each attempt.
+		target := strings.TrimRight(prov.BaseURL, "/") + r.URL.Path
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		sendBody = body
+		effectiveModel = model
+		mappedModel = ""
+		if to, ok := prov.ModelMap[model]; ok && to != "" && to != model {
+			if rewritten, done := usage.SetModel(body, to); done {
+				sendBody = rewritten
+				mappedModel = to
+				effectiveModel = to
+			}
+		}
+
 		req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(sendBody))
 		if err != nil {
 			lastErr = err
@@ -261,6 +303,10 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 		break
 	}
 
+	// prov, mappedModel, and effectiveModel reflect the provider of the last attempt — the
+	// one that served the response (or the last one tried before giving up).
+	logRow.Provider = prov.Name
+	logRow.MappedModel = mappedModel
 	logRow.Attempts = attempts
 
 	// No HTTP response at all: a network/transport failure (or a request we couldn't build).

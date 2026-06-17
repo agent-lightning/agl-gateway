@@ -83,6 +83,25 @@ func (p Provider) ResolvedRetry(def Retry) Retry {
 	return r
 }
 
+// Provider-selection policy values for a key. When a request does not pin a provider via
+// the X-AGL-Provider header and the key is bound to several providers, "start" decides
+// which provider the first attempt uses and "order" decides how retries walk the rest.
+const (
+	StartFirst      = "first"       // first attempt uses the first-bound provider
+	StartRandom     = "random"      // first attempt uses a random bound provider
+	OrderRoundRobin = "round_robin" // retries walk the remaining providers in order
+	OrderRandom     = "random"      // retries pick the remaining providers at random
+
+	DefaultStart = StartFirst
+	DefaultOrder = OrderRoundRobin
+)
+
+// ValidStart reports whether s is a recognized provider-selection start policy.
+func ValidStart(s string) bool { return s == StartFirst || s == StartRandom }
+
+// ValidOrder reports whether s is a recognized provider-selection retry order.
+func ValidOrder(s string) bool { return s == OrderRoundRobin || s == OrderRandom }
+
 // Load reads, parses, and validates the configuration file at path.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)

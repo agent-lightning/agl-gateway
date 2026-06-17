@@ -1,6 +1,8 @@
 package store
 
 import (
+	"database/sql"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -17,7 +19,7 @@ func newTestStore(t *testing.T) *Store {
 
 func TestDeleteKeyCascadesLogs(t *testing.T) {
 	s := newTestStore(t)
-	k, err := s.CreateKey("dev", "h", "p", []string{"openai"})
+	k, err := s.CreateKey("dev", "h", "p", []string{"openai"}, "first", "round_robin")
 	if err != nil {
 		t.Fatalf("CreateKey: %v", err)
 	}
@@ -62,7 +64,7 @@ func TestLogMappedModelAndAttempts(t *testing.T) {
 func TestKeyLifecycle(t *testing.T) {
 	s := newTestStore(t)
 
-	k, err := s.CreateKey("dev", "hash-abc", "sk-gw-ab", []string{"openai", "anthropic"})
+	k, err := s.CreateKey("dev", "hash-abc", "sk-gw-ab", []string{"openai", "anthropic"}, "first", "round_robin")
 	if err != nil {
 		t.Fatalf("CreateKey: %v", err)
 	}
@@ -112,10 +114,10 @@ func TestKeyLifecycle(t *testing.T) {
 
 func TestDuplicateHashRejected(t *testing.T) {
 	s := newTestStore(t)
-	if _, err := s.CreateKey("a", "dup", "p", []string{"x"}); err != nil {
+	if _, err := s.CreateKey("a", "dup", "p", []string{"x"}, "first", "round_robin"); err != nil {
 		t.Fatalf("CreateKey: %v", err)
 	}
-	if _, err := s.CreateKey("b", "dup", "p", []string{"x"}); err == nil {
+	if _, err := s.CreateKey("b", "dup", "p", []string{"x"}, "first", "round_robin"); err == nil {
 		t.Error("expected error inserting duplicate hash")
 	}
 }
@@ -195,5 +197,54 @@ func TestStats(t *testing.T) {
 	top := stats[0]
 	if top.Model != "gpt-5.4" || top.Requests != 2 || top.InputTokens != 200 || top.Cost != 1.0 {
 		t.Errorf("unexpected top stat: %+v", top)
+	}
+}
+
+func TestCreateKeyPersistsPolicy(t *testing.T) {
+	s := newTestStore(t)
+	k, err := s.CreateKey("dev", "h1", "p", []string{"a", "b"}, "random", "random")
+	if err != nil {
+		t.Fatalf("CreateKey: %v", err)
+	}
+	if k.ProviderStart != "random" || k.ProviderOrder != "random" {
+		t.Errorf("returned policy = %q/%q, want random/random", k.ProviderStart, k.ProviderOrder)
+	}
+	got, err := s.KeyByHash("h1")
+	if err != nil || got == nil {
+		t.Fatalf("KeyByHash: %v (key=%v)", err, got)
+	}
+	if got.ProviderStart != "random" || got.ProviderOrder != "random" {
+		t.Errorf("stored policy = %q/%q, want random/random", got.ProviderStart, got.ProviderOrder)
+	}
+}
+
+func TestLegacyDBUpgradesPolicyColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	// Seed an api_keys table without the policy columns, as an older version would.
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	_, err = raw.Exec(`CREATE TABLE api_keys (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, hash TEXT NOT NULL UNIQUE,
+		prefix TEXT NOT NULL, providers TEXT NOT NULL, created_at INTEGER NOT NULL,
+		disabled INTEGER NOT NULL DEFAULT 0);
+		INSERT INTO api_keys (name, hash, prefix, providers, created_at) VALUES ('old','legacy','p','["a"]',0);`)
+	if err != nil {
+		t.Fatalf("seed legacy: %v", err)
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	k, err := s.KeyByHash("legacy")
+	if err != nil || k == nil {
+		t.Fatalf("KeyByHash: %v (key=%v)", err, k)
+	}
+	if k.ProviderStart != "first" || k.ProviderOrder != "round_robin" {
+		t.Errorf("upgraded policy = %q/%q, want first/round_robin", k.ProviderStart, k.ProviderOrder)
 	}
 }

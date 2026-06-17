@@ -70,6 +70,10 @@ func TestCreateListDeleteKey(t *testing.T) {
 	if created.Key == "" || created.ID == 0 {
 		t.Fatalf("missing key/id: %+v", created)
 	}
+	// Omitted policy falls back to the defaults.
+	if created.ProviderStart != "first" || created.ProviderOrder != "round_robin" {
+		t.Errorf("default policy = %q/%q, want first/round_robin", created.ProviderStart, created.ProviderOrder)
+	}
 
 	// List omits the secret but includes the key.
 	rec = req(t, h, "GET", "/admin/keys", master, "")
@@ -100,6 +104,8 @@ func TestCreateKeyValidation(t *testing.T) {
 		"no providers":     `{"name":"x","providers":[]}`,
 		"unknown provider": `{"name":"x","providers":["ghost"]}`,
 		"bad json":         `{`,
+		"bad start":        `{"name":"x","providers":["openai"],"provider_start":"nope"}`,
+		"bad order":        `{"name":"x","providers":["openai"],"provider_order":"nope"}`,
 	}
 	for name, body := range cases {
 		if rec := req(t, h, "POST", "/admin/keys", master, body); rec.Code != http.StatusBadRequest {

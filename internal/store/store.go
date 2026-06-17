@@ -13,13 +13,15 @@ import (
 // APIKey is a stored gateway credential. The plaintext key itself is never stored;
 // only its SHA-256 hash (for lookup) and a short prefix (for display).
 type APIKey struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	Hash      string    `json:"-"`
-	Prefix    string    `json:"prefix"`
-	Providers []string  `json:"providers"`
-	CreatedAt time.Time `json:"created_at"`
-	Disabled  bool      `json:"disabled"`
+	ID            int64     `json:"id"`
+	Name          string    `json:"name"`
+	Hash          string    `json:"-"`
+	Prefix        string    `json:"prefix"`
+	Providers     []string  `json:"providers"`
+	ProviderStart string    `json:"provider_start"`
+	ProviderOrder string    `json:"provider_order"`
+	CreatedAt     time.Time `json:"created_at"`
+	Disabled      bool      `json:"disabled"`
 }
 
 // RequestLog is the recorded metadata for a single proxied request.
@@ -101,13 +103,15 @@ func (s *Store) migrate() error {
 	}
 	const schema = `
 CREATE TABLE IF NOT EXISTS api_keys (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    name       TEXT NOT NULL,
-    hash       TEXT NOT NULL UNIQUE,
-    prefix     TEXT NOT NULL,
-    providers  TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    disabled   INTEGER NOT NULL DEFAULT 0
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL,
+    hash           TEXT NOT NULL UNIQUE,
+    prefix         TEXT NOT NULL,
+    providers      TEXT NOT NULL,
+    provider_start TEXT NOT NULL DEFAULT 'first',
+    provider_order TEXT NOT NULL DEFAULT 'round_robin',
+    created_at     INTEGER NOT NULL,
+    disabled       INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS request_logs (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,6 +146,12 @@ CREATE INDEX IF NOT EXISTS idx_logs_api_key_id ON request_logs(api_key_id);
 	if err := s.ensureColumn("request_logs", "attempts", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn("api_keys", "provider_start", "TEXT NOT NULL DEFAULT 'first'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("api_keys", "provider_order", "TEXT NOT NULL DEFAULT 'round_robin'"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -171,27 +181,29 @@ func (s *Store) ensureColumn(table, column, decl string) error {
 }
 
 // CreateKey inserts a new API key and returns the stored row.
-func (s *Store) CreateKey(name, hash, prefix string, providers []string) (*APIKey, error) {
+func (s *Store) CreateKey(name, hash, prefix string, providers []string, start, order string) (*APIKey, error) {
 	provJSON, err := json.Marshal(providers)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now()
 	res, err := s.db.Exec(
-		`INSERT INTO api_keys (name, hash, prefix, providers, created_at, disabled) VALUES (?, ?, ?, ?, ?, 0)`,
-		name, hash, prefix, string(provJSON), now.UnixMilli(),
+		`INSERT INTO api_keys (name, hash, prefix, providers, provider_start, provider_order, created_at, disabled) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+		name, hash, prefix, string(provJSON), start, order, now.UnixMilli(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create key: %w", err)
 	}
 	id, _ := res.LastInsertId()
 	return &APIKey{
-		ID:        id,
-		Name:      name,
-		Hash:      hash,
-		Prefix:    prefix,
-		Providers: providers,
-		CreatedAt: time.UnixMilli(now.UnixMilli()),
+		ID:            id,
+		Name:          name,
+		Hash:          hash,
+		Prefix:        prefix,
+		Providers:     providers,
+		ProviderStart: start,
+		ProviderOrder: order,
+		CreatedAt:     time.UnixMilli(now.UnixMilli()),
 	}, nil
 }
 
@@ -199,14 +211,14 @@ func (s *Store) CreateKey(name, hash, prefix string, providers []string) (*APIKe
 // matching key exists.
 func (s *Store) KeyByHash(hash string) (*APIKey, error) {
 	row := s.db.QueryRow(
-		`SELECT id, name, hash, prefix, providers, created_at, disabled FROM api_keys WHERE hash = ?`, hash)
+		`SELECT id, name, hash, prefix, providers, provider_start, provider_order, created_at, disabled FROM api_keys WHERE hash = ?`, hash)
 	return scanKey(row)
 }
 
 // ListKeys returns all API keys, newest first.
 func (s *Store) ListKeys() ([]APIKey, error) {
 	rows, err := s.db.Query(
-		`SELECT id, name, hash, prefix, providers, created_at, disabled FROM api_keys ORDER BY id DESC`)
+		`SELECT id, name, hash, prefix, providers, provider_start, provider_order, created_at, disabled FROM api_keys ORDER BY id DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -260,7 +272,7 @@ func scanKey(sc scanner) (*APIKey, error) {
 		createdMs int64
 		disabled  int
 	)
-	err := sc.Scan(&k.ID, &k.Name, &k.Hash, &k.Prefix, &provJSON, &createdMs, &disabled)
+	err := sc.Scan(&k.ID, &k.Name, &k.Hash, &k.Prefix, &provJSON, &k.ProviderStart, &k.ProviderOrder, &createdMs, &disabled)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

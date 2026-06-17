@@ -77,6 +77,10 @@ func (a *Admin) authMiddleware(next http.Handler) http.Handler {
 type createKeyRequest struct {
 	Name      string   `json:"name"`
 	Providers []string `json:"providers"`
+	// Start and Order set the key's provider-selection policy when a request does not pin a
+	// provider via X-AGL-Provider. Empty values fall back to the package defaults.
+	Start string `json:"provider_start"`
+	Order string `json:"provider_order"`
 }
 
 type createKeyResponse struct {
@@ -105,6 +109,20 @@ func (a *Admin) createKey(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.Start == "" {
+		req.Start = config.DefaultStart
+	}
+	if req.Order == "" {
+		req.Order = config.DefaultOrder
+	}
+	if !config.ValidStart(req.Start) {
+		writeJSON(w, http.StatusBadRequest, errBody("invalid provider_start: "+req.Start))
+		return
+	}
+	if !config.ValidOrder(req.Order) {
+		writeJSON(w, http.StatusBadRequest, errBody("invalid provider_order: "+req.Order))
+		return
+	}
 
 	plain, display, err := keys.Generate()
 	if err != nil {
@@ -112,7 +130,7 @@ func (a *Admin) createKey(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, errBody("could not generate key"))
 		return
 	}
-	k, err := a.store.CreateKey(req.Name, keys.Hash(plain), display, req.Providers)
+	k, err := a.store.CreateKey(req.Name, keys.Hash(plain), display, req.Providers, req.Start, req.Order)
 	if err != nil {
 		a.logger.Error("create key failed", "err", err)
 		writeJSON(w, http.StatusInternalServerError, errBody("could not store key"))
@@ -383,7 +401,7 @@ func (a *Admin) test(w http.ResponseWriter, r *http.Request) {
 		emit(testEvent{Type: "error", Message: "could not generate test key"})
 		return
 	}
-	k, err := a.store.CreateKey("modeltest-"+time.Now().UTC().Format("20060102-150405"), keys.Hash(plain), display, names)
+	k, err := a.store.CreateKey("modeltest-"+time.Now().UTC().Format("20060102-150405"), keys.Hash(plain), display, names, config.DefaultStart, config.DefaultOrder)
 	if err != nil {
 		a.logger.Error("model-test key creation failed", "err", err)
 		emit(testEvent{Type: "error", Message: "could not create test key"})
