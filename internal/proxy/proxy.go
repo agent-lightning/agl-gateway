@@ -422,6 +422,16 @@ func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
 // succeeds on retry, so we treat that specific 401 as transient.
 const litellmTagBugMarker = "due to tags configuration"
 
+// azureUnsupportedMarkers are substrings of a known LiteLLM/Azure flake: a valid request is
+// intermittently rejected with a 400 "litellm.BadRequestError: AzureException - The requested
+// operation is unsupported.. Received Model Group=… Available Model Group Fallbacks=None". It
+// succeeds on retry, so we treat that specific 400 as transient. Both markers must be present
+// so we only retry the LiteLLM-originated variant, not an unrelated provider 400.
+var azureUnsupportedMarkers = [][]byte{
+	[]byte("litellm"),
+	[]byte("The requested operation is unsupported"),
+}
+
 // retryableStatus reports whether a status code is transient and worth retrying on its own:
 // request timeout (408), rate limit (429), and any 5xx. These are also the statuses reported
 // to the client as a provider-side failure when they survive the retry loop.
@@ -432,14 +442,15 @@ func retryableStatus(status int) bool {
 }
 
 // retryable reports whether an upstream response should be retried. 408, 429 and 5xx always
-// are. A 401 is retried only when its body matches the known LiteLLM tag-config bug above.
-// Detecting that requires reading the body, so the consumed bytes are restored to resp.Body
+// are. A 401 is retried only when its body matches the known LiteLLM tag-config bug, and a
+// 400 only when it matches the known LiteLLM/Azure "operation is unsupported" flake.
+// Detecting either requires reading the body, so the consumed bytes are restored to resp.Body
 // (via a MultiReader) for the pass-through path when we decide not to retry.
 func retryable(resp *http.Response) bool {
 	if retryableStatus(resp.StatusCode) {
 		return true
 	}
-	if resp.StatusCode != http.StatusUnauthorized {
+	if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusBadRequest {
 		return false
 	}
 	orig := resp.Body
@@ -448,7 +459,16 @@ func retryable(resp *http.Response) bool {
 		io.Reader
 		io.Closer
 	}{io.MultiReader(bytes.NewReader(head), orig), orig}
-	return bytes.Contains(head, []byte(litellmTagBugMarker))
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return bytes.Contains(head, []byte(litellmTagBugMarker))
+	}
+	for _, m := range azureUnsupportedMarkers {
+		if !bytes.Contains(head, m) {
+			return false
+		}
+	}
+	return true
 }
 
 // sleepBackoff waits for an exponential backoff with full jitter. It returns false if the

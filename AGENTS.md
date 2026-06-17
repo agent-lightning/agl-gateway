@@ -29,7 +29,7 @@ OpenAI-compatible `/v1/models` to list models. The data plane stays endpoint-agn
 
 ```
 client ──► proxy ──┐ auth (sha256 key lookup) ──► pick bound provider (X-AGL-Provider header, else random)
-                   ├─ retry loop (backoff+jitter on net err / 408 / 429 / 5xx / LiteLLM tag-bug 401)
+                   ├─ retry loop (backoff+jitter on net err / 408 / 429 / 5xx / LiteLLM tag-bug 401 / LiteLLM-Azure "unsupported" 400)
                    └─ stream upstream→client (SSE flushed), tee into usage.Accumulator
                                                   └─► pricing.Cost ─► store.InsertLog
 ```

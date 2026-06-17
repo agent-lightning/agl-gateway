@@ -230,6 +230,62 @@ func TestNoRetryOnGeneric401(t *testing.T) {
 	}
 }
 
+// A LiteLLM/Azure "operation is unsupported" 400 is a known transient flake: retry it, and a
+// later success passes through normally.
+func TestRetryOnAzureUnsupported400(t *testing.T) {
+	var calls atomic.Int32
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"error":{"message":"litellm.BadRequestError: AzureException - The requested operation is unsupported.. Received Model Group=gpt-5.2-codex Available Model Group Fallbacks=None"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"ok":true}`)
+	})
+	p, st, key := harness(t, up)
+
+	rec := do(t, p, key, "/v1/x", `{"model":"gpt-5.2-codex"}`)
+	if got := calls.Load(); got != 2 {
+		t.Errorf("upstream calls = %d, want 2 (one retry)", got)
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 || logs[0].StatusCode != http.StatusOK || logs[0].Attempts != 2 {
+		t.Errorf("expected one 200 log with 2 attempts, got %+v", logs)
+	}
+}
+
+// An unrelated 400 must NOT be retried, and its body must pass through unchanged. The
+// "operation is unsupported" text without the litellm signature is the boundary case.
+func TestNoRetryOnGeneric400(t *testing.T) {
+	var calls atomic.Int32
+	const body = `{"error":{"message":"AzureException - The requested operation is unsupported."}}`
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, body)
+	})
+	p, st, key := harness(t, up)
+
+	rec := do(t, p, key, "/v1/x", `{"model":"gpt-5.4"}`)
+	if got := calls.Load(); got != 1 {
+		t.Errorf("upstream calls = %d, want 1 (no retry)", got)
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+	if rec.Body.String() != body {
+		t.Errorf("body = %q, want %q (must pass through unchanged)", rec.Body.String(), body)
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 || logs[0].StatusCode != http.StatusBadRequest || logs[0].Attempts != 1 {
+		t.Errorf("expected one 400 log with 1 attempt, got %+v", logs)
+	}
+}
+
 // A 408 from the upstream is transient and must be retried like 429/5xx.
 func TestRetryOn408(t *testing.T) {
 	var calls atomic.Int32
