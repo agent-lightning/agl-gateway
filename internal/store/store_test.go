@@ -49,6 +49,7 @@ func TestLogMappedModelAndAttempts(t *testing.T) {
 	if err := s.InsertLog(&RequestLog{
 		APIKeyID: 1, KeyName: "dev", Provider: "openai",
 		Model: "alias", MappedModel: "gpt-5.4", Attempts: 3, StatusCode: 200,
+		APIType: "openai_chat", AssembleError: "anthropic accumulate: boom",
 		RequestContentType: "application/json", ResponseContentType: "text/event-stream",
 	}); err != nil {
 		t.Fatalf("InsertLog: %v", err)
@@ -59,6 +60,10 @@ func TestLogMappedModelAndAttempts(t *testing.T) {
 	}
 	if logs[0].MappedModel != "gpt-5.4" || logs[0].Attempts != 3 {
 		t.Errorf("round-trip mismatch: %+v", logs[0])
+	}
+	// api_type and assemble_error are returned without IncludePayloads.
+	if logs[0].APIType != "openai_chat" || logs[0].AssembleError != "anthropic accumulate: boom" {
+		t.Errorf("api_type/assemble_error = %q/%q", logs[0].APIType, logs[0].AssembleError)
 	}
 	if logs[0].RequestContentType != "application/json" || logs[0].ResponseContentType != "text/event-stream" {
 		t.Errorf("content types = %q/%q", logs[0].RequestContentType, logs[0].ResponseContentType)

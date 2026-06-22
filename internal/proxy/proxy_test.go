@@ -91,6 +91,9 @@ func TestForwardNonStreaming(t *testing.T) {
 	if l.Model != "gpt-5.4" || l.InputTokens != 600 || l.OutputTokens != 200 || l.CacheReadTokens != 400 {
 		t.Errorf("unexpected log usage: %+v", l)
 	}
+	if l.APIType != "openai_chat" {
+		t.Errorf("api_type = %q, want openai_chat", l.APIType)
+	}
 	wantCost := 600*2.5e-6 + 200*1.5e-5 + 400*2.5e-7
 	if l.Cost < wantCost-1e-12 || l.Cost > wantCost+1e-12 {
 		t.Errorf("cost = %v, want %v", l.Cost, wantCost)
@@ -201,6 +204,51 @@ func TestPayloadCaptureUnknownStreamKeepsRawOnly(t *testing.T) {
 	}
 	if len(logs[0].AssembledResponse) != 0 {
 		t.Errorf("assembled unknown stream = %s, want empty", logs[0].AssembledResponse)
+	}
+	if logs[0].APIType != "" {
+		t.Errorf("api_type for unknown path = %q, want empty", logs[0].APIType)
+	}
+}
+
+// TestPayloadCaptureRecordsAssembleErrorButStillMeters drives a malformed Anthropic stream (a
+// content block delta with no preceding start) so the SDK accumulator gives up. The raw response
+// is still captured, the failure reason is recorded, and usage from message_start is still metered.
+func TestPayloadCaptureRecordsAssembleError(t *testing.T) {
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		fmt.Fprint(w, "event: message_start\n"+
+			`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude","content":[],"usage":{"input_tokens":7,"output_tokens":1}}}`+"\n\n")
+		fl.Flush()
+		// Delta for an index with no content_block_start: an out-of-order gap the SDK rejects.
+		fmt.Fprint(w, "event: content_block_delta\n"+
+			`data: {"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"oops"}}`+"\n\n")
+		fl.Flush()
+	})
+	p, st, key := harness(t, up)
+	p.cfg.PayloadCapture = config.PayloadCapture{Enabled: true, AssembleStreams: true}
+
+	rec := do(t, p, key, "/v1/messages", `{"model":"claude","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{IncludePayloads: true})
+	if len(logs) != 1 {
+		t.Fatalf("logs = %d, want 1", len(logs))
+	}
+	l := logs[0]
+	if l.APIType != "anthropic_messages" {
+		t.Errorf("api_type = %q, want anthropic_messages", l.APIType)
+	}
+	if l.AssembleError == "" || len(l.AssembledResponse) != 0 {
+		t.Errorf("expected assemble_error set and no assembled body, got error=%q assembled=%s", l.AssembleError, l.AssembledResponse)
+	}
+	if string(l.RawResponse) != rec.Body.String() {
+		t.Errorf("raw response not captured: %q", l.RawResponse)
+	}
+	// Usage from message_start survives the assembly failure (metering is best-effort, non-blocking).
+	if l.InputTokens != 7 {
+		t.Errorf("input tokens = %d, want 7 (from message_start)", l.InputTokens)
 	}
 }
 

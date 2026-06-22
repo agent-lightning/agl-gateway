@@ -91,7 +91,7 @@
     </div>
     <div class="panel">
       <table><thead><tr>
-        <th>Time</th><th>Key</th><th>Provider</th><th>Model</th><th>Mapped→</th><th>Status</th>
+        <th>Time</th><th>Key</th><th>Provider</th><th>Model</th><th>Mapped→</th><th>API</th><th>Status</th>
         <th class="num">Tries</th><th>Stream</th>
         <th class="num">TTFT</th><th class="num">Dur</th><th class="num">In</th><th class="num">Out</th>
         <th class="num">Cache R</th><th class="num">Cache W</th><th class="num">Cost</th><th>Error</th>
@@ -241,14 +241,15 @@ async function loadLogs(){
       <td class="muted">${fmtTime(l.created_at)}</td><td>${esc(l.key_name)}</td>
       <td>${esc(l.provider)}</td><td>${esc(l.model)}</td>
       <td class="muted">${l.mapped_model?esc(l.mapped_model):"—"}</td>
+      <td class="muted">${l.api_type?esc(l.api_type):"—"}</td>
       <td style="color:${l.status_code>=200&&l.status_code<300?'var(--ok)':'var(--danger)'}">${l.status_code}</td>
       <td class="num">${l.attempts}</td>
       <td>${l.streaming?"yes":"no"}</td>
       <td class="num">${l.ttft_ms}ms</td><td class="num">${l.duration_ms}ms</td>
       <td class="num">${l.input_tokens}</td><td class="num">${l.output_tokens}</td>
       <td class="num">${l.cache_read_tokens}</td><td class="num">${l.cache_write_tokens}</td>
-      <td class="num">${fmtCost(l.cost)}</td><td class="wrap danger">${esc(l.error)}</td></tr>`).join("")
-      || `<tr><td colspan="16" class="muted">no requests logged</td></tr>`;
+      <td class="num">${fmtCost(l.cost)}</td><td class="wrap danger">${esc(l.error)}${l.assemble_error?`<div class="muted">assemble: ${esc(l.assemble_error)}</div>`:""}</td></tr>`).join("")
+      || `<tr><td colspan="17" class="muted">no requests logged</td></tr>`;
     setStatus(true);
   }catch(e){ toast(e.message,false); }
 }

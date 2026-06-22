@@ -2,18 +2,22 @@ package capture
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
+// assemble feeds streamed SSE chunks and returns the assembled body plus an ok flag (true when no
+// failure reason was reported), matching how the proxy treats an empty reason as success.
 func assemble(t *testing.T, format StreamFormat, chunks ...string) ([]byte, bool) {
 	t.Helper()
-	a := NewStreamAssembler(format)
+	a := NewAccumulator(format, true)
 	for _, c := range chunks {
 		if _, err := a.Write([]byte(c)); err != nil {
 			t.Fatalf("Write: %v", err)
 		}
 	}
-	return a.Finalize()
+	data, reason := a.Finalize()
+	return data, reason == ""
 }
 
 func TestFormatForPath(t *testing.T) {
@@ -33,10 +37,30 @@ func TestFormatForPath(t *testing.T) {
 	}
 }
 
+func TestStreamFormatString(t *testing.T) {
+	cases := map[StreamFormat]string{
+		FormatOpenAIChat:        "openai_chat",
+		FormatOpenAIResponses:   "openai_responses",
+		FormatAnthropicMessages: "anthropic_messages",
+		FormatUnknown:           "",
+	}
+	for f, want := range cases {
+		if got := f.String(); got != want {
+			t.Errorf("%d.String() = %q, want %q", f, got, want)
+		}
+	}
+}
+
+func TestNewAccumulatorUnknownIsNil(t *testing.T) {
+	if a := NewAccumulator(FormatUnknown, true); a != nil {
+		t.Errorf("NewAccumulator(FormatUnknown) = %v, want nil", a)
+	}
+}
+
 func TestAssembleOpenAIChatStream(t *testing.T) {
 	out, ok := assemble(t, FormatOpenAIChat,
 		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":123,"model":"gpt-5.4","choices":[{"index":0,"delta":{"role":"assistant","content":"hel"},"finish_reason":null}]}`+"\n\n",
-		`data: {"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}`+"\n\n",
+		`data: {"id":"chatcmpl_1","choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`+"\n\n",
 		"data: [DONE]\n\n",
 	)
 	if !ok {
@@ -68,6 +92,18 @@ func TestAssembleOpenAIChatStream(t *testing.T) {
 	}
 	if got.Usage.PromptTokens != 10 || got.Usage.CompletionTokens != 2 {
 		t.Errorf("usage = %+v", got.Usage)
+	}
+}
+
+// TestAssembleOpenAIChatBackfillsMissingID guards the dirty-data case where a trailing usage-only
+// chunk omits the id: the SDK accumulator would otherwise drop it and lose the usage.
+func TestAssembleOpenAIChatBackfillsMissingID(t *testing.T) {
+	a := NewAccumulator(FormatOpenAIChat, true)
+	a.Write([]byte(`data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}` + "\n\n"))
+	a.Write([]byte(`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}` + "\n\n"))
+	u, ok := a.Usage()
+	if !ok || u.InputTokens != 3 || u.OutputTokens != 1 {
+		t.Errorf("usage from id-less trailing chunk = %+v ok=%v", u, ok)
 	}
 }
 
@@ -126,6 +162,28 @@ func TestAssembleOpenAIResponsesDeltaFallback(t *testing.T) {
 	}
 }
 
+func TestAssembleOpenAIResponsesIncompleteIsTerminal(t *testing.T) {
+	out, ok := assemble(t, FormatOpenAIResponses,
+		"event: response.output_text.delta\n"+
+			`data: {"type":"response.output_text.delta","delta":"partial"}`+"\n\n",
+		"event: response.incomplete\n"+
+			`data: {"type":"response.incomplete","response":{"id":"resp_1","object":"response","status":"incomplete","output_text":"partial","usage":{"input_tokens":4,"output_tokens":2}}}`+"\n\n",
+	)
+	if !ok {
+		t.Fatal("Finalize returned ok=false")
+	}
+	var got struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("assembled JSON invalid: %v\n%s", err, out)
+	}
+	if got.ID != "resp_1" || got.Status != "incomplete" {
+		t.Errorf("incomplete terminal not used: %+v\n%s", got, out)
+	}
+}
+
 func TestAssembleAnthropicMessagesStream(t *testing.T) {
 	out, ok := assemble(t, FormatAnthropicMessages,
 		"event: message_start\n"+
@@ -173,14 +231,15 @@ func TestAssembleAnthropicMessagesStream(t *testing.T) {
 	}
 }
 
-// TestAssembleAnthropicModernUsageNotDropped guards the regression where message_start and
-// message_delta were silently dropped because their usage objects carry nested objects
-// (cache_creation, output_tokens_details) and strings (inference_geo) that a map[string]int
-// cannot decode — losing id, model, stop_reason, and usage from the assembled message.
+// TestAssembleAnthropicModernUsageNotDropped guards that the modern usage shape — nested objects
+// (cache_creation, output_tokens_details) and strings (inference_geo) alongside the integer token
+// counts — survives accumulation and is faithfully re-emitted by the SDK usage type.
 func TestAssembleAnthropicModernUsageNotDropped(t *testing.T) {
 	out, ok := assemble(t, FormatAnthropicMessages,
 		"event: message_start\n"+
 			`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-8","content":[],"usage":{"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"inference_geo":"global","input_tokens":9,"output_tokens":6}}}`+"\n\n",
+		"event: content_block_start\n"+
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`+"\n\n",
 		"event: content_block_delta\n"+
 			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`+"\n\n",
 		"event: message_delta\n"+
@@ -235,7 +294,7 @@ func TestAssembleAnthropicThinkingSignatureAndCitations(t *testing.T) {
 		"event: content_block_delta\n"+
 			`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"see source"}}`+"\n\n",
 		"event: content_block_delta\n"+
-			`data: {"type":"content_block_delta","index":1,"delta":{"type":"citations_delta","citation":{"type":"char_location","cited_text":"x"}}}`+"\n\n",
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"citations_delta","citation":{"type":"char_location","cited_text":"x","document_index":0,"document_title":"d","start_char_index":0,"end_char_index":1}}}`+"\n\n",
 	)
 	if !ok {
 		t.Fatal("Finalize returned ok=false")
@@ -263,32 +322,10 @@ func TestAssembleAnthropicThinkingSignatureAndCitations(t *testing.T) {
 	}
 }
 
-func TestAssembleOpenAIResponsesIncompleteIsTerminal(t *testing.T) {
-	out, ok := assemble(t, FormatOpenAIResponses,
-		"event: response.output_text.delta\n"+
-			`data: {"type":"response.output_text.delta","delta":"partial"}`+"\n\n",
-		"event: response.incomplete\n"+
-			`data: {"type":"response.incomplete","response":{"id":"resp_1","object":"response","status":"incomplete","output_text":"partial","usage":{"input_tokens":4,"output_tokens":2}}}`+"\n\n",
-	)
-	if !ok {
-		t.Fatal("Finalize returned ok=false")
-	}
-	var got struct {
-		ID     string `json:"id"`
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatalf("assembled JSON invalid: %v\n%s", err, out)
-	}
-	if got.ID != "resp_1" || got.Status != "incomplete" {
-		t.Errorf("incomplete terminal not used: %+v\n%s", got, out)
-	}
-}
-
 func TestAssembleOpenAIChatToolCallsAndRefusal(t *testing.T) {
 	out, ok := assemble(t, FormatOpenAIChat,
 		`data: {"id":"chatcmpl_1","model":"gpt-5.4","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"ci"}}]}}]}`+"\n\n",
-		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ty\":\"SF\"}"}}]},"finish_reason":"tool_calls"}]}`+"\n\n",
+		`data: {"id":"chatcmpl_1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ty\":\"SF\"}"}}]},"finish_reason":"tool_calls"}]}`+"\n\n",
 		"data: [DONE]\n\n",
 	)
 	if !ok {
@@ -335,7 +372,7 @@ func TestAssembleOpenAIChatToolCallsAndRefusal(t *testing.T) {
 func TestAssembleOpenAIChatRefusal(t *testing.T) {
 	out, ok := assemble(t, FormatOpenAIChat,
 		`data: {"id":"chatcmpl_2","model":"gpt-5.4","choices":[{"index":0,"delta":{"role":"assistant","refusal":"I can"}}]}`+"\n\n",
-		`data: {"choices":[{"index":0,"delta":{"refusal":"not help"},"finish_reason":"stop"}]}`+"\n\n",
+		`data: {"id":"chatcmpl_2","choices":[{"index":0,"delta":{"refusal":"not help"},"finish_reason":"stop"}]}`+"\n\n",
 		"data: [DONE]\n\n",
 	)
 	if !ok {
@@ -353,5 +390,126 @@ func TestAssembleOpenAIChatRefusal(t *testing.T) {
 	}
 	if len(got.Choices) != 1 || got.Choices[0].Message.Refusal != "I cannot help" {
 		t.Errorf("refusal = %+v\n%s", got.Choices, out)
+	}
+}
+
+func TestUsageOpenAIChatSubtractsCache(t *testing.T) {
+	a := NewAccumulator(FormatOpenAIChat, true)
+	a.Write([]byte(`data: {"id":"c1","choices":[{"index":0,"delta":{"content":"hi"}}]}` + "\n\n"))
+	a.Write([]byte(`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14,"prompt_tokens_details":{"cached_tokens":6}}}` + "\n\n"))
+	u, ok := a.Usage()
+	if !ok || u.InputTokens != 4 || u.OutputTokens != 4 || u.CacheReadTokens != 6 || u.CacheWriteTokens != 0 {
+		t.Errorf("usage = %+v ok=%v, want input 4 (10-6) output 4 cacheRead 6", u, ok)
+	}
+}
+
+func TestUsageOpenAIResponsesSubtractsCache(t *testing.T) {
+	a := NewAccumulator(FormatOpenAIResponses, true)
+	a.Write([]byte("event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"id":"r1","object":"response","usage":{"input_tokens":12,"output_tokens":5,"input_tokens_details":{"cached_tokens":3}}}}` + "\n\n"))
+	u, ok := a.Usage()
+	if !ok || u.InputTokens != 9 || u.OutputTokens != 5 || u.CacheReadTokens != 3 {
+		t.Errorf("usage = %+v ok=%v, want input 9 (12-3) output 5 cacheRead 3", u, ok)
+	}
+}
+
+func TestUsageAnthropicSeparatesCache(t *testing.T) {
+	a := NewAccumulator(FormatAnthropicMessages, true)
+	a.Write([]byte("event: message_start\n" +
+		`data: {"type":"message_start","message":{"id":"m1","type":"message","role":"assistant","model":"claude","content":[],"usage":{"input_tokens":9,"cache_read_input_tokens":2,"cache_creation_input_tokens":5,"output_tokens":1}}}` + "\n\n"))
+	a.Write([]byte("event: message_delta\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":28}}` + "\n\n"))
+	u, ok := a.Usage()
+	if !ok || u.InputTokens != 9 || u.OutputTokens != 28 || u.CacheReadTokens != 2 || u.CacheWriteTokens != 5 {
+		t.Errorf("usage = %+v ok=%v, want input 9 output 28 cacheRead 2 cacheWrite 5", u, ok)
+	}
+}
+
+func TestUsageNonStreaming(t *testing.T) {
+	a := NewAccumulator(FormatAnthropicMessages, false)
+	a.Write([]byte(`{"type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":5,"output_tokens":7}}`))
+	u, ok := a.Usage()
+	if !ok || u.InputTokens != 5 || u.OutputTokens != 7 {
+		t.Errorf("non-streaming usage = %+v ok=%v, want input 5 output 7", u, ok)
+	}
+}
+
+func TestFinalizeNoAssemblableEvents(t *testing.T) {
+	// Nothing written.
+	a := NewAccumulator(FormatOpenAIChat, true)
+	if _, reason := a.Finalize(); reason != "no assemblable events" {
+		t.Errorf("empty stream reason = %q, want %q", reason, "no assemblable events")
+	}
+	// Only unparseable data.
+	b := NewAccumulator(FormatOpenAIChat, true)
+	b.Write([]byte("data: not json at all\n\n"))
+	if _, reason := b.Finalize(); reason != "no assemblable events" {
+		t.Errorf("garbage stream reason = %q, want %q", reason, "no assemblable events")
+	}
+}
+
+// TestAssembleAnthropicWebSearchToolUse exercises a server_tool_use block (input_json deltas) and
+// the web_search_tool_result block from the streaming-docs sample. The result block is an
+// otherwise-unmodeled type, so it flows through the comprehensive fallback (type + tool_use_id).
+func TestAssembleAnthropicWebSearchToolUse(t *testing.T) {
+	out, ok := assemble(t, FormatAnthropicMessages,
+		"event: message_start\n"+
+			`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-8","content":[],"stop_reason":null,"usage":{"input_tokens":2679,"output_tokens":3}}}`+"\n\n",
+		"event: content_block_start\n"+
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_01","name":"web_search","input":{}}}`+"\n\n",
+		"event: content_block_delta\n"+
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":"}}`+"\n\n",
+		"event: content_block_delta\n"+
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":" \"weather NYC\"}"}}`+"\n\n",
+		"event: content_block_stop\n"+
+			`data: {"type":"content_block_stop","index":0}`+"\n\n",
+		"event: content_block_start\n"+
+			`data: {"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_01","content":[{"type":"web_search_result","title":"Weather","url":"https://example.com","encrypted_content":"abc","page_age":null}]}}`+"\n\n",
+		"event: content_block_stop\n"+
+			`data: {"type":"content_block_stop","index":1}`+"\n\n",
+		"event: message_delta\n"+
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":10682,"output_tokens":510,"server_tool_use":{"web_search_requests":1}}}`+"\n\n",
+		"event: message_stop\n"+`data: {"type":"message_stop"}`+"\n\n",
+	)
+	if !ok {
+		t.Fatal("Finalize returned ok=false")
+	}
+	var got struct {
+		Content []struct {
+			Type  string `json:"type"`
+			Name  string `json:"name"`
+			Input struct {
+				Query string `json:"query"`
+			} `json:"input"`
+			ToolUseID string `json:"tool_use_id"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("assembled JSON invalid: %v\n%s", err, out)
+	}
+	if len(got.Content) != 2 {
+		t.Fatalf("content blocks = %d, want 2\n%s", len(got.Content), out)
+	}
+	if got.Content[0].Type != "server_tool_use" || got.Content[0].Name != "web_search" || got.Content[0].Input.Query != "weather NYC" {
+		t.Errorf("server_tool_use block = %+v", got.Content[0])
+	}
+	if got.Content[1].Type != "web_search_tool_result" || got.Content[1].ToolUseID != "srvtoolu_01" {
+		t.Errorf("web_search_tool_result fallback = %+v", got.Content[1])
+	}
+}
+
+func TestFinalizeAnthropicIndexGapGivesUp(t *testing.T) {
+	a := NewAccumulator(FormatAnthropicMessages, true)
+	// A content_block_start at a non-zero index with no preceding block is an out-of-order gap the
+	// SDK rejects; we surface that as a failure reason rather than a bogus assembly.
+	a.Write([]byte("event: content_block_start\n" +
+		`data: {"type":"content_block_start","index":5,"content_block":{"type":"text","text":""}}` + "\n\n"))
+	data, reason := a.Finalize()
+	if data != nil || !strings.HasPrefix(reason, "anthropic accumulate:") {
+		t.Errorf("index gap: data=%s reason=%q, want nil data + accumulate reason", data, reason)
+	}
+	// Usage must not panic and reports nothing.
+	if u, ok := a.Usage(); ok || u.InputTokens != 0 {
+		t.Errorf("usage after failure = %+v ok=%v, want empty", u, ok)
 	}
 }

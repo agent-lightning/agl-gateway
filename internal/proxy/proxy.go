@@ -241,10 +241,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	// the provider count.
 	retry := sequence[0].ResolvedRetry(p.cfg.Defaults.Retry)
 
+	format := capture.FormatForPath(r.URL.Path)
 	logRow := &store.RequestLog{
 		APIKeyID:           key.ID,
 		KeyName:            key.Name,
 		Model:              model,
+		APIType:            format.String(),
 		RequestContentType: strings.TrimSpace(r.Header.Get("Content-Type")),
 	}
 	if p.cfg.PayloadCapture.Enabled {
@@ -350,7 +352,20 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	isErr := resp.StatusCode >= 400
 	w.WriteHeader(resp.StatusCode)
 
-	acc := usage.NewAccumulator(streaming)
+	// Metering accumulator: SDK-typed for recognized formats (usage + optional assembly), or the
+	// generic best-effort scanner for unrecognized endpoints.
+	var (
+		capAcc *capture.Accumulator
+		genAcc *usage.Accumulator
+		meter  io.Writer
+	)
+	if format != capture.FormatUnknown {
+		capAcc = capture.NewAccumulator(format, streaming)
+		meter = capAcc
+	} else {
+		genAcc = usage.NewAccumulator(streaming)
+		meter = genAcc
+	}
 	captureLimit := 0
 	if isErr {
 		captureLimit = maxErrorBodyCapture // keep a snippet of the error body for the log
@@ -358,17 +373,19 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	var payloads *payloadSink
 	if p.cfg.PayloadCapture.Enabled {
 		payloads = &payloadSink{raw: newLimitedRecorder(payloadLimit(p.cfg.PayloadCapture.MaxResponseBytes))}
-		if streaming && p.cfg.PayloadCapture.AssembleStreams {
-			payloads.assembler = capture.NewStreamAssembler(capture.FormatForPath(r.URL.Path))
-		}
 	}
 	var payloadWriter io.Writer
 	if payloads != nil {
 		payloadWriter = payloads
 	}
-	ttft, gotByte, head := streamBody(w, resp.Body, acc, start, captureLimit, payloadWriter)
+	ttft, gotByte, head := streamBody(w, resp.Body, meter, start, captureLimit, payloadWriter)
 
-	u, _ := acc.Finalize()
+	var u pricing.Usage
+	if capAcc != nil {
+		u, _ = capAcc.Usage()
+	} else {
+		u, _ = genAcc.Finalize()
+	}
 	// Price by the requested model (the alias the client asked for); only fall back to the
 	// mapped upstream model when the requested one has no configured price.
 	u.Model = model
@@ -399,9 +416,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	if payloads != nil {
 		logRow.RawResponse = payloads.raw.Bytes()
 		logRow.RawResponseTruncated = payloads.raw.Truncated()
-		if payloads.assembler != nil {
-			if assembled, ok := payloads.assembler.Finalize(); ok {
+		if capAcc != nil && streaming && p.cfg.PayloadCapture.AssembleStreams {
+			if assembled, reason := capAcc.Finalize(); reason == "" {
 				logRow.AssembledResponse, logRow.AssembledResponseTruncated = captureBytes(assembled, payloadLimit(p.cfg.PayloadCapture.MaxAssembledBytes))
+			} else {
+				logRow.AssembleError = reason
 			}
 		}
 	}
@@ -455,16 +474,12 @@ func (r *limitedRecorder) Truncated() bool {
 }
 
 type payloadSink struct {
-	raw       *limitedRecorder
-	assembler *capture.StreamAssembler
+	raw *limitedRecorder
 }
 
 func (s *payloadSink) Write(p []byte) (int, error) {
 	if s.raw != nil {
 		_, _ = s.raw.Write(p)
-	}
-	if s.assembler != nil {
-		_, _ = s.assembler.Write(p)
 	}
 	return len(p), nil
 }
@@ -490,7 +505,7 @@ func payloadLimit(limit int) int {
 // into the usage accumulator, and reports time-to-first-byte measured from reqStart. When
 // captureLimit > 0 it also returns up to that many leading bytes of the body (used to log
 // the upstream's error payload).
-func streamBody(w http.ResponseWriter, body io.Reader, acc *usage.Accumulator, reqStart time.Time, captureLimit int, payloads io.Writer) (ttft time.Duration, gotByte bool, head []byte) {
+func streamBody(w http.ResponseWriter, body io.Reader, acc io.Writer, reqStart time.Time, captureLimit int, payloads io.Writer) (ttft time.Duration, gotByte bool, head []byte) {
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {

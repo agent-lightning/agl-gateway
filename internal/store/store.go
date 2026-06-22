@@ -36,6 +36,7 @@ type RequestLog struct {
 	ResponseContentType        string    `json:"response_content_type"`
 	StatusCode                 int       `json:"status_code"`
 	Streaming                  bool      `json:"streaming"`
+	APIType                    string    `json:"api_type,omitempty"`
 	Attempts                   int       `json:"attempts"`
 	TTFTMillis                 int64     `json:"ttft_ms"`
 	DurationMillis             int64     `json:"duration_ms"`
@@ -45,6 +46,7 @@ type RequestLog struct {
 	CacheWriteTokens           int       `json:"cache_write_tokens"`
 	Cost                       float64   `json:"cost"`
 	Error                      string    `json:"error"`
+	AssembleError              string    `json:"assemble_error,omitempty"`
 	RawRequest                 []byte    `json:"raw_request,omitempty"`
 	RawResponse                []byte    `json:"raw_response,omitempty"`
 	AssembledResponse          []byte    `json:"assembled_response,omitempty"`
@@ -145,6 +147,8 @@ CREATE TABLE IF NOT EXISTS request_logs (
     cache_write_tokens INTEGER NOT NULL,
     cost               REAL NOT NULL,
     error              TEXT NOT NULL,
+    api_type           TEXT NOT NULL DEFAULT '',
+    assemble_error     TEXT NOT NULL DEFAULT '',
     raw_request        BLOB,
     raw_response       BLOB,
     assembled_response BLOB,
@@ -170,6 +174,12 @@ CREATE INDEX IF NOT EXISTS idx_logs_api_key_id ON request_logs(api_key_id);
 		return err
 	}
 	if err := s.ensureColumn("request_logs", "response_content_type", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("request_logs", "api_type", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("request_logs", "assemble_error", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn("request_logs", "raw_request", "BLOB"); err != nil {
@@ -349,13 +359,13 @@ INSERT INTO request_logs
  (api_key_id, key_name, provider, model, mapped_model, request_content_type,
   response_content_type, status_code, streaming, attempts,
   ttft_ms, duration_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-  cost, error, raw_request, raw_response, assembled_response, raw_request_truncated,
+  cost, error, api_type, assemble_error, raw_request, raw_response, assembled_response, raw_request_truncated,
   raw_response_truncated, assembled_response_truncated, created_at)
- VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		l.APIKeyID, l.KeyName, l.Provider, l.Model, l.MappedModel, l.RequestContentType,
 		l.ResponseContentType, l.StatusCode, b2i(l.Streaming),
 		l.Attempts, l.TTFTMillis, l.DurationMillis, l.InputTokens, l.OutputTokens, l.CacheReadTokens,
-		l.CacheWriteTokens, l.Cost, l.Error, l.RawRequest, l.RawResponse, l.AssembledResponse,
+		l.CacheWriteTokens, l.Cost, l.Error, l.APIType, l.AssembleError, l.RawRequest, l.RawResponse, l.AssembledResponse,
 		b2i(l.RawRequestTruncated), b2i(l.RawResponseTruncated), b2i(l.AssembledResponseTruncated),
 		l.CreatedAt.UnixMilli(),
 	)
@@ -370,7 +380,8 @@ INSERT INTO request_logs
 func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 	cols := `id, api_key_id, key_name, provider, model, mapped_model, status_code, streaming,
 	             request_content_type, response_content_type, attempts, ttft_ms, duration_ms,
-	             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost, error,`
+	             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost, error,
+	             api_type, assemble_error,`
 	if f.IncludePayloads {
 		cols += ` raw_request, raw_response, assembled_response,`
 	}
@@ -418,7 +429,7 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 		dest := []any{&l.ID, &l.APIKeyID, &l.KeyName, &l.Provider, &l.Model, &l.MappedModel,
 			&l.StatusCode, &streaming, &l.RequestContentType, &l.ResponseContentType,
 			&l.Attempts, &l.TTFTMillis, &l.DurationMillis, &l.InputTokens, &l.OutputTokens,
-			&l.CacheReadTokens, &l.CacheWriteTokens, &l.Cost, &l.Error}
+			&l.CacheReadTokens, &l.CacheWriteTokens, &l.Cost, &l.Error, &l.APIType, &l.AssembleError}
 		if f.IncludePayloads {
 			dest = append(dest, &l.RawRequest, &l.RawResponse, &l.AssembledResponse)
 		}

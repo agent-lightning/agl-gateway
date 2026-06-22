@@ -14,9 +14,12 @@ OpenAI-compatible `/v1/models` to list models. The data plane stays endpoint-agn
 
 ## Project principles
 
-- **Minimalistic.** Standard library first. The only third-party dependencies are
-  `gopkg.in/yaml.v3` and `modernc.org/sqlite` (pure-Go, no cgo). Don't add dependencies or
-  frameworks without a strong reason.
+- **Minimalistic.** Standard library first. The core dependencies are `gopkg.in/yaml.v3` and
+  `modernc.org/sqlite` (pure-Go, no cgo). `internal/capture` additionally depends on the official
+  provider SDKs — `github.com/openai/openai-go/v3` and `github.com/anthropics/anthropic-sdk-go` —
+  for their stream-accumulator and usage types, so response assembly and metering track the real
+  APIs instead of hand-rolled shapes. Don't add other dependencies or frameworks without a strong
+  reason.
 - **Robust over clever.** Failures degrade gracefully: unknown models still log (zero
   cost), unparseable usage still logs (zero tokens), a dead provider returns 502 and is
   recorded.
@@ -30,7 +33,9 @@ OpenAI-compatible `/v1/models` to list models. The data plane stays endpoint-agn
 ```
 client ──► proxy ──┐ auth (sha256 key lookup) ──► build provider sequence (X-AGL-Provider pins one, else the key's start/order policy)
                    ├─ retry loop (backoff+jitter on net err / 408 / 429 / 5xx / LiteLLM tag-bug 401 / LiteLLM-Azure "unsupported" 400); each retry fails over to the next provider in the sequence
-                   └─ stream upstream→client (SSE flushed), tee into usage.Accumulator
+                   └─ stream upstream→client (SSE flushed), tee into the metering sink
+                      (capture.Accumulator for recognized formats — usage + assembled body;
+                       else usage.Accumulator)
                                                   └─► pricing.Cost ─► store.InsertLog
 ```
 
@@ -41,7 +46,8 @@ Packages:
 | `internal/config` | YAML load, defaults, validation. |
 | `internal/pricing`| Normalized `Usage` → dollar cost. |
 | `internal/store`  | SQLite schema + `api_keys`/`request_logs` access. |
-| `internal/usage`  | Best-effort model + usage extraction (OpenAI/Anthropic, JSON + SSE). |
+| `internal/usage`  | Generic best-effort fallback for model + usage extraction on *unrecognized* endpoints (JSON + SSE), plus request-side `RequestModel`/`SetModel`. Recognized formats are metered by `internal/capture`. |
+| `internal/capture`| For recognized API formats (chat/responses/messages), wraps the provider SDK accumulators to derive both the assembled non-streaming response and normalized token usage from one pass; records `api_type` and any `assemble_error`. |
 | `internal/keys`   | Mint + SHA-256-hash gateway keys. |
 | `internal/probe`  | Shared model-probe logic (endpoint/body/summary, worker pool); used by `cmd/modelcheck` and `/admin/test`. |
 | `internal/proxy`  | Data plane: auth, routing, retry, streaming, metering. |
@@ -171,7 +177,9 @@ hardcoded number, so there is no constant to keep in sync.
 - **Schema change:** add the column to the `CREATE TABLE` in `store.migrate` *and* an
   `ensureColumn` call so existing databases upgrade in place; extend `RequestLog`, the
   `INSERT`, and the `QueryLogs` `SELECT`/scan together.
-- **New usage shape:** extend `internal/usage` (`rawUsage`/`usageEnvelope`/`normalize`) and
-  add a focused test with a real-ish payload. Keep it best-effort and provider-neutral.
+- **New usage shape:** for a *recognized* format, prefer bumping the provider SDK version in
+  `internal/capture` (the SDK accumulator/usage types own these shapes). For an *unrecognized*
+  endpoint, extend the generic fallback in `internal/usage` (`rawUsage`/`usageEnvelope`/`normalize`).
+  Either way add a focused test with a real-ish payload and keep it best-effort.
 - **New admin endpoint:** add to `Admin.Handler`, keep it behind the master-key middleware,
   return JSON, and add a handler test.

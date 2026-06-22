@@ -1,15 +1,33 @@
-// Package capture records proxied payload bytes and best-effort assembled streaming
-// responses for inspection.
+// Package capture records proxied payload bytes and, for recognized API formats, derives a
+// best-effort non-streaming assembly of a streamed response plus its normalized token usage.
+//
+// Accumulation is delegated to the official provider SDKs (github.com/openai/openai-go/v3 and
+// github.com/anthropics/anthropic-sdk-go): the SDK accumulators own the fiddly, drift-prone work
+// of merging deltas (partial tool-call JSON, cumulative usage, content-block indexing, citations,
+// thinking/signature, the full Responses event set). We then read the accumulated typed objects
+// to (a) emit a clean assembled JSON body for inspection and (b) report usage for metering.
+//
+// It is deliberately best-effort: malformed events are skipped, and Finalize returns a non-empty
+// reason when nothing useful could be assembled. Usage never gates on that reason — partial counts
+// (e.g. Anthropic input tokens from message_start) are still reported.
 package capture
 
 import (
 	"bytes"
 	"encoding/json"
-	"sort"
 	"strings"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/responses"
+
+	"github.com/agent-lightning/agl-gateway/internal/pricing"
 )
 
-// StreamFormat is the provider stream shape inferred from the request path.
+// maxBodyBuffer caps how much of a non-streaming response body is retained for parsing.
+const maxBodyBuffer = 1 << 20 // 1 MiB
+
+// StreamFormat is the provider API shape inferred from the request path.
 type StreamFormat int
 
 const (
@@ -19,8 +37,8 @@ const (
 	FormatAnthropicMessages
 )
 
-// FormatForPath returns the streaming format understood for a request path. Unknown
-// paths still have their raw response stream recorded by the caller.
+// FormatForPath returns the API format understood for a request path. Unknown paths still have
+// their raw response stream recorded by the caller, but are not assembled or SDK-metered.
 func FormatForPath(path string) StreamFormat {
 	path = strings.TrimRight(path, "/")
 	switch path {
@@ -35,60 +53,413 @@ func FormatForPath(path string) StreamFormat {
 	}
 }
 
-// StreamAssembler consumes SSE bytes and produces a non-streaming JSON response in the
-// matching API family. It is deliberately best-effort: malformed or unknown events are
-// ignored, and Finalize returns ok=false when nothing useful could be assembled.
-type StreamAssembler struct {
-	format StreamFormat
-	parser sseParser
-
-	chat      chatState
-	responses responsesState
-	anthropic anthropicState
+// String returns the stable identifier logged in the api_type column.
+func (f StreamFormat) String() string {
+	switch f {
+	case FormatOpenAIChat:
+		return "openai_chat"
+	case FormatOpenAIResponses:
+		return "openai_responses"
+	case FormatAnthropicMessages:
+		return "anthropic_messages"
+	default:
+		return ""
+	}
 }
 
-// NewStreamAssembler returns an assembler for format, or nil for FormatUnknown.
-func NewStreamAssembler(format StreamFormat) *StreamAssembler {
+// Accumulator consumes a response body (SSE bytes when streaming, or a full JSON document when
+// not) for one recognized format and exposes the assembled JSON (Finalize) and normalized token
+// usage (Usage). The zero value is not usable; construct with NewAccumulator.
+type Accumulator struct {
+	format    StreamFormat
+	streaming bool
+	parser    sseParser
+
+	body    []byte // non-streaming: capped raw body, parsed once on flush
+	seen    bool   // at least one event/document was parsed
+	reason  string // first hard-failure reason; once set, assembly gives up
+	flushed bool
+
+	chat      openai.ChatCompletionAccumulator
+	chatID    string // first seen chunk id, backfilled into id-less chunks
+	message   anthropic.Message
+	response  responses.Response // typed terminal Response (for usage)
+	respRaw   []byte             // clean raw bytes of the terminal Response (for output)
+	respText  strings.Builder    // fallback text when no terminal Response arrives
+	respFinal bool
+}
+
+// NewAccumulator returns an Accumulator for format, or nil for FormatUnknown. Pass streaming=true
+// for text/event-stream bodies.
+func NewAccumulator(format StreamFormat, streaming bool) *Accumulator {
 	if format == FormatUnknown {
 		return nil
 	}
-	return &StreamAssembler{format: format}
+	return &Accumulator{format: format, streaming: streaming}
 }
 
-// Write feeds raw SSE bytes to the assembler.
-func (a *StreamAssembler) Write(p []byte) (int, error) {
-	a.parser.write(p, a.handleEvent)
+// Write feeds response bytes. It never errors and always reports len(p) consumed so it can be used
+// as the sink of an io.TeeReader.
+func (a *Accumulator) Write(p []byte) (int, error) {
+	if a.streaming {
+		a.parser.write(p, a.handleEvent)
+	} else if len(a.body) < maxBodyBuffer {
+		room := maxBodyBuffer - len(a.body)
+		if len(p) > room {
+			a.body = append(a.body, p[:room]...)
+		} else {
+			a.body = append(a.body, p...)
+		}
+	}
 	return len(p), nil
 }
 
-// Finalize flushes any pending SSE event and returns the assembled JSON response.
-func (a *StreamAssembler) Finalize() ([]byte, bool) {
-	a.parser.flush(a.handleEvent)
+// Usage returns the normalized token usage accumulated so far. The boolean is false when no usage
+// could be extracted. It deliberately ignores any assembly failure reason.
+func (a *Accumulator) Usage() (pricing.Usage, bool) {
+	a.flush()
 	switch a.format {
 	case FormatOpenAIChat:
-		return a.chat.finalize()
+		u := a.chat.ChatCompletion.Usage
+		cacheRead := int(u.PromptTokensDetails.CachedTokens) // OpenAI counts cached within the input total
+		return buckets(int(u.PromptTokens)-cacheRead, int(u.CompletionTokens), cacheRead, 0)
 	case FormatOpenAIResponses:
-		return a.responses.finalize()
+		u := a.response.Usage
+		cacheRead := int(u.InputTokensDetails.CachedTokens)
+		return buckets(int(u.InputTokens)-cacheRead, int(u.OutputTokens), cacheRead, 0)
 	case FormatAnthropicMessages:
-		return a.anthropic.finalize()
-	default:
-		return nil, false
+		u := a.message.Usage // Anthropic counts cache reads/writes separately from input
+		return buckets(int(u.InputTokens), int(u.OutputTokens), int(u.CacheReadInputTokens), int(u.CacheCreationInputTokens))
 	}
+	return pricing.Usage{}, false
 }
 
-func (a *StreamAssembler) handleEvent(event string, data []byte) {
-	data = bytes.TrimSpace(data)
-	if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+// buckets assembles the non-overlapping Usage buckets, clamping a negative input (which can occur
+// when cached tokens are subtracted) to zero.
+func buckets(input, output, cacheRead, cacheWrite int) (pricing.Usage, bool) {
+	if input < 0 {
+		input = 0
+	}
+	u := pricing.Usage{InputTokens: input, OutputTokens: output, CacheReadTokens: cacheRead, CacheWriteTokens: cacheWrite}
+	return u, input > 0 || output > 0 || cacheRead > 0 || cacheWrite > 0
+}
+
+// Finalize flushes any pending input and returns the assembled JSON response. The string is empty
+// on success, or a short failure reason when the stream could not be assembled.
+func (a *Accumulator) Finalize() (data []byte, reason string) {
+	a.flush()
+	if a.reason != "" {
+		return nil, a.reason
+	}
+	if !a.seen {
+		return nil, "no assemblable events"
+	}
+	switch a.format {
+	case FormatOpenAIChat:
+		return a.finalizeChat()
+	case FormatOpenAIResponses:
+		return a.finalizeResponses()
+	case FormatAnthropicMessages:
+		return a.finalizeAnthropic()
+	}
+	return nil, "unknown format"
+}
+
+// flush is idempotent: it drains the SSE parser (streaming) or parses the buffered body once
+// (non-streaming) into the SDK typed object.
+func (a *Accumulator) flush() {
+	if a.flushed {
+		return
+	}
+	a.flushed = true
+	if a.streaming {
+		a.parser.flush(a.handleEvent)
+		return
+	}
+	if len(a.body) == 0 {
 		return
 	}
 	switch a.format {
 	case FormatOpenAIChat:
-		a.chat.handle(data)
+		if json.Unmarshal(a.body, &a.chat.ChatCompletion) == nil {
+			a.seen = true
+		}
 	case FormatOpenAIResponses:
-		a.responses.handle(event, data)
+		if json.Unmarshal(a.body, &a.response) == nil {
+			a.respRaw = append(a.respRaw[:0], a.body...)
+			a.respFinal = true
+			a.seen = true
+		}
 	case FormatAnthropicMessages:
-		a.anthropic.handle(data)
+		if json.Unmarshal(a.body, &a.message) == nil {
+			a.seen = true
+		}
 	}
+}
+
+func (a *Accumulator) handleEvent(event string, data []byte) {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+		return
+	}
+	if a.reason != "" {
+		return
+	}
+	switch a.format {
+	case FormatOpenAIChat:
+		a.handleChat(data)
+	case FormatOpenAIResponses:
+		a.handleResponses(data)
+	case FormatAnthropicMessages:
+		a.handleAnthropic(data)
+	}
+}
+
+func (a *Accumulator) handleChat(data []byte) {
+	var chunk openai.ChatCompletionChunk
+	if json.Unmarshal(data, &chunk) != nil {
+		return
+	}
+	a.seen = true
+	// The SDK accumulator drops chunks whose id disagrees with the first; some providers omit the
+	// id on the trailing usage-only chunk, so backfill the established id to keep that chunk.
+	if chunk.ID == "" {
+		chunk.ID = a.chatID
+	} else {
+		a.chatID = chunk.ID
+	}
+	a.chat.AddChunk(chunk) // false is a soft skip (e.g. mismatched id); never fatal
+}
+
+func (a *Accumulator) handleAnthropic(data []byte) {
+	var ev anthropic.MessageStreamEventUnion
+	if json.Unmarshal(data, &ev) != nil {
+		return
+	}
+	a.seen = true
+	if err := a.message.Accumulate(ev); err != nil {
+		a.reason = "anthropic accumulate: " + err.Error()
+	}
+}
+
+func (a *Accumulator) handleResponses(data []byte) {
+	var ev responses.ResponseStreamEventUnion
+	if json.Unmarshal(data, &ev) != nil {
+		return
+	}
+	a.seen = true
+	switch ev.Type {
+	case "response.completed", "response.incomplete", "response.failed":
+		// Every terminal event carries the complete Response object; keep the last one and its
+		// clean original bytes for the assembled output.
+		a.response = ev.Response
+		if raw := ev.Response.RawJSON(); raw != "" {
+			a.respRaw = append(a.respRaw[:0], raw...)
+			a.respFinal = true
+		}
+	case "response.output_text.delta", "response.refusal.delta":
+		a.respText.WriteString(ev.Delta)
+	}
+}
+
+func (a *Accumulator) finalizeChat() ([]byte, string) {
+	cc := a.chat.ChatCompletion
+	choices := make([]map[string]any, 0, len(cc.Choices))
+	for _, ch := range cc.Choices {
+		msg := ch.Message
+		role := string(msg.Role)
+		if role == "" {
+			role = "assistant"
+		}
+		m := map[string]any{"role": role}
+		hasExtras := len(msg.ToolCalls) > 0 || msg.Refusal != ""
+		if msg.Content != "" || !hasExtras {
+			// Faithful to OpenAI: content is null when only tool_calls/refusal are present.
+			m["content"] = msg.Content
+		} else {
+			m["content"] = nil
+		}
+		if msg.Refusal != "" {
+			m["refusal"] = msg.Refusal
+		}
+		if len(msg.ToolCalls) > 0 {
+			calls := make([]map[string]any, 0, len(msg.ToolCalls))
+			for _, tc := range msg.ToolCalls {
+				typ := tc.Type
+				if typ == "" {
+					typ = "function"
+				}
+				call := map[string]any{
+					"type":     typ,
+					"function": map[string]any{"name": tc.Function.Name, "arguments": tc.Function.Arguments},
+				}
+				if tc.ID != "" {
+					call["id"] = tc.ID
+				}
+				calls = append(calls, call)
+			}
+			m["tool_calls"] = calls
+		}
+		item := map[string]any{"index": ch.Index, "message": m, "finish_reason": nil}
+		if ch.FinishReason != "" {
+			item["finish_reason"] = ch.FinishReason
+		}
+		choices = append(choices, item)
+	}
+	out := map[string]any{"object": "chat.completion", "choices": choices}
+	if cc.ID != "" {
+		out["id"] = cc.ID
+	}
+	if cc.Created != 0 {
+		out["created"] = cc.Created
+	}
+	if cc.Model != "" {
+		out["model"] = cc.Model
+	}
+	if u := faithfulUsage(cc.Usage, cc.Usage.PromptTokens != 0 || cc.Usage.CompletionTokens != 0 || cc.Usage.TotalTokens != 0); u != nil {
+		out["usage"] = u
+	}
+	return marshal(out, "chat")
+}
+
+func (a *Accumulator) finalizeAnthropic() ([]byte, string) {
+	msg := a.message
+	role := string(msg.Role)
+	if role == "" {
+		role = "assistant"
+	}
+	content := make([]json.RawMessage, 0, len(msg.Content))
+	for i := range msg.Content {
+		content = append(content, anthropicBlock(msg.Content[i]))
+	}
+	out := map[string]any{"type": "message", "role": role, "content": content}
+	if msg.ID != "" {
+		out["id"] = msg.ID
+	}
+	if msg.Model != "" {
+		out["model"] = string(msg.Model)
+	}
+	if msg.StopReason != "" {
+		out["stop_reason"] = string(msg.StopReason)
+	}
+	if msg.StopSequence != "" {
+		out["stop_sequence"] = msg.StopSequence
+	}
+	any := msg.Usage.InputTokens != 0 || msg.Usage.OutputTokens != 0 ||
+		msg.Usage.CacheReadInputTokens != 0 || msg.Usage.CacheCreationInputTokens != 0
+	if u := faithfulUsage(msg.Usage, any); u != nil {
+		out["usage"] = u
+	}
+	return marshal(out, "message")
+}
+
+func (a *Accumulator) finalizeResponses() ([]byte, string) {
+	if a.respFinal && len(a.respRaw) > 0 {
+		// The terminal event already carried the complete, clean Response object.
+		return append([]byte(nil), a.respRaw...), ""
+	}
+	// Fallback: a minimal Response built from accumulated output_text deltas (truncated stream).
+	out := map[string]any{
+		"object": "response",
+		"status": "incomplete",
+		"output": []map[string]any{{
+			"type": "message",
+			"role": "assistant",
+			"content": []map[string]any{{
+				"type": "output_text",
+				"text": a.respText.String(),
+			}},
+		}},
+	}
+	return marshal(out, "response")
+}
+
+// anthropicBlock renders one accumulated content block as clean JSON. It reads the union's
+// exported fields directly (which the SDK mutates in place as deltas arrive) rather than AsAny(),
+// whose typed view is only refreshed on content_block_stop. Common variants get an explicit
+// minimal shape; other block types still record whatever populated fields they carry.
+func anthropicBlock(block anthropic.ContentBlockUnion) json.RawMessage {
+	m := map[string]any{"type": block.Type}
+	switch block.Type {
+	case "text":
+		m["text"] = block.Text
+		if len(block.Citations) > 0 {
+			if cb, err := json.Marshal(block.Citations); err == nil {
+				m["citations"] = json.RawMessage(cb)
+			}
+		}
+	case "thinking":
+		m["thinking"] = block.Thinking
+		if block.Signature != "" {
+			m["signature"] = block.Signature
+		}
+	case "redacted_thinking":
+		m["data"] = block.Data
+	case "tool_use", "server_tool_use":
+		if block.ID != "" {
+			m["id"] = block.ID
+		}
+		if block.Name != "" {
+			m["name"] = block.Name
+		}
+		m["input"] = toolInput(block.Input)
+	default:
+		// Comprehensive fallback: emit every populated scalar field of the block.
+		if block.Text != "" {
+			m["text"] = block.Text
+		}
+		if block.ID != "" {
+			m["id"] = block.ID
+		}
+		if block.Name != "" {
+			m["name"] = block.Name
+		}
+		if block.Data != "" {
+			m["data"] = block.Data
+		}
+		if block.ToolUseID != "" {
+			m["tool_use_id"] = block.ToolUseID
+		}
+		if len(block.Input) > 0 && string(block.Input) != "null" {
+			m["input"] = toolInput(block.Input)
+		}
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return json.RawMessage(b)
+}
+
+// toolInput returns the accumulated tool-call input as a JSON object, defaulting to {} when the
+// partial JSON never resolved to anything valid.
+func toolInput(raw json.RawMessage) any {
+	s := bytes.TrimSpace(raw)
+	if len(s) == 0 || !json.Valid(s) {
+		return map[string]any{}
+	}
+	return json.RawMessage(append([]byte(nil), s...))
+}
+
+// faithfulUsage re-marshals an SDK usage struct (which carries only real provider usage fields) as
+// raw JSON, or returns nil when present is false so an empty usage object is omitted.
+func faithfulUsage(v any, present bool) json.RawMessage {
+	if !present {
+		return nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return json.RawMessage(b)
+}
+
+func marshal(v any, what string) ([]byte, string) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, "marshal " + what + ": " + err.Error()
+	}
+	return b, ""
 }
 
 type sseParser struct {
@@ -147,540 +518,4 @@ func (p *sseParser) emit(emit func(string, []byte)) {
 	emit(p.event, data)
 	p.event = ""
 	p.dataLines = nil
-}
-
-type chatState struct {
-	seen              bool
-	id                string
-	created           int64
-	model             string
-	systemFingerprint string
-	usage             json.RawMessage
-	choices           map[int]*chatChoice
-}
-
-type chatChoice struct {
-	index        int
-	role         string
-	content      strings.Builder
-	refusal      strings.Builder
-	toolCalls    map[int]*chatToolCall
-	toolOrder    []int
-	finishReason json.RawMessage
-}
-
-type chatToolCall struct {
-	id   string
-	typ  string
-	name string
-	args strings.Builder
-}
-
-type chatChunk struct {
-	ID                string `json:"id"`
-	Created           int64  `json:"created"`
-	Model             string `json:"model"`
-	SystemFingerprint string `json:"system_fingerprint"`
-	Choices           []struct {
-		Index int `json:"index"`
-		Delta struct {
-			Role      string          `json:"role"`
-			Content   json.RawMessage `json:"content"`
-			Refusal   json.RawMessage `json:"refusal"`
-			ToolCalls []struct {
-				Index    int    `json:"index"`
-				ID       string `json:"id"`
-				Type     string `json:"type"`
-				Function struct {
-					Name      string `json:"name"`
-					Arguments string `json:"arguments"`
-				} `json:"function"`
-			} `json:"tool_calls"`
-		} `json:"delta"`
-		FinishReason json.RawMessage `json:"finish_reason"`
-	} `json:"choices"`
-	Usage json.RawMessage `json:"usage"`
-}
-
-func (s *chatState) handle(data []byte) {
-	var c chatChunk
-	if err := json.Unmarshal(data, &c); err != nil {
-		return
-	}
-	s.seen = true
-	if c.ID != "" {
-		s.id = c.ID
-	}
-	if c.Created != 0 {
-		s.created = c.Created
-	}
-	if c.Model != "" {
-		s.model = c.Model
-	}
-	if c.SystemFingerprint != "" {
-		s.systemFingerprint = c.SystemFingerprint
-	}
-	if len(c.Usage) > 0 && string(c.Usage) != "null" {
-		s.usage = append(s.usage[:0], c.Usage...)
-	}
-	if s.choices == nil {
-		s.choices = map[int]*chatChoice{}
-	}
-	for _, ch := range c.Choices {
-		dst := s.choices[ch.Index]
-		if dst == nil {
-			dst = &chatChoice{index: ch.Index}
-			s.choices[ch.Index] = dst
-		}
-		if ch.Delta.Role != "" {
-			dst.role = ch.Delta.Role
-		}
-		if text, ok := rawJSONString(ch.Delta.Content); ok {
-			dst.content.WriteString(text)
-		}
-		if text, ok := rawJSONString(ch.Delta.Refusal); ok {
-			dst.refusal.WriteString(text)
-		}
-		for _, tc := range ch.Delta.ToolCalls {
-			if dst.toolCalls == nil {
-				dst.toolCalls = map[int]*chatToolCall{}
-			}
-			call := dst.toolCalls[tc.Index]
-			if call == nil {
-				call = &chatToolCall{}
-				dst.toolCalls[tc.Index] = call
-				dst.toolOrder = append(dst.toolOrder, tc.Index)
-			}
-			if tc.ID != "" {
-				call.id = tc.ID
-			}
-			if tc.Type != "" {
-				call.typ = tc.Type
-			}
-			if tc.Function.Name != "" {
-				call.name = tc.Function.Name
-			}
-			call.args.WriteString(tc.Function.Arguments)
-		}
-		if len(ch.FinishReason) > 0 && string(ch.FinishReason) != "null" {
-			dst.finishReason = append(dst.finishReason[:0], ch.FinishReason...)
-		}
-	}
-}
-
-func (s *chatState) finalize() ([]byte, bool) {
-	if !s.seen {
-		return nil, false
-	}
-	out := map[string]any{
-		"object":  "chat.completion",
-		"choices": s.finalChoices(),
-	}
-	if s.id != "" {
-		out["id"] = s.id
-	}
-	if s.created != 0 {
-		out["created"] = s.created
-	}
-	if s.model != "" {
-		out["model"] = s.model
-	}
-	if s.systemFingerprint != "" {
-		out["system_fingerprint"] = s.systemFingerprint
-	}
-	if len(s.usage) > 0 {
-		out["usage"] = s.usage
-	}
-	b, err := json.Marshal(out)
-	return b, err == nil
-}
-
-func (s *chatState) finalChoices() []map[string]any {
-	indexes := make([]int, 0, len(s.choices))
-	for idx := range s.choices {
-		indexes = append(indexes, idx)
-	}
-	sort.Ints(indexes)
-	out := make([]map[string]any, 0, len(indexes))
-	for _, idx := range indexes {
-		ch := s.choices[idx]
-		role := ch.role
-		if role == "" {
-			role = "assistant"
-		}
-		message := map[string]any{"role": role}
-		hasExtras := len(ch.toolCalls) > 0 || ch.refusal.Len() > 0
-		if ch.content.Len() > 0 || !hasExtras {
-			// Faithful to OpenAI: content is null when only tool_calls/refusal are present.
-			message["content"] = ch.content.String()
-		} else {
-			message["content"] = nil
-		}
-		if ch.refusal.Len() > 0 {
-			message["refusal"] = ch.refusal.String()
-		}
-		if len(ch.toolCalls) > 0 {
-			message["tool_calls"] = ch.finalToolCalls()
-		}
-		item := map[string]any{
-			"index":         idx,
-			"message":       message,
-			"finish_reason": nil,
-		}
-		if len(ch.finishReason) > 0 {
-			item["finish_reason"] = ch.finishReason
-		}
-		out = append(out, item)
-	}
-	return out
-}
-
-func (ch *chatChoice) finalToolCalls() []map[string]any {
-	order := append([]int(nil), ch.toolOrder...)
-	sort.Ints(order)
-	calls := make([]map[string]any, 0, len(order))
-	for _, idx := range order {
-		tc := ch.toolCalls[idx]
-		typ := tc.typ
-		if typ == "" {
-			typ = "function"
-		}
-		call := map[string]any{
-			"type": typ,
-			"function": map[string]any{
-				"name":      tc.name,
-				"arguments": tc.args.String(),
-			},
-		}
-		if tc.id != "" {
-			call["id"] = tc.id
-		}
-		calls = append(calls, call)
-	}
-	return calls
-}
-
-type responsesState struct {
-	seen          bool
-	finalResponse json.RawMessage
-	text          strings.Builder
-	usage         json.RawMessage
-}
-
-func (s *responsesState) handle(event string, data []byte) {
-	var e struct {
-		Type     string          `json:"type"`
-		Delta    string          `json:"delta"`
-		Text     string          `json:"text"`
-		Response json.RawMessage `json:"response"`
-	}
-	if err := json.Unmarshal(data, &e); err != nil {
-		return
-	}
-	s.seen = true
-	if e.Type == "" {
-		e.Type = event
-	}
-	if len(e.Response) > 0 && string(e.Response) != "null" {
-		var probe struct {
-			Usage json.RawMessage `json:"usage"`
-		}
-		_ = json.Unmarshal(e.Response, &probe)
-		if len(probe.Usage) > 0 && string(probe.Usage) != "null" {
-			s.usage = append(s.usage[:0], probe.Usage...)
-		}
-		// All three terminal events carry the complete final response object; keep the
-		// last one seen.
-		switch e.Type {
-		case "response.completed", "response.incomplete", "response.failed":
-			s.finalResponse = append(s.finalResponse[:0], e.Response...)
-		}
-	}
-	switch e.Type {
-	case "response.output_text.delta", "response.refusal.delta":
-		s.text.WriteString(e.Delta)
-	case "response.output_text.done":
-		if s.text.Len() == 0 && e.Text != "" {
-			s.text.WriteString(e.Text)
-		}
-	}
-}
-
-func (s *responsesState) finalize() ([]byte, bool) {
-	if len(s.finalResponse) > 0 {
-		return append([]byte(nil), s.finalResponse...), true
-	}
-	if !s.seen {
-		return nil, false
-	}
-	out := map[string]any{
-		"object": "response",
-		"output": []map[string]any{{
-			"type": "message",
-			"role": "assistant",
-			"content": []map[string]any{{
-				"type": "output_text",
-				"text": s.text.String(),
-			}},
-		}},
-	}
-	if len(s.usage) > 0 {
-		out["usage"] = s.usage
-	}
-	b, err := json.Marshal(out)
-	return b, err == nil
-}
-
-type anthropicState struct {
-	seen         bool
-	id           string
-	role         string
-	model        string
-	stopReason   string
-	stopSequence *string
-	usage        map[string]json.RawMessage
-	blocks       map[int]*anthropicBlock
-}
-
-type anthropicBlock struct {
-	index       int
-	typ         string
-	id          string
-	name        string
-	text        strings.Builder
-	thinking    strings.Builder
-	signature   strings.Builder
-	partialJSON strings.Builder
-	data        string            // redacted_thinking payload
-	citations   []json.RawMessage // citations_delta accumulations
-}
-
-func (s *anthropicState) handle(data []byte) {
-	var e struct {
-		Type    string `json:"type"`
-		Message *struct {
-			ID      string          `json:"id"`
-			Role    string          `json:"role"`
-			Model   string          `json:"model"`
-			Usage   json.RawMessage `json:"usage"`
-			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-		} `json:"message"`
-		Index        int `json:"index"`
-		ContentBlock *struct {
-			Type  string          `json:"type"`
-			ID    string          `json:"id"`
-			Name  string          `json:"name"`
-			Text  string          `json:"text"`
-			Data  string          `json:"data"`
-			Input json.RawMessage `json:"input"`
-		} `json:"content_block"`
-		Delta *struct {
-			Type         string          `json:"type"`
-			Text         string          `json:"text"`
-			Thinking     string          `json:"thinking"`
-			Signature    string          `json:"signature"`
-			PartialJSON  string          `json:"partial_json"`
-			Citation     json.RawMessage `json:"citation"`
-			StopReason   string          `json:"stop_reason"`
-			StopSequence *string         `json:"stop_sequence"`
-		} `json:"delta"`
-		Usage json.RawMessage `json:"usage"`
-	}
-	if err := json.Unmarshal(data, &e); err != nil {
-		return
-	}
-	s.seen = true
-	if s.blocks == nil {
-		s.blocks = map[int]*anthropicBlock{}
-	}
-	switch e.Type {
-	case "message_start":
-		if e.Message != nil {
-			s.id = e.Message.ID
-			s.role = e.Message.Role
-			s.model = e.Message.Model
-			s.mergeUsage(e.Message.Usage)
-			for i, block := range e.Message.Content {
-				dst := s.block(i)
-				dst.typ = block.Type
-				dst.text.WriteString(block.Text)
-			}
-		}
-	case "content_block_start":
-		if e.ContentBlock != nil {
-			dst := s.block(e.Index)
-			dst.typ = e.ContentBlock.Type
-			dst.id = e.ContentBlock.ID
-			dst.name = e.ContentBlock.Name
-			dst.text.WriteString(e.ContentBlock.Text)
-			if e.ContentBlock.Data != "" {
-				dst.data = e.ContentBlock.Data
-			}
-			if len(e.ContentBlock.Input) > 0 && string(e.ContentBlock.Input) != "null" {
-				dst.partialJSON.Write(e.ContentBlock.Input)
-			}
-		}
-	case "content_block_delta":
-		if e.Delta != nil {
-			dst := s.block(e.Index)
-			switch e.Delta.Type {
-			case "text_delta":
-				if dst.typ == "" {
-					dst.typ = "text"
-				}
-				dst.text.WriteString(e.Delta.Text)
-			case "thinking_delta":
-				if dst.typ == "" {
-					dst.typ = "thinking"
-				}
-				dst.thinking.WriteString(e.Delta.Thinking)
-			case "signature_delta":
-				dst.signature.WriteString(e.Delta.Signature)
-			case "input_json_delta":
-				if dst.typ == "" {
-					dst.typ = "tool_use"
-				}
-				dst.partialJSON.WriteString(e.Delta.PartialJSON)
-			case "citations_delta":
-				if len(e.Delta.Citation) > 0 && string(e.Delta.Citation) != "null" {
-					dst.citations = append(dst.citations, append([]byte(nil), e.Delta.Citation...))
-				}
-			}
-		}
-	case "message_delta":
-		if e.Delta != nil {
-			s.stopReason = e.Delta.StopReason
-			s.stopSequence = e.Delta.StopSequence
-		}
-		s.mergeUsage(e.Usage)
-	}
-}
-
-func (s *anthropicState) block(index int) *anthropicBlock {
-	b := s.blocks[index]
-	if b == nil {
-		b = &anthropicBlock{index: index}
-		s.blocks[index] = b
-	}
-	return b
-}
-
-// mergeUsage overlays a usage object onto the accumulated usage, keyed by field name with
-// the latest non-null value winning. Usage is kept as raw JSON because modern Anthropic
-// usage carries nested objects (cache_creation, output_tokens_details) and strings
-// (inference_geo) alongside the integer token counts — a map[string]int would fail to
-// decode and silently drop the entire event.
-func (s *anthropicState) mergeUsage(raw json.RawMessage) {
-	if len(raw) == 0 || string(raw) == "null" {
-		return
-	}
-	var u map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &u); err != nil {
-		return
-	}
-	if s.usage == nil {
-		s.usage = map[string]json.RawMessage{}
-	}
-	for k, v := range u {
-		if len(v) == 0 || string(v) == "null" {
-			continue
-		}
-		s.usage[k] = append([]byte(nil), v...)
-	}
-}
-
-func (s *anthropicState) finalize() ([]byte, bool) {
-	if !s.seen {
-		return nil, false
-	}
-	role := s.role
-	if role == "" {
-		role = "assistant"
-	}
-	out := map[string]any{
-		"type":    "message",
-		"role":    role,
-		"content": s.finalBlocks(),
-	}
-	if s.id != "" {
-		out["id"] = s.id
-	}
-	if s.model != "" {
-		out["model"] = s.model
-	}
-	if s.stopReason != "" {
-		out["stop_reason"] = s.stopReason
-	}
-	if s.stopSequence != nil {
-		out["stop_sequence"] = *s.stopSequence
-	}
-	if len(s.usage) > 0 {
-		out["usage"] = s.usage
-	}
-	b, err := json.Marshal(out)
-	return b, err == nil
-}
-
-func (s *anthropicState) finalBlocks() []map[string]any {
-	indexes := make([]int, 0, len(s.blocks))
-	for idx := range s.blocks {
-		indexes = append(indexes, idx)
-	}
-	sort.Ints(indexes)
-	out := make([]map[string]any, 0, len(indexes))
-	for _, idx := range indexes {
-		b := s.blocks[idx]
-		typ := b.typ
-		if typ == "" {
-			typ = "text"
-		}
-		item := map[string]any{"type": typ}
-		switch typ {
-		case "tool_use", "server_tool_use":
-			if b.id != "" {
-				item["id"] = b.id
-			}
-			if b.name != "" {
-				item["name"] = b.name
-			}
-			raw := strings.TrimSpace(b.partialJSON.String())
-			var input any = map[string]any{}
-			if raw != "" {
-				if json.Valid([]byte(raw)) {
-					input = json.RawMessage(raw)
-				} else {
-					input = raw
-				}
-			}
-			item["input"] = input
-		case "thinking":
-			item["thinking"] = b.thinking.String()
-			if b.signature.Len() > 0 {
-				item["signature"] = b.signature.String()
-			}
-		case "redacted_thinking":
-			item["data"] = b.data
-		default:
-			item["text"] = b.text.String()
-			if len(b.citations) > 0 {
-				item["citations"] = b.citations
-			}
-		}
-		out = append(out, item)
-	}
-	return out
-}
-
-func rawJSONString(raw json.RawMessage) (string, bool) {
-	if len(raw) == 0 || string(raw) == "null" {
-		return "", false
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return s, true
-	}
-	return "", false
 }
