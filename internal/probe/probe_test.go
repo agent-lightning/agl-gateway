@@ -120,17 +120,23 @@ func TestPoolConcurrencyAndCompleteness(t *testing.T) {
 	}
 	var mu sync.Mutex
 	callbacks := 0
+	// Rendezvous: the first two workers to enter both block until the second
+	// arrives, guaranteeing they are in-flight simultaneously (deterministic
+	// overlap, no reliance on busy-spin or wall-clock timing). Once released,
+	// the closed channel lets every later call through immediately.
+	var entered int32
+	ready := make(chan struct{})
 	results := Pool(jobs, 4, func(j Job) Result {
 		cur := atomic.AddInt32(&inflight, 1)
+		if atomic.AddInt32(&entered, 1) == 2 {
+			close(ready)
+		}
+		<-ready
 		for {
 			old := atomic.LoadInt32(&peak)
 			if cur <= old || atomic.CompareAndSwapInt32(&peak, old, cur) {
 				break
 			}
-		}
-		// Busy-spin briefly so workers overlap without relying on wall-clock sleeps.
-		for n := 0; n < 200000; n++ {
-			_ = n
 		}
 		atomic.AddInt32(&inflight, -1)
 		return Result{Provider: j.Provider, Model: j.Model, OK: true}
