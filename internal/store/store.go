@@ -61,6 +61,10 @@ type LogFilter struct {
 	Since    time.Time
 	Limit    int
 	Offset   int
+	// IncludePayloads selects the heavy raw_request/raw_response/assembled_response BLOB
+	// columns. When false (the default) they are omitted from the query, so the returned
+	// RequestLogs carry nil payload bytes regardless of what was captured.
+	IncludePayloads bool
 }
 
 // Stat is an aggregate roll-up of request logs grouped by key and model.
@@ -361,14 +365,17 @@ INSERT INTO request_logs
 	return nil
 }
 
-// QueryLogs returns request logs matching the filter, newest first.
+// QueryLogs returns request logs matching the filter, newest first. The heavy payload
+// BLOB columns are only read when f.IncludePayloads is set.
 func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
-	q := `SELECT id, api_key_id, key_name, provider, model, mapped_model, status_code, streaming,
+	cols := `id, api_key_id, key_name, provider, model, mapped_model, status_code, streaming,
 	             request_content_type, response_content_type, attempts, ttft_ms, duration_ms,
-	             input_tokens, output_tokens, cache_read_tokens,
-	             cache_write_tokens, cost, error, raw_request, raw_response, assembled_response,
-	             raw_request_truncated, raw_response_truncated, assembled_response_truncated, created_at
-	      FROM request_logs WHERE 1=1`
+	             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost, error,`
+	if f.IncludePayloads {
+		cols += ` raw_request, raw_response, assembled_response,`
+	}
+	cols += ` raw_request_truncated, raw_response_truncated, assembled_response_truncated, created_at`
+	q := `SELECT ` + cols + ` FROM request_logs WHERE 1=1`
 	var args []any
 	if f.APIKeyID > 0 {
 		q += " AND api_key_id = ?"
@@ -408,13 +415,15 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 			assembledTruncated int
 			createdMs          int64
 		)
-		if err := rows.Scan(&l.ID, &l.APIKeyID, &l.KeyName, &l.Provider, &l.Model, &l.MappedModel,
+		dest := []any{&l.ID, &l.APIKeyID, &l.KeyName, &l.Provider, &l.Model, &l.MappedModel,
 			&l.StatusCode, &streaming, &l.RequestContentType, &l.ResponseContentType,
 			&l.Attempts, &l.TTFTMillis, &l.DurationMillis, &l.InputTokens, &l.OutputTokens,
-			&l.CacheReadTokens, &l.CacheWriteTokens, &l.Cost, &l.Error,
-			&l.RawRequest, &l.RawResponse, &l.AssembledResponse, &rawReqTruncated,
-			&rawRespTruncated, &assembledTruncated,
-			&createdMs); err != nil {
+			&l.CacheReadTokens, &l.CacheWriteTokens, &l.Cost, &l.Error}
+		if f.IncludePayloads {
+			dest = append(dest, &l.RawRequest, &l.RawResponse, &l.AssembledResponse)
+		}
+		dest = append(dest, &rawReqTruncated, &rawRespTruncated, &assembledTruncated, &createdMs)
+		if err := rows.Scan(dest...); err != nil {
 			return nil, err
 		}
 		l.Streaming = streaming != 0

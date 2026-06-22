@@ -120,10 +120,10 @@ func TestLogsAndStats(t *testing.T) {
 		StatusCode: 200, InputTokens: 100, OutputTokens: 50, Cost: 0.5})
 
 	rec := req(t, h, "GET", "/admin/logs", master, "")
-	var logs []store.RequestLog
-	json.Unmarshal(rec.Body.Bytes(), &logs)
-	if len(logs) != 1 {
-		t.Fatalf("logs = %d, want 1", len(logs))
+	var page logsResponse
+	json.Unmarshal(rec.Body.Bytes(), &page)
+	if len(page.Logs) != 1 {
+		t.Fatalf("logs = %d, want 1", len(page.Logs))
 	}
 
 	rec = req(t, h, "GET", "/admin/stats", master, "")
@@ -141,7 +141,7 @@ func TestLogsAndStats(t *testing.T) {
 	}
 }
 
-func TestExportKeyDataPaginatesByKey(t *testing.T) {
+func TestLogsPaginateByKey(t *testing.T) {
 	h, st := newAdmin(t)
 	k, err := st.CreateKey("dev", "hash-dev", "sk-gw-dev", []string{"openai"}, "first", "round_robin")
 	if err != nil {
@@ -163,15 +163,15 @@ func TestExportKeyDataPaginatesByKey(t *testing.T) {
 		t.Fatalf("InsertLog(other): %v", err)
 	}
 
-	rec := req(t, h, "GET", "/admin/export?api_key_id="+itoa(k.ID)+"&limit=2", master, "")
+	rec := req(t, h, "GET", "/admin/logs?api_key_id="+itoa(k.ID)+"&limit=2", master, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 	}
-	var page keyExportResponse
+	var page logsResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if page.APIKey.ID != k.ID || page.APIKey.Name != "dev" {
+	if page.APIKey == nil || page.APIKey.ID != k.ID || page.APIKey.Name != "dev" {
 		t.Fatalf("api key = %+v, want dev key", page.APIKey)
 	}
 	if page.Limit != 2 || page.Offset != 0 || page.NextOffset != 2 || !page.HasMore {
@@ -182,34 +182,64 @@ func TestExportKeyDataPaginatesByKey(t *testing.T) {
 	}
 	for _, l := range page.Logs {
 		if l.APIKeyID != k.ID {
-			t.Errorf("export included log for api_key_id=%d, want %d", l.APIKeyID, k.ID)
+			t.Errorf("logs included api_key_id=%d, want %d", l.APIKeyID, k.ID)
 		}
 	}
 
-	rec = req(t, h, "GET", "/admin/export?api_key_id="+itoa(k.ID)+"&limit=2&offset=2", master, "")
+	rec = req(t, h, "GET", "/admin/logs?api_key_id="+itoa(k.ID)+"&limit=2&offset=2", master, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("second page status = %d, body=%s", rec.Code, rec.Body.String())
 	}
-	page = keyExportResponse{}
+	page = logsResponse{}
 	json.Unmarshal(rec.Body.Bytes(), &page)
 	if page.HasMore || page.NextOffset != 0 || len(page.Logs) != 1 {
 		t.Fatalf("second page = %+v", page)
 	}
 }
 
-func TestExportKeyDataMissingKey(t *testing.T) {
-	h, _ := newAdmin(t)
-	rec := req(t, h, "GET", "/admin/export?api_key_id=404", master, "")
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", rec.Code)
+func TestLogsPayloadsOptIn(t *testing.T) {
+	h, st := newAdmin(t)
+	k, err := st.CreateKey("dev", "hash-dev", "sk-gw-dev", []string{"openai"}, "first", "round_robin")
+	if err != nil {
+		t.Fatalf("CreateKey: %v", err)
+	}
+	if err := st.InsertLog(&store.RequestLog{
+		APIKeyID: k.ID, KeyName: "dev", Provider: "openai", Model: "gpt-5.4", StatusCode: 200,
+		RawRequest: []byte(`{"secret":true}`), RawResponse: []byte("data: x\n\n"),
+	}); err != nil {
+		t.Fatalf("InsertLog: %v", err)
+	}
+
+	// Default: payload blobs are omitted.
+	rec := req(t, h, "GET", "/admin/logs?api_key_id="+itoa(k.ID), master, "")
+	var page logsResponse
+	json.Unmarshal(rec.Body.Bytes(), &page)
+	if len(page.Logs) != 1 {
+		t.Fatalf("logs = %d, want 1", len(page.Logs))
+	}
+	if page.Logs[0].RawRequest != nil || page.Logs[0].RawResponse != nil {
+		t.Errorf("payloads should be omitted by default: req=%q resp=%q", page.Logs[0].RawRequest, page.Logs[0].RawResponse)
+	}
+
+	// Opt-in: payload blobs are returned.
+	rec = req(t, h, "GET", "/admin/logs?api_key_id="+itoa(k.ID)+"&include_payloads=true", master, "")
+	page = logsResponse{}
+	json.Unmarshal(rec.Body.Bytes(), &page)
+	if len(page.Logs) != 1 || string(page.Logs[0].RawRequest) != `{"secret":true}` || string(page.Logs[0].RawResponse) != "data: x\n\n" {
+		t.Errorf("include_payloads did not return payloads: %+v", page.Logs)
 	}
 }
 
-func TestExportKeyDataRequiresKeyID(t *testing.T) {
+func TestLogsMissingKeyReturnsEmpty(t *testing.T) {
 	h, _ := newAdmin(t)
-	rec := req(t, h, "GET", "/admin/export", master, "")
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
+	rec := req(t, h, "GET", "/admin/logs?api_key_id=404", master, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var page logsResponse
+	json.Unmarshal(rec.Body.Bytes(), &page)
+	if len(page.Logs) != 0 || page.APIKey != nil || page.HasMore {
+		t.Fatalf("missing-key page = %+v, want empty with no api_key", page)
 	}
 }
 

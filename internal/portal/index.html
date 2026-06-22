@@ -235,7 +235,8 @@ async function loadLogs(){
   const w = $("#logwindow").value, lim = $("#loglimit").value || 100;
   let q = "?limit="+encodeURIComponent(lim); if(w) q+="&since="+encodeURIComponent(w);
   try{
-    const logs = await api("GET","/admin/logs"+q);
+    const resp = await api("GET","/admin/logs"+q);
+    const logs = resp.logs || [];
     $("#logsbody").innerHTML = logs.map(l=>`<tr>
       <td class="muted">${fmtTime(l.created_at)}</td><td>${esc(l.key_name)}</td>
       <td>${esc(l.provider)}</td><td>${esc(l.model)}</td>

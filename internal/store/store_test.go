@@ -79,7 +79,15 @@ func TestLogPayloadBytesRoundTrip(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("InsertLog: %v", err)
 	}
-	logs, err := s.QueryLogs(LogFilter{})
+	// Without IncludePayloads the heavy blob columns are omitted.
+	bare, err := s.QueryLogs(LogFilter{})
+	if err != nil {
+		t.Fatalf("QueryLogs(bare): %v", err)
+	}
+	if len(bare) != 1 || bare[0].RawRequest != nil || bare[0].RawResponse != nil || bare[0].AssembledResponse != nil {
+		t.Errorf("payloads should be omitted by default: %+v", bare)
+	}
+	logs, err := s.QueryLogs(LogFilter{IncludePayloads: true})
 	if err != nil {
 		t.Fatalf("QueryLogs: %v", err)
 	}

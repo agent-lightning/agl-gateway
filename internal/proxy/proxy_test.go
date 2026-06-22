@@ -154,7 +154,7 @@ func TestPayloadCaptureStoresRawAndAssembledStream(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
-	logs, _ := st.QueryLogs(store.LogFilter{})
+	logs, _ := st.QueryLogs(store.LogFilter{IncludePayloads: true})
 	if len(logs) != 1 {
 		t.Fatalf("logs = %d, want 1", len(logs))
 	}
@@ -192,7 +192,7 @@ func TestPayloadCaptureUnknownStreamKeepsRawOnly(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
-	logs, _ := st.QueryLogs(store.LogFilter{})
+	logs, _ := st.QueryLogs(store.LogFilter{IncludePayloads: true})
 	if len(logs) != 1 {
 		t.Fatalf("logs = %d, want 1", len(logs))
 	}

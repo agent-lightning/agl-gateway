@@ -163,7 +163,17 @@ type chatChoice struct {
 	index        int
 	role         string
 	content      strings.Builder
+	refusal      strings.Builder
+	toolCalls    map[int]*chatToolCall
+	toolOrder    []int
 	finishReason json.RawMessage
+}
+
+type chatToolCall struct {
+	id   string
+	typ  string
+	name string
+	args strings.Builder
 }
 
 type chatChunk struct {
@@ -174,8 +184,18 @@ type chatChunk struct {
 	Choices           []struct {
 		Index int `json:"index"`
 		Delta struct {
-			Role    string          `json:"role"`
-			Content json.RawMessage `json:"content"`
+			Role      string          `json:"role"`
+			Content   json.RawMessage `json:"content"`
+			Refusal   json.RawMessage `json:"refusal"`
+			ToolCalls []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Type     string `json:"type"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason json.RawMessage `json:"finish_reason"`
 	} `json:"choices"`
@@ -217,6 +237,30 @@ func (s *chatState) handle(data []byte) {
 		}
 		if text, ok := rawJSONString(ch.Delta.Content); ok {
 			dst.content.WriteString(text)
+		}
+		if text, ok := rawJSONString(ch.Delta.Refusal); ok {
+			dst.refusal.WriteString(text)
+		}
+		for _, tc := range ch.Delta.ToolCalls {
+			if dst.toolCalls == nil {
+				dst.toolCalls = map[int]*chatToolCall{}
+			}
+			call := dst.toolCalls[tc.Index]
+			if call == nil {
+				call = &chatToolCall{}
+				dst.toolCalls[tc.Index] = call
+				dst.toolOrder = append(dst.toolOrder, tc.Index)
+			}
+			if tc.ID != "" {
+				call.id = tc.ID
+			}
+			if tc.Type != "" {
+				call.typ = tc.Type
+			}
+			if tc.Function.Name != "" {
+				call.name = tc.Function.Name
+			}
+			call.args.WriteString(tc.Function.Arguments)
 		}
 		if len(ch.FinishReason) > 0 && string(ch.FinishReason) != "null" {
 			dst.finishReason = append(dst.finishReason[:0], ch.FinishReason...)
@@ -264,12 +308,23 @@ func (s *chatState) finalChoices() []map[string]any {
 		if role == "" {
 			role = "assistant"
 		}
+		message := map[string]any{"role": role}
+		hasExtras := len(ch.toolCalls) > 0 || ch.refusal.Len() > 0
+		if ch.content.Len() > 0 || !hasExtras {
+			// Faithful to OpenAI: content is null when only tool_calls/refusal are present.
+			message["content"] = ch.content.String()
+		} else {
+			message["content"] = nil
+		}
+		if ch.refusal.Len() > 0 {
+			message["refusal"] = ch.refusal.String()
+		}
+		if len(ch.toolCalls) > 0 {
+			message["tool_calls"] = ch.finalToolCalls()
+		}
 		item := map[string]any{
-			"index": idx,
-			"message": map[string]any{
-				"role":    role,
-				"content": ch.content.String(),
-			},
+			"index":         idx,
+			"message":       message,
 			"finish_reason": nil,
 		}
 		if len(ch.finishReason) > 0 {
@@ -278,6 +333,31 @@ func (s *chatState) finalChoices() []map[string]any {
 		out = append(out, item)
 	}
 	return out
+}
+
+func (ch *chatChoice) finalToolCalls() []map[string]any {
+	order := append([]int(nil), ch.toolOrder...)
+	sort.Ints(order)
+	calls := make([]map[string]any, 0, len(order))
+	for _, idx := range order {
+		tc := ch.toolCalls[idx]
+		typ := tc.typ
+		if typ == "" {
+			typ = "function"
+		}
+		call := map[string]any{
+			"type": typ,
+			"function": map[string]any{
+				"name":      tc.name,
+				"arguments": tc.args.String(),
+			},
+		}
+		if tc.id != "" {
+			call["id"] = tc.id
+		}
+		calls = append(calls, call)
+	}
+	return calls
 }
 
 type responsesState struct {
@@ -309,7 +389,10 @@ func (s *responsesState) handle(event string, data []byte) {
 		if len(probe.Usage) > 0 && string(probe.Usage) != "null" {
 			s.usage = append(s.usage[:0], probe.Usage...)
 		}
-		if e.Type == "response.completed" {
+		// All three terminal events carry the complete final response object; keep the
+		// last one seen.
+		switch e.Type {
+		case "response.completed", "response.incomplete", "response.failed":
 			s.finalResponse = append(s.finalResponse[:0], e.Response...)
 		}
 	}
@@ -355,7 +438,7 @@ type anthropicState struct {
 	model        string
 	stopReason   string
 	stopSequence *string
-	usage        map[string]int
+	usage        map[string]json.RawMessage
 	blocks       map[int]*anthropicBlock
 }
 
@@ -366,17 +449,20 @@ type anthropicBlock struct {
 	name        string
 	text        strings.Builder
 	thinking    strings.Builder
+	signature   strings.Builder
 	partialJSON strings.Builder
+	data        string            // redacted_thinking payload
+	citations   []json.RawMessage // citations_delta accumulations
 }
 
 func (s *anthropicState) handle(data []byte) {
 	var e struct {
 		Type    string `json:"type"`
 		Message *struct {
-			ID      string         `json:"id"`
-			Role    string         `json:"role"`
-			Model   string         `json:"model"`
-			Usage   map[string]int `json:"usage"`
+			ID      string          `json:"id"`
+			Role    string          `json:"role"`
+			Model   string          `json:"model"`
+			Usage   json.RawMessage `json:"usage"`
 			Content []struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
@@ -388,17 +474,20 @@ func (s *anthropicState) handle(data []byte) {
 			ID    string          `json:"id"`
 			Name  string          `json:"name"`
 			Text  string          `json:"text"`
+			Data  string          `json:"data"`
 			Input json.RawMessage `json:"input"`
 		} `json:"content_block"`
 		Delta *struct {
-			Type         string  `json:"type"`
-			Text         string  `json:"text"`
-			Thinking     string  `json:"thinking"`
-			PartialJSON  string  `json:"partial_json"`
-			StopReason   string  `json:"stop_reason"`
-			StopSequence *string `json:"stop_sequence"`
+			Type         string          `json:"type"`
+			Text         string          `json:"text"`
+			Thinking     string          `json:"thinking"`
+			Signature    string          `json:"signature"`
+			PartialJSON  string          `json:"partial_json"`
+			Citation     json.RawMessage `json:"citation"`
+			StopReason   string          `json:"stop_reason"`
+			StopSequence *string         `json:"stop_sequence"`
 		} `json:"delta"`
-		Usage map[string]int `json:"usage"`
+		Usage json.RawMessage `json:"usage"`
 	}
 	if err := json.Unmarshal(data, &e); err != nil {
 		return
@@ -427,6 +516,9 @@ func (s *anthropicState) handle(data []byte) {
 			dst.id = e.ContentBlock.ID
 			dst.name = e.ContentBlock.Name
 			dst.text.WriteString(e.ContentBlock.Text)
+			if e.ContentBlock.Data != "" {
+				dst.data = e.ContentBlock.Data
+			}
 			if len(e.ContentBlock.Input) > 0 && string(e.ContentBlock.Input) != "null" {
 				dst.partialJSON.Write(e.ContentBlock.Input)
 			}
@@ -445,11 +537,17 @@ func (s *anthropicState) handle(data []byte) {
 					dst.typ = "thinking"
 				}
 				dst.thinking.WriteString(e.Delta.Thinking)
+			case "signature_delta":
+				dst.signature.WriteString(e.Delta.Signature)
 			case "input_json_delta":
 				if dst.typ == "" {
 					dst.typ = "tool_use"
 				}
 				dst.partialJSON.WriteString(e.Delta.PartialJSON)
+			case "citations_delta":
+				if len(e.Delta.Citation) > 0 && string(e.Delta.Citation) != "null" {
+					dst.citations = append(dst.citations, append([]byte(nil), e.Delta.Citation...))
+				}
 			}
 		}
 	case "message_delta":
@@ -470,17 +568,27 @@ func (s *anthropicState) block(index int) *anthropicBlock {
 	return b
 }
 
-func (s *anthropicState) mergeUsage(u map[string]int) {
-	if len(u) == 0 {
+// mergeUsage overlays a usage object onto the accumulated usage, keyed by field name with
+// the latest non-null value winning. Usage is kept as raw JSON because modern Anthropic
+// usage carries nested objects (cache_creation, output_tokens_details) and strings
+// (inference_geo) alongside the integer token counts — a map[string]int would fail to
+// decode and silently drop the entire event.
+func (s *anthropicState) mergeUsage(raw json.RawMessage) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return
+	}
+	var u map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &u); err != nil {
 		return
 	}
 	if s.usage == nil {
-		s.usage = map[string]int{}
+		s.usage = map[string]json.RawMessage{}
 	}
 	for k, v := range u {
-		if v > s.usage[k] {
-			s.usage[k] = v
+		if len(v) == 0 || string(v) == "null" {
+			continue
 		}
+		s.usage[k] = append([]byte(nil), v...)
 	}
 }
 
@@ -531,7 +639,7 @@ func (s *anthropicState) finalBlocks() []map[string]any {
 		}
 		item := map[string]any{"type": typ}
 		switch typ {
-		case "tool_use":
+		case "tool_use", "server_tool_use":
 			if b.id != "" {
 				item["id"] = b.id
 			}
@@ -550,8 +658,16 @@ func (s *anthropicState) finalBlocks() []map[string]any {
 			item["input"] = input
 		case "thinking":
 			item["thinking"] = b.thinking.String()
+			if b.signature.Len() > 0 {
+				item["signature"] = b.signature.String()
+			}
+		case "redacted_thinking":
+			item["data"] = b.data
 		default:
 			item["text"] = b.text.String()
+			if len(b.citations) > 0 {
+				item["citations"] = b.citations
+			}
 		}
 		out = append(out, item)
 	}
