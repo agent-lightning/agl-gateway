@@ -27,6 +27,8 @@ transparently.
 - **Best-effort metering.** Model, attempts, input/output/cache tokens, TTFT, duration,
   status, error, and computed cost are logged for every request — extracted from OpenAI
   Chat/Responses and Anthropic Messages payloads (streaming or not).
+- **Optional payload capture.** When enabled, request/response bytes are stored in SQLite,
+  with optional best-effort assembly for common OpenAI and Anthropic SSE streams.
 - **Cost computation.** Per-model token pricing in the config yields a dollar cost per
   request and aggregate stats.
 - **Web portal** for managing keys and inspecting logs, stats, and a live model test.
@@ -88,6 +90,12 @@ master_key: "mk-…"            # authenticates /admin and the portal
 database: "./gateway.db"
 defaults:
   retry: { max_retries: 3, base_delay: 200ms, max_delay: 10s }
+payload_capture:
+  enabled: false
+  max_request_bytes: 1048576
+  max_response_bytes: 1048576
+  assemble_streams: false
+  max_assembled_bytes: 1048576
 providers:
   - name: openai
     base_url: https://api.openai.com
@@ -105,6 +113,13 @@ pricing:
 ```
 
 The retry policy is `base_delay * 2^attempt` capped at `max_delay`, with full jitter.
+
+`payload_capture` is off by default because payloads can contain secrets and can grow the
+SQLite database quickly. When enabled, the gateway stores the original inbound request body
+and the final upstream response body on each request log, capped by the configured byte
+limits. With `assemble_streams: true`, recognized SSE responses for `/v1/chat/completions`,
+`/v1/responses`, and `/v1/messages` also store a best-effort assembled JSON response;
+unrecognized stream paths still store the raw stream.
 
 ## Using the gateway
 

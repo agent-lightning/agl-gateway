@@ -49,6 +49,7 @@ func TestLogMappedModelAndAttempts(t *testing.T) {
 	if err := s.InsertLog(&RequestLog{
 		APIKeyID: 1, KeyName: "dev", Provider: "openai",
 		Model: "alias", MappedModel: "gpt-5.4", Attempts: 3, StatusCode: 200,
+		RequestContentType: "application/json", ResponseContentType: "text/event-stream",
 	}); err != nil {
 		t.Fatalf("InsertLog: %v", err)
 	}
@@ -58,6 +59,41 @@ func TestLogMappedModelAndAttempts(t *testing.T) {
 	}
 	if logs[0].MappedModel != "gpt-5.4" || logs[0].Attempts != 3 {
 		t.Errorf("round-trip mismatch: %+v", logs[0])
+	}
+	if logs[0].RequestContentType != "application/json" || logs[0].ResponseContentType != "text/event-stream" {
+		t.Errorf("content types = %q/%q", logs[0].RequestContentType, logs[0].ResponseContentType)
+	}
+}
+
+func TestLogPayloadBytesRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.InsertLog(&RequestLog{
+		APIKeyID: 1, KeyName: "dev", Provider: "openai", Model: "gpt-5.4",
+		StatusCode:                 200,
+		RawRequest:                 []byte(`{"model":"gpt-5.4"}`),
+		RawResponse:                []byte("data: x\n\n"),
+		AssembledResponse:          []byte(`{"output_text":"x"}`),
+		RawRequestTruncated:        true,
+		RawResponseTruncated:       true,
+		AssembledResponseTruncated: true,
+	}); err != nil {
+		t.Fatalf("InsertLog: %v", err)
+	}
+	logs, err := s.QueryLogs(LogFilter{})
+	if err != nil {
+		t.Fatalf("QueryLogs: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("logs = %d, want 1", len(logs))
+	}
+	got := logs[0]
+	if string(got.RawRequest) != `{"model":"gpt-5.4"}` ||
+		string(got.RawResponse) != "data: x\n\n" ||
+		string(got.AssembledResponse) != `{"output_text":"x"}` {
+		t.Errorf("payload bytes = %q / %q / %q", got.RawRequest, got.RawResponse, got.AssembledResponse)
+	}
+	if !got.RawRequestTruncated || !got.RawResponseTruncated || !got.AssembledResponseTruncated {
+		t.Errorf("truncation flags = %+v", got)
 	}
 }
 

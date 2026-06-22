@@ -33,6 +33,14 @@ func TestParseAppliesDefaults(t *testing.T) {
 	if c.Defaults.Retry.MaxDelay != 10*time.Second {
 		t.Errorf("default max_delay = %v", c.Defaults.Retry.MaxDelay)
 	}
+	if c.PayloadCapture.Enabled {
+		t.Error("payload capture should be disabled by default")
+	}
+	if c.PayloadCapture.MaxRequestBytes != DefaultPayloadCaptureBytes ||
+		c.PayloadCapture.MaxResponseBytes != DefaultPayloadCaptureBytes ||
+		c.PayloadCapture.MaxAssembledBytes != DefaultPayloadCaptureBytes {
+		t.Errorf("payload capture defaults = %+v", c.PayloadCapture)
+	}
 }
 
 func TestParseDurations(t *testing.T) {
@@ -89,6 +97,14 @@ pricing:
   - model: gpt
     input_cost_per_token: 2
 `,
+		"negative payload limit": `
+master_key: mk
+payload_capture:
+  max_request_bytes: -1
+providers:
+  - name: openai
+    base_url: http://x
+`,
 	}
 	for name, y := range cases {
 		if _, err := Parse([]byte(y)); err == nil {
@@ -111,6 +127,29 @@ func TestResolvedRetryOverride(t *testing.T) {
 	none := Provider{}
 	if none.ResolvedRetry(def) != def {
 		t.Errorf("ResolvedRetry without override = %+v, want %+v", none.ResolvedRetry(def), def)
+	}
+}
+
+func TestPayloadCaptureParses(t *testing.T) {
+	y := minimalYAML + `
+payload_capture:
+  enabled: true
+  max_request_bytes: 1024
+  max_response_bytes: 2048
+  assemble_streams: true
+  max_assembled_bytes: 4096
+`
+	c, err := Parse([]byte(y))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !c.PayloadCapture.Enabled || !c.PayloadCapture.AssembleStreams {
+		t.Errorf("payload flags = %+v", c.PayloadCapture)
+	}
+	if c.PayloadCapture.MaxRequestBytes != 1024 ||
+		c.PayloadCapture.MaxResponseBytes != 2048 ||
+		c.PayloadCapture.MaxAssembledBytes != 4096 {
+		t.Errorf("payload limits = %+v", c.PayloadCapture)
 	}
 }
 

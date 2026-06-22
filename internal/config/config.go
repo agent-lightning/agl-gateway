@@ -11,12 +11,13 @@ import (
 
 // Config is the top-level gateway configuration.
 type Config struct {
-	Server    Server         `yaml:"server"`
-	MasterKey string         `yaml:"master_key"`
-	Database  string         `yaml:"database"`
-	Defaults  Defaults       `yaml:"defaults"`
-	Providers []Provider     `yaml:"providers"`
-	Pricing   []ModelPricing `yaml:"pricing"`
+	Server         Server         `yaml:"server"`
+	MasterKey      string         `yaml:"master_key"`
+	Database       string         `yaml:"database"`
+	Defaults       Defaults       `yaml:"defaults"`
+	PayloadCapture PayloadCapture `yaml:"payload_capture"`
+	Providers      []Provider     `yaml:"providers"`
+	Pricing        []ModelPricing `yaml:"pricing"`
 }
 
 // Server holds HTTP listener settings.
@@ -27,6 +28,19 @@ type Server struct {
 // Defaults provides fallback settings applied to every provider.
 type Defaults struct {
 	Retry Retry `yaml:"retry"`
+}
+
+// DefaultPayloadCaptureBytes caps each stored payload field when capture is enabled and no
+// explicit limit is configured.
+const DefaultPayloadCaptureBytes = 1 << 20 // 1 MiB
+
+// PayloadCapture controls optional storage of request/response bodies in request_logs.
+type PayloadCapture struct {
+	Enabled           bool `yaml:"enabled"`
+	MaxRequestBytes   int  `yaml:"max_request_bytes"`
+	MaxResponseBytes  int  `yaml:"max_response_bytes"`
+	AssembleStreams   bool `yaml:"assemble_streams"`
+	MaxAssembledBytes int  `yaml:"max_assembled_bytes"`
 }
 
 // Retry configures exponential backoff with jitter for an upstream provider.
@@ -140,6 +154,15 @@ func (c *Config) applyDefaults() {
 	if c.Defaults.Retry.MaxDelay == 0 {
 		c.Defaults.Retry.MaxDelay = 10 * time.Second
 	}
+	if c.PayloadCapture.MaxRequestBytes == 0 {
+		c.PayloadCapture.MaxRequestBytes = DefaultPayloadCaptureBytes
+	}
+	if c.PayloadCapture.MaxResponseBytes == 0 {
+		c.PayloadCapture.MaxResponseBytes = DefaultPayloadCaptureBytes
+	}
+	if c.PayloadCapture.MaxAssembledBytes == 0 {
+		c.PayloadCapture.MaxAssembledBytes = DefaultPayloadCaptureBytes
+	}
 }
 
 // Validate checks the configuration for internal consistency.
@@ -149,6 +172,15 @@ func (c *Config) Validate() error {
 	}
 	if len(c.Providers) == 0 {
 		return fmt.Errorf("config: at least one provider is required")
+	}
+	if c.PayloadCapture.MaxRequestBytes < 0 {
+		return fmt.Errorf("config: payload_capture max_request_bytes must be non-negative")
+	}
+	if c.PayloadCapture.MaxResponseBytes < 0 {
+		return fmt.Errorf("config: payload_capture max_response_bytes must be non-negative")
+	}
+	if c.PayloadCapture.MaxAssembledBytes < 0 {
+		return fmt.Errorf("config: payload_capture max_assembled_bytes must be non-negative")
 	}
 	seen := make(map[string]bool, len(c.Providers))
 	for i, p := range c.Providers {

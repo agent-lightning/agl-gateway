@@ -26,24 +26,32 @@ type APIKey struct {
 
 // RequestLog is the recorded metadata for a single proxied request.
 type RequestLog struct {
-	ID               int64     `json:"id"`
-	APIKeyID         int64     `json:"api_key_id"`
-	KeyName          string    `json:"key_name"`
-	Provider         string    `json:"provider"`
-	Model            string    `json:"model"`
-	MappedModel      string    `json:"mapped_model"`
-	StatusCode       int       `json:"status_code"`
-	Streaming        bool      `json:"streaming"`
-	Attempts         int       `json:"attempts"`
-	TTFTMillis       int64     `json:"ttft_ms"`
-	DurationMillis   int64     `json:"duration_ms"`
-	InputTokens      int       `json:"input_tokens"`
-	OutputTokens     int       `json:"output_tokens"`
-	CacheReadTokens  int       `json:"cache_read_tokens"`
-	CacheWriteTokens int       `json:"cache_write_tokens"`
-	Cost             float64   `json:"cost"`
-	Error            string    `json:"error"`
-	CreatedAt        time.Time `json:"created_at"`
+	ID                         int64     `json:"id"`
+	APIKeyID                   int64     `json:"api_key_id"`
+	KeyName                    string    `json:"key_name"`
+	Provider                   string    `json:"provider"`
+	Model                      string    `json:"model"`
+	MappedModel                string    `json:"mapped_model"`
+	RequestContentType         string    `json:"request_content_type"`
+	ResponseContentType        string    `json:"response_content_type"`
+	StatusCode                 int       `json:"status_code"`
+	Streaming                  bool      `json:"streaming"`
+	Attempts                   int       `json:"attempts"`
+	TTFTMillis                 int64     `json:"ttft_ms"`
+	DurationMillis             int64     `json:"duration_ms"`
+	InputTokens                int       `json:"input_tokens"`
+	OutputTokens               int       `json:"output_tokens"`
+	CacheReadTokens            int       `json:"cache_read_tokens"`
+	CacheWriteTokens           int       `json:"cache_write_tokens"`
+	Cost                       float64   `json:"cost"`
+	Error                      string    `json:"error"`
+	RawRequest                 []byte    `json:"raw_request,omitempty"`
+	RawResponse                []byte    `json:"raw_response,omitempty"`
+	AssembledResponse          []byte    `json:"assembled_response,omitempty"`
+	RawRequestTruncated        bool      `json:"raw_request_truncated"`
+	RawResponseTruncated       bool      `json:"raw_response_truncated"`
+	AssembledResponseTruncated bool      `json:"assembled_response_truncated"`
+	CreatedAt                  time.Time `json:"created_at"`
 }
 
 // LogFilter constrains a log query. Zero-valued fields are ignored.
@@ -120,6 +128,8 @@ CREATE TABLE IF NOT EXISTS request_logs (
     provider           TEXT NOT NULL,
     model              TEXT NOT NULL,
     mapped_model       TEXT NOT NULL DEFAULT '',
+    request_content_type  TEXT NOT NULL DEFAULT '',
+    response_content_type TEXT NOT NULL DEFAULT '',
     status_code        INTEGER NOT NULL,
     streaming          INTEGER NOT NULL,
     attempts           INTEGER NOT NULL DEFAULT 0,
@@ -131,6 +141,12 @@ CREATE TABLE IF NOT EXISTS request_logs (
     cache_write_tokens INTEGER NOT NULL,
     cost               REAL NOT NULL,
     error              TEXT NOT NULL,
+    raw_request        BLOB,
+    raw_response       BLOB,
+    assembled_response BLOB,
+    raw_request_truncated        INTEGER NOT NULL DEFAULT 0,
+    raw_response_truncated       INTEGER NOT NULL DEFAULT 0,
+    assembled_response_truncated INTEGER NOT NULL DEFAULT 0,
     created_at         INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_logs_created_at ON request_logs(created_at);
@@ -144,6 +160,30 @@ CREATE INDEX IF NOT EXISTS idx_logs_api_key_id ON request_logs(api_key_id);
 		return err
 	}
 	if err := s.ensureColumn("request_logs", "attempts", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("request_logs", "request_content_type", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("request_logs", "response_content_type", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("request_logs", "raw_request", "BLOB"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("request_logs", "raw_response", "BLOB"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("request_logs", "assembled_response", "BLOB"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("request_logs", "raw_request_truncated", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("request_logs", "raw_response_truncated", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("request_logs", "assembled_response_truncated", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
 	if err := s.ensureColumn("api_keys", "provider_start", "TEXT NOT NULL DEFAULT 'first'"); err != nil {
@@ -294,13 +334,18 @@ func (s *Store) InsertLog(l *RequestLog) error {
 	}
 	_, err := s.db.Exec(`
 INSERT INTO request_logs
- (api_key_id, key_name, provider, model, mapped_model, status_code, streaming, attempts,
+ (api_key_id, key_name, provider, model, mapped_model, request_content_type,
+  response_content_type, status_code, streaming, attempts,
   ttft_ms, duration_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-  cost, error, created_at)
- VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		l.APIKeyID, l.KeyName, l.Provider, l.Model, l.MappedModel, l.StatusCode, b2i(l.Streaming),
+  cost, error, raw_request, raw_response, assembled_response, raw_request_truncated,
+  raw_response_truncated, assembled_response_truncated, created_at)
+ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		l.APIKeyID, l.KeyName, l.Provider, l.Model, l.MappedModel, l.RequestContentType,
+		l.ResponseContentType, l.StatusCode, b2i(l.Streaming),
 		l.Attempts, l.TTFTMillis, l.DurationMillis, l.InputTokens, l.OutputTokens, l.CacheReadTokens,
-		l.CacheWriteTokens, l.Cost, l.Error, l.CreatedAt.UnixMilli(),
+		l.CacheWriteTokens, l.Cost, l.Error, l.RawRequest, l.RawResponse, l.AssembledResponse,
+		b2i(l.RawRequestTruncated), b2i(l.RawResponseTruncated), b2i(l.AssembledResponseTruncated),
+		l.CreatedAt.UnixMilli(),
 	)
 	if err != nil {
 		return fmt.Errorf("insert log: %w", err)
@@ -311,8 +356,10 @@ INSERT INTO request_logs
 // QueryLogs returns request logs matching the filter, newest first.
 func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 	q := `SELECT id, api_key_id, key_name, provider, model, mapped_model, status_code, streaming,
-	             attempts, ttft_ms, duration_ms, input_tokens, output_tokens, cache_read_tokens,
-	             cache_write_tokens, cost, error, created_at
+	             request_content_type, response_content_type, attempts, ttft_ms, duration_ms,
+	             input_tokens, output_tokens, cache_read_tokens,
+	             cache_write_tokens, cost, error, raw_request, raw_response, assembled_response,
+	             raw_request_truncated, raw_response_truncated, assembled_response_truncated, created_at
 	      FROM request_logs WHERE 1=1`
 	var args []any
 	if f.APIKeyID > 0 {
@@ -346,17 +393,26 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 	var logs []RequestLog
 	for rows.Next() {
 		var (
-			l         RequestLog
-			streaming int
-			createdMs int64
+			l                  RequestLog
+			streaming          int
+			rawReqTruncated    int
+			rawRespTruncated   int
+			assembledTruncated int
+			createdMs          int64
 		)
 		if err := rows.Scan(&l.ID, &l.APIKeyID, &l.KeyName, &l.Provider, &l.Model, &l.MappedModel,
-			&l.StatusCode, &streaming, &l.Attempts, &l.TTFTMillis, &l.DurationMillis, &l.InputTokens,
-			&l.OutputTokens, &l.CacheReadTokens, &l.CacheWriteTokens, &l.Cost, &l.Error,
+			&l.StatusCode, &streaming, &l.RequestContentType, &l.ResponseContentType,
+			&l.Attempts, &l.TTFTMillis, &l.DurationMillis, &l.InputTokens, &l.OutputTokens,
+			&l.CacheReadTokens, &l.CacheWriteTokens, &l.Cost, &l.Error,
+			&l.RawRequest, &l.RawResponse, &l.AssembledResponse, &rawReqTruncated,
+			&rawRespTruncated, &assembledTruncated,
 			&createdMs); err != nil {
 			return nil, err
 		}
 		l.Streaming = streaming != 0
+		l.RawRequestTruncated = rawReqTruncated != 0
+		l.RawResponseTruncated = rawRespTruncated != 0
+		l.AssembledResponseTruncated = assembledTruncated != 0
 		l.CreatedAt = time.UnixMilli(createdMs)
 		logs = append(logs, l)
 	}

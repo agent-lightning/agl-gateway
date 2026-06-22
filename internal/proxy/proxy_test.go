@@ -98,6 +98,9 @@ func TestForwardNonStreaming(t *testing.T) {
 	if l.Streaming {
 		t.Error("expected non-streaming")
 	}
+	if l.RequestContentType != "application/json" || l.ResponseContentType != "application/json" {
+		t.Errorf("content types = %q/%q", l.RequestContentType, l.ResponseContentType)
+	}
 }
 
 func TestForwardStreamingSSE(t *testing.T) {
@@ -126,6 +129,78 @@ func TestForwardStreamingSSE(t *testing.T) {
 	}
 	if logs[0].InputTokens != 10 || logs[0].OutputTokens != 5 {
 		t.Errorf("stream usage = %+v", logs[0])
+	}
+	if logs[0].RequestContentType != "application/json" || logs[0].ResponseContentType != "text/event-stream" {
+		t.Errorf("content types = %q/%q", logs[0].RequestContentType, logs[0].ResponseContentType)
+	}
+}
+
+func TestPayloadCaptureStoresRawAndAssembledStream(t *testing.T) {
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		fmt.Fprint(w, `data: {"id":"chatcmpl_1","created":123,"model":"gpt-5.4","choices":[{"index":0,"delta":{"role":"assistant","content":"hel"},"finish_reason":null}]}`+"\n\n")
+		fl.Flush()
+		fmt.Fprint(w, `data: {"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`+"\n\n")
+		fl.Flush()
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		fl.Flush()
+	})
+	p, st, key := harness(t, up)
+	p.cfg.PayloadCapture = config.PayloadCapture{Enabled: true, AssembleStreams: true}
+
+	body := `{"model":"gpt-5.4","stream":true}`
+	rec := do(t, p, key, "/v1/chat/completions", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 {
+		t.Fatalf("logs = %d, want 1", len(logs))
+	}
+	l := logs[0]
+	if string(l.RawRequest) != body {
+		t.Errorf("raw request = %q, want %q", l.RawRequest, body)
+	}
+	if string(l.RawResponse) != rec.Body.String() {
+		t.Errorf("raw response = %q, want client body %q", l.RawResponse, rec.Body.String())
+	}
+	var assembled struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(l.AssembledResponse, &assembled); err != nil {
+		t.Fatalf("assembled response is not JSON: %v\n%s", err, l.AssembledResponse)
+	}
+	if len(assembled.Choices) != 1 || assembled.Choices[0].Message.Content != "hello" {
+		t.Errorf("assembled = %s", l.AssembledResponse)
+	}
+}
+
+func TestPayloadCaptureUnknownStreamKeepsRawOnly(t *testing.T) {
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: {\"delta\":\"x\"}\n\n")
+	})
+	p, st, key := harness(t, up)
+	p.cfg.PayloadCapture = config.PayloadCapture{Enabled: true, AssembleStreams: true}
+
+	rec := do(t, p, key, "/v1/custom", `{"model":"gpt-5.4","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 {
+		t.Fatalf("logs = %d, want 1", len(logs))
+	}
+	if string(logs[0].RawResponse) != rec.Body.String() {
+		t.Errorf("raw response = %q, want %q", logs[0].RawResponse, rec.Body.String())
+	}
+	if len(logs[0].AssembledResponse) != 0 {
+		t.Errorf("assembled unknown stream = %s, want empty", logs[0].AssembledResponse)
 	}
 }
 

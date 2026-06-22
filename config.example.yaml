@@ -20,6 +20,18 @@ defaults:
     base_delay: 200ms
     max_delay: 10s
 
+# Optional payload capture. Disabled by default because request/response bodies can contain
+# secrets and can grow the SQLite database quickly. When enabled, the gateway stores the
+# original inbound request body and the final upstream response body in request_logs. SSE
+# streams can also be best-effort assembled for /v1/chat/completions, /v1/responses, and
+# /v1/messages; unknown stream paths still store the raw response stream.
+payload_capture:
+  enabled: false
+  max_request_bytes: 1048576
+  max_response_bytes: 1048576
+  assemble_streams: false
+  max_assembled_bytes: 1048576
+
 # Upstream providers. An API key is bound to one or more of these by name; each request
 # is routed to a randomly chosen bound provider. The gateway forwards the original request
 # path and body unchanged, replacing the client's Authorization header with the provider's

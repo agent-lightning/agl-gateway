@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agent-lightning/agl-gateway/internal/capture"
 	"github.com/agent-lightning/agl-gateway/internal/config"
 	"github.com/agent-lightning/agl-gateway/internal/keys"
 	"github.com/agent-lightning/agl-gateway/internal/pricing"
@@ -240,7 +241,15 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	// the provider count.
 	retry := sequence[0].ResolvedRetry(p.cfg.Defaults.Retry)
 
-	logRow := &store.RequestLog{APIKeyID: key.ID, KeyName: key.Name, Model: model}
+	logRow := &store.RequestLog{
+		APIKeyID:           key.ID,
+		KeyName:            key.Name,
+		Model:              model,
+		RequestContentType: strings.TrimSpace(r.Header.Get("Content-Type")),
+	}
+	if p.cfg.PayloadCapture.Enabled {
+		logRow.RawRequest, logRow.RawRequestTruncated = captureBytes(body, payloadLimit(p.cfg.PayloadCapture.MaxRequestBytes))
+	}
 
 	var (
 		resp           *http.Response
@@ -346,7 +355,18 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	if isErr {
 		captureLimit = maxErrorBodyCapture // keep a snippet of the error body for the log
 	}
-	ttft, gotByte, head := streamBody(w, resp.Body, acc, start, captureLimit)
+	var payloads *payloadSink
+	if p.cfg.PayloadCapture.Enabled {
+		payloads = &payloadSink{raw: newLimitedRecorder(payloadLimit(p.cfg.PayloadCapture.MaxResponseBytes))}
+		if streaming && p.cfg.PayloadCapture.AssembleStreams {
+			payloads.assembler = capture.NewStreamAssembler(capture.FormatForPath(r.URL.Path))
+		}
+	}
+	var payloadWriter io.Writer
+	if payloads != nil {
+		payloadWriter = payloads
+	}
+	ttft, gotByte, head := streamBody(w, resp.Body, acc, start, captureLimit, payloadWriter)
 
 	u, _ := acc.Finalize()
 	// Price by the requested model (the alias the client asked for); only fall back to the
@@ -357,6 +377,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	}
 
 	logRow.StatusCode = resp.StatusCode
+	logRow.ResponseContentType = strings.TrimSpace(resp.Header.Get("Content-Type"))
 	logRow.Streaming = streaming
 	if isErr {
 		msg := fmt.Sprintf("upstream provider %q returned HTTP %d after %d attempt(s)",
@@ -375,6 +396,15 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	logRow.CacheReadTokens = u.CacheReadTokens
 	logRow.CacheWriteTokens = u.CacheWriteTokens
 	logRow.Cost = p.prices.Cost(u)
+	if payloads != nil {
+		logRow.RawResponse = payloads.raw.Bytes()
+		logRow.RawResponseTruncated = payloads.raw.Truncated()
+		if payloads.assembler != nil {
+			if assembled, ok := payloads.assembler.Finalize(); ok {
+				logRow.AssembledResponse, logRow.AssembledResponseTruncated = captureBytes(assembled, payloadLimit(p.cfg.PayloadCapture.MaxAssembledBytes))
+			}
+		}
+	}
 	p.save(logRow)
 }
 
@@ -384,11 +414,83 @@ func (p *Proxy) save(row *store.RequestLog) {
 	}
 }
 
+type limitedRecorder struct {
+	limit     int
+	buf       []byte
+	truncated bool
+}
+
+func newLimitedRecorder(limit int) *limitedRecorder {
+	return &limitedRecorder{limit: limit}
+}
+
+func (r *limitedRecorder) Write(p []byte) (int, error) {
+	if r.limit <= 0 {
+		if len(p) > 0 {
+			r.truncated = true
+		}
+		return len(p), nil
+	}
+	if len(r.buf) < r.limit {
+		room := r.limit - len(r.buf)
+		if room > len(p) {
+			room = len(p)
+		}
+		r.buf = append(r.buf, p[:room]...)
+		if room < len(p) {
+			r.truncated = true
+		}
+	} else if len(p) > 0 {
+		r.truncated = true
+	}
+	return len(p), nil
+}
+
+func (r *limitedRecorder) Bytes() []byte {
+	return append([]byte(nil), r.buf...)
+}
+
+func (r *limitedRecorder) Truncated() bool {
+	return r.truncated
+}
+
+type payloadSink struct {
+	raw       *limitedRecorder
+	assembler *capture.StreamAssembler
+}
+
+func (s *payloadSink) Write(p []byte) (int, error) {
+	if s.raw != nil {
+		_, _ = s.raw.Write(p)
+	}
+	if s.assembler != nil {
+		_, _ = s.assembler.Write(p)
+	}
+	return len(p), nil
+}
+
+func captureBytes(src []byte, limit int) ([]byte, bool) {
+	if limit <= 0 {
+		return nil, len(src) > 0
+	}
+	if len(src) <= limit {
+		return append([]byte(nil), src...), false
+	}
+	return append([]byte(nil), src[:limit]...), true
+}
+
+func payloadLimit(limit int) int {
+	if limit == 0 {
+		return config.DefaultPayloadCaptureBytes
+	}
+	return limit
+}
+
 // streamBody copies upstream->client, flushing each chunk (for SSE liveness), tees bytes
 // into the usage accumulator, and reports time-to-first-byte measured from reqStart. When
 // captureLimit > 0 it also returns up to that many leading bytes of the body (used to log
 // the upstream's error payload).
-func streamBody(w http.ResponseWriter, body io.Reader, acc *usage.Accumulator, reqStart time.Time, captureLimit int) (ttft time.Duration, gotByte bool, head []byte) {
+func streamBody(w http.ResponseWriter, body io.Reader, acc *usage.Accumulator, reqStart time.Time, captureLimit int, payloads io.Writer) (ttft time.Duration, gotByte bool, head []byte) {
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {
@@ -398,19 +500,23 @@ func streamBody(w http.ResponseWriter, body io.Reader, acc *usage.Accumulator, r
 				ttft = time.Since(reqStart)
 				gotByte = true
 			}
-			_, _ = acc.Write(buf[:n])
+			chunk := buf[:n]
+			if _, werr := w.Write(chunk); werr != nil {
+				return ttft, gotByte, head
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			_, _ = acc.Write(chunk)
+			if payloads != nil {
+				_, _ = payloads.Write(chunk)
+			}
 			if captureLimit > 0 && len(head) < captureLimit {
 				room := captureLimit - len(head)
 				if room > n {
 					room = n
 				}
-				head = append(head, buf[:room]...)
-			}
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return ttft, gotByte, head
-			}
-			if flusher != nil {
-				flusher.Flush()
+				head = append(head, chunk[:room]...)
 			}
 		}
 		if err != nil {
