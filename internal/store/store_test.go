@@ -118,6 +118,13 @@ func TestKeyLifecycle(t *testing.T) {
 	if got.Name != "dev" || len(got.Providers) != 2 || got.Providers[0] != "openai" {
 		t.Errorf("unexpected key: %+v", got)
 	}
+	byID, err := s.KeyByID(k.ID)
+	if err != nil {
+		t.Fatalf("KeyByID: %v", err)
+	}
+	if byID == nil || byID.Name != "dev" {
+		t.Fatalf("KeyByID returned %+v, want dev key", byID)
+	}
 	if got.CreatedAt.IsZero() {
 		t.Error("CreatedAt is zero")
 	}
@@ -128,6 +135,13 @@ func TestKeyLifecycle(t *testing.T) {
 	}
 	if missing != nil {
 		t.Error("KeyByHash(missing) != nil")
+	}
+	missingID, err := s.KeyByID(k.ID + 999)
+	if err != nil {
+		t.Fatalf("KeyByID(missing): %v", err)
+	}
+	if missingID != nil {
+		t.Error("KeyByID(missing) != nil")
 	}
 
 	keys, err := s.ListKeys()

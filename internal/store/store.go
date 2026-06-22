@@ -255,6 +255,14 @@ func (s *Store) KeyByHash(hash string) (*APIKey, error) {
 	return scanKey(row)
 }
 
+// KeyByID looks up an API key by numeric id. It returns (nil, nil) when no matching key
+// exists.
+func (s *Store) KeyByID(id int64) (*APIKey, error) {
+	row := s.db.QueryRow(
+		`SELECT id, name, hash, prefix, providers, provider_start, provider_order, created_at, disabled FROM api_keys WHERE id = ?`, id)
+	return scanKey(row)
+}
+
 // ListKeys returns all API keys, newest first.
 func (s *Store) ListKeys() ([]APIKey, error) {
 	rows, err := s.db.Query(

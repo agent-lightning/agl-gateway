@@ -141,6 +141,78 @@ func TestLogsAndStats(t *testing.T) {
 	}
 }
 
+func TestExportKeyDataPaginatesByKey(t *testing.T) {
+	h, st := newAdmin(t)
+	k, err := st.CreateKey("dev", "hash-dev", "sk-gw-dev", []string{"openai"}, "first", "round_robin")
+	if err != nil {
+		t.Fatalf("CreateKey: %v", err)
+	}
+	other, err := st.CreateKey("ops", "hash-ops", "sk-gw-ops", []string{"anthropic"}, "first", "round_robin")
+	if err != nil {
+		t.Fatalf("CreateKey: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := st.InsertLog(&store.RequestLog{
+			APIKeyID: k.ID, KeyName: "dev", Provider: "openai", Model: "gpt-5.4",
+			StatusCode: 200, RawRequest: []byte(`{"page":true}`),
+		}); err != nil {
+			t.Fatalf("InsertLog: %v", err)
+		}
+	}
+	if err := st.InsertLog(&store.RequestLog{APIKeyID: other.ID, KeyName: "ops", Provider: "anthropic", Model: "claude", StatusCode: 200}); err != nil {
+		t.Fatalf("InsertLog(other): %v", err)
+	}
+
+	rec := req(t, h, "GET", "/admin/export?api_key_id="+itoa(k.ID)+"&limit=2", master, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var page keyExportResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if page.APIKey.ID != k.ID || page.APIKey.Name != "dev" {
+		t.Fatalf("api key = %+v, want dev key", page.APIKey)
+	}
+	if page.Limit != 2 || page.Offset != 0 || page.NextOffset != 2 || !page.HasMore {
+		t.Fatalf("page metadata = limit:%d offset:%d next:%d has_more:%v", page.Limit, page.Offset, page.NextOffset, page.HasMore)
+	}
+	if len(page.Logs) != 2 {
+		t.Fatalf("logs = %d, want 2", len(page.Logs))
+	}
+	for _, l := range page.Logs {
+		if l.APIKeyID != k.ID {
+			t.Errorf("export included log for api_key_id=%d, want %d", l.APIKeyID, k.ID)
+		}
+	}
+
+	rec = req(t, h, "GET", "/admin/export?api_key_id="+itoa(k.ID)+"&limit=2&offset=2", master, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second page status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	page = keyExportResponse{}
+	json.Unmarshal(rec.Body.Bytes(), &page)
+	if page.HasMore || page.NextOffset != 0 || len(page.Logs) != 1 {
+		t.Fatalf("second page = %+v", page)
+	}
+}
+
+func TestExportKeyDataMissingKey(t *testing.T) {
+	h, _ := newAdmin(t)
+	rec := req(t, h, "GET", "/admin/export?api_key_id=404", master, "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestExportKeyDataRequiresKeyID(t *testing.T) {
+	h, _ := newAdmin(t)
+	rec := req(t, h, "GET", "/admin/export", master, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
 func TestProvidersDiscoversModels(t *testing.T) {
 	// One upstream serves an OpenAI-style /v1/models list; assert it is discovered, unioned
 	// with the provider's model_map aliases, deduped, and sorted. The second provider is

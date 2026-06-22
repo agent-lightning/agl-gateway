@@ -52,6 +52,7 @@ func (a *Admin) Handler() http.Handler {
 	mux.HandleFunc("POST /admin/keys", a.createKey)
 	mux.HandleFunc("GET /admin/keys", a.listKeys)
 	mux.HandleFunc("DELETE /admin/keys/{id}", a.deleteKey)
+	mux.HandleFunc("GET /admin/export", a.exportKeyData)
 	mux.HandleFunc("GET /admin/logs", a.listLogs)
 	mux.HandleFunc("GET /admin/stats", a.stats)
 	mux.HandleFunc("GET /admin/providers", a.providers)
@@ -186,6 +187,66 @@ func (a *Admin) listLogs(w http.ResponseWriter, r *http.Request) {
 		logs = []store.RequestLog{}
 	}
 	writeJSON(w, http.StatusOK, logs)
+}
+
+const (
+	defaultExportLimit = 100
+	maxExportLimit     = 1000
+)
+
+type keyExportResponse struct {
+	APIKey     store.APIKey       `json:"api_key"`
+	Limit      int                `json:"limit"`
+	Offset     int                `json:"offset"`
+	NextOffset int                `json:"next_offset,omitempty"`
+	HasMore    bool               `json:"has_more"`
+	Logs       []store.RequestLog `json:"logs"`
+}
+
+func (a *Admin) exportKeyData(w http.ResponseWriter, r *http.Request) {
+	id := queryInt64(r, "api_key_id")
+	if id <= 0 {
+		writeJSON(w, http.StatusBadRequest, errBody("api_key_id is required"))
+		return
+	}
+	k, err := a.store.KeyByID(id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errBody("could not load key"))
+		return
+	}
+	if k == nil {
+		writeJSON(w, http.StatusNotFound, errBody("key not found"))
+		return
+	}
+	limit, offset := exportPage(r)
+	logs, err := a.store.QueryLogs(store.LogFilter{
+		APIKeyID: id,
+		Limit:    limit + 1,
+		Offset:   offset,
+		Since:    querySince(r),
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errBody("could not export key data"))
+		return
+	}
+	hasMore := len(logs) > limit
+	if hasMore {
+		logs = logs[:limit]
+	}
+	if logs == nil {
+		logs = []store.RequestLog{}
+	}
+	resp := keyExportResponse{
+		APIKey:  *k,
+		Limit:   limit,
+		Offset:  offset,
+		HasMore: hasMore,
+		Logs:    logs,
+	}
+	if hasMore {
+		resp.NextOffset = offset + limit
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (a *Admin) stats(w http.ResponseWriter, r *http.Request) {
@@ -465,6 +526,21 @@ func errBody(msg string) any { return map[string]any{"error": map[string]string{
 func queryInt64(r *http.Request, key string) int64 {
 	n, _ := strconv.ParseInt(r.URL.Query().Get(key), 10, 64)
 	return n
+}
+
+func exportPage(r *http.Request) (limit, offset int) {
+	limit = int(queryInt64(r, "limit"))
+	if limit <= 0 {
+		limit = defaultExportLimit
+	}
+	if limit > maxExportLimit {
+		limit = maxExportLimit
+	}
+	offset = int(queryInt64(r, "offset"))
+	if offset < 0 {
+		offset = 0
+	}
+	return limit, offset
 }
 
 // querySince accepts an RFC3339 timestamp, a Go duration window (e.g. "24h"), or unix

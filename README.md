@@ -171,6 +171,7 @@ $MASTER_KEY`).
 | POST   | `/admin/keys`       | `{"name","providers":[...],"provider_start","provider_order"}` → returns the plaintext key once |
 | GET    | `/admin/keys`       | list keys (no secret) |
 | DELETE | `/admin/keys/{id}`  | delete a key (cascades to its logs, reclaiming space) |
+| GET    | `/admin/export`    | `?api_key_id&limit&offset&since` — export one key's request logs, including captured payload columns when present |
 | GET    | `/admin/logs`       | `?limit&offset&api_key_id&provider&since` |
 | GET    | `/admin/stats`      | `?api_key_id&since` — aggregates grouped by key + model |
 | GET    | `/admin/providers`  | configured providers + their models (see below) |
