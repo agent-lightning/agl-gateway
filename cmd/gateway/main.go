@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -70,7 +72,7 @@ func run(configPath string, logger *slog.Logger) error {
 	go func() {
 		logger.Info("agl-gateway listening",
 			"version", version.Version,
-			"addr", cfg.Server.Addr, "providers", len(cfg.Providers), "database", cfg.Database)
+			"addr", cfg.Server.Addr, "providers", len(cfg.Providers), "database", redactDatabase(cfg.Database))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -88,4 +90,16 @@ func run(configPath string, logger *slog.Logger) error {
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
 	}
+}
+
+// redactDatabase masks any password in a postgres:// DSN so it is safe to log. A SQLite
+// file path (no userinfo) is returned unchanged.
+func redactDatabase(database string) string {
+	if strings.HasPrefix(database, "postgres://") || strings.HasPrefix(database, "postgresql://") {
+		if u, err := url.Parse(database); err == nil {
+			return u.Redacted()
+		}
+		return "postgres://[redacted]"
+	}
+	return database
 }

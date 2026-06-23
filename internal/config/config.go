@@ -11,8 +11,12 @@ import (
 
 // Config is the top-level gateway configuration.
 type Config struct {
-	Server         Server         `yaml:"server"`
-	MasterKey      string         `yaml:"master_key"`
+	Server    Server `yaml:"server"`
+	MasterKey string `yaml:"master_key"`
+	// Database selects the persistence backend: a postgres:// or postgresql:// URL uses
+	// PostgreSQL; anything else is a SQLite file path (default "./gateway.db"). The
+	// AGL_DATABASE environment variable, when set, overrides this field — convenient for
+	// containers and for keeping a PostgreSQL DSN (with its password) out of the YAML file.
 	Database       string         `yaml:"database"`
 	Defaults       Defaults       `yaml:"defaults"`
 	PayloadCapture PayloadCapture `yaml:"payload_capture"`
@@ -138,7 +142,14 @@ func Parse(data []byte) (*Config, error) {
 	return &c, nil
 }
 
+// DatabaseEnv is the environment variable that, when set, overrides the configured
+// database backend (see Config.Database).
+const DatabaseEnv = "AGL_DATABASE"
+
 func (c *Config) applyDefaults() {
+	if v := os.Getenv(DatabaseEnv); v != "" {
+		c.Database = v
+	}
 	if c.Server.Addr == "" {
 		c.Server.Addr = ":8080"
 	}

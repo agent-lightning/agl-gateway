@@ -14,6 +14,7 @@ providers:
 `
 
 func TestParseAppliesDefaults(t *testing.T) {
+	t.Setenv(DatabaseEnv, "") // ensure the env override does not perturb the default
 	c, err := Parse([]byte(minimalYAML))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -40,6 +41,27 @@ func TestParseAppliesDefaults(t *testing.T) {
 		c.PayloadCapture.MaxResponseBytes != DefaultPayloadCaptureBytes ||
 		c.PayloadCapture.MaxAssembledBytes != DefaultPayloadCaptureBytes {
 		t.Errorf("payload capture defaults = %+v", c.PayloadCapture)
+	}
+}
+
+func TestDatabaseEnvOverride(t *testing.T) {
+	const dsn = "postgres://u:p@localhost:5432/db?sslmode=disable"
+	// Env overrides whatever the YAML specifies.
+	t.Setenv(DatabaseEnv, dsn)
+	c, err := Parse([]byte(minimalYAML + "\ndatabase: ./yaml.db\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Database != dsn {
+		t.Errorf("env override = %q, want %q", c.Database, dsn)
+	}
+	// Env also wins over the empty-string default fallback.
+	c, err = Parse([]byte(minimalYAML))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Database != dsn {
+		t.Errorf("env override (no yaml) = %q, want %q", c.Database, dsn)
 	}
 }
 

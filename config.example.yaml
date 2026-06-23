@@ -8,7 +8,10 @@ server:
 # Generate something long and random, e.g. `openssl rand -hex 32`.
 master_key: "mk-change-me-to-a-long-random-secret"
 
-# SQLite database path. WAL files are created alongside it.
+# Persistence backend. A SQLite file path (WAL files are created alongside it), or a
+# postgres:// (or postgresql://) URL to use PostgreSQL instead. The AGL_DATABASE
+# environment variable overrides this — handy for containers and for keeping a PostgreSQL
+# password out of this file, e.g. AGL_DATABASE=postgres://user:pass@host:5432/agl
 database: "./gateway.db"
 
 # Default retry policy. Each upstream attempt that fails with a network error or an

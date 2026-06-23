@@ -15,7 +15,10 @@ OpenAI-compatible `/v1/models` to list models. The data plane stays endpoint-agn
 ## Project principles
 
 - **Minimalistic.** Standard library first. The core dependencies are `gopkg.in/yaml.v3` and
-  `modernc.org/sqlite` (pure-Go, no cgo). `internal/capture` additionally depends on the official
+  `modernc.org/sqlite` (pure-Go, no cgo). The store can alternatively be backed by
+  **PostgreSQL** via `github.com/jackc/pgx/v5/stdlib` (also pure-Go, no cgo) — selected at
+  runtime by the `database` config value, with no other code path changes. `internal/capture`
+  additionally depends on the official
   provider SDKs — `github.com/openai/openai-go/v3` and `github.com/anthropics/anthropic-sdk-go` —
   for their stream-accumulator and usage types, so response assembly and metering track the real
   APIs instead of hand-rolled shapes. Don't add other dependencies or frameworks without a strong
@@ -45,7 +48,7 @@ Packages:
 |-------------------|----------------|
 | `internal/config` | YAML load, defaults, validation. |
 | `internal/pricing`| Normalized `Usage` → dollar cost. |
-| `internal/store`  | SQLite schema + `api_keys`/`request_logs` access. |
+| `internal/store`  | SQLite **or** PostgreSQL persistence for `api_keys`/`request_logs`. Backend chosen by the `database` config value (a `postgres://`/`postgresql://` URL selects PostgreSQL via pgx; anything else is a SQLite file path), overridable by the `AGL_DATABASE` env var. Query logic is shared; a small `dialect` (`store_sqlite.go`/`store_postgres.go`) isolates placeholder rebinding, the `SUM` cast, schema/migrate, and post-delete vacuum. |
 | `internal/usage`  | Generic best-effort fallback for model + usage extraction on *unrecognized* endpoints (JSON + SSE), plus request-side `RequestModel`/`SetModel`. Recognized formats are metered by `internal/capture`. |
 | `internal/capture`| For recognized API formats (chat/responses/messages), wraps the provider SDK accumulators to derive both the assembled non-streaming response and normalized token usage from one pass; records `api_type` and any `assemble_error`. |
 | `internal/keys`   | Mint + SHA-256-hash gateway keys. |
@@ -87,8 +90,9 @@ Packages:
   `gateway` fault, with the attempt count, via both the JSON body and `X-AGL-*` headers.
   Provider responses (incl. surviving 4xx/5xx) pass through; only gateway-side problems are
   synthesized. The attempt count and reason are written to the log.
-- **Deleting a key cascades to its logs** in a transaction, then runs `incremental_vacuum`
-  to release space (`auto_vacuum=INCREMENTAL` is set at DB creation).
+- **Deleting a key cascades to its logs** in a transaction. On SQLite it then runs
+  `incremental_vacuum` to release space (`auto_vacuum=INCREMENTAL` is set at DB creation); on
+  PostgreSQL the post-delete `afterDeleteKey` hook is a no-op (autovacuum reclaims space).
 
 ## Conventions
 
@@ -107,6 +111,16 @@ go build ./...
 go test ./...                          # all packages have tests
 go vet ./...
 go run ./cmd/gateway -config config.yaml
+```
+
+The `internal/store` tests run against in-memory SQLite by default. To also exercise the
+PostgreSQL backend, point `AGL_DATABASE` at a throwaway database (the same env var the
+gateway honors at runtime); the store tests then run every portable case against both
+backends, and skip PostgreSQL when it is unset:
+
+```sh
+docker run -d -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:18-alpine
+AGL_DATABASE='postgres://postgres:pw@localhost:5432/postgres?sslmode=disable' go test ./internal/store/...
 ```
 
 Build the binaries from source:
@@ -147,7 +161,9 @@ identically.
 ### Docker image
 
 The image is a static binary on Debian slim (non-root, ~13 MB layer for the binary). It
-expects a config at `/data/config.yaml` and keeps the SQLite database in `/data`. Build it
+expects a config at `/data/config.yaml` and keeps the SQLite database in `/data` (when
+`database` is a `postgres://` URL the gateway uses that instead and the `/data` SQLite file is
+unused). Build it
 locally with `docker build -t agl-gateway .`. Pushing a `v*` tag builds and publishes a
 multi-arch image (linux/amd64 + linux/arm64) to GHCR via the publish-on-tag workflow (see
 [Versioning](#versioning)).
@@ -174,9 +190,11 @@ hardcoded number, so there is no constant to keep in sync.
 - **New provider:** config only — add to `providers:`. No code.
 - **Model mapping:** config only — add `model_map:` under a provider. No code.
 - **New model price:** config only — add to `pricing:`.
-- **Schema change:** add the column to the `CREATE TABLE` in `store.migrate` *and* an
-  `ensureColumn` call so existing databases upgrade in place; extend `RequestLog`, the
-  `INSERT`, and the `QueryLogs` `SELECT`/scan together.
+- **Schema change:** add the column to the SQLite `CREATE TABLE` *and* an `ensureColumn` call
+  in `store_sqlite.go` so existing databases upgrade in place, **and** add it to the
+  `postgresSchema` DDL in `store_postgres.go` (keep the types in sync — SQLite
+  `INTEGER`/`BLOB`/`REAL` map to PostgreSQL `BIGINT`/`BYTEA`/`DOUBLE PRECISION`); extend
+  `RequestLog`, the `INSERT`, and the `QueryLogs` `SELECT`/scan together.
 - **New usage shape:** for a *recognized* format, prefer bumping the provider SDK version in
   `internal/capture` (the SDK accumulator/usage types own these shapes). For an *unrecognized*
   endpoint, extend the generic fallback in `internal/usage` (`rawUsage`/`usageEnvelope`/`normalize`).

@@ -87,7 +87,7 @@ See [`config.example.yaml`](config.example.yaml) for a fully commented example. 
 ```yaml
 server: { addr: ":8080" }
 master_key: "mk-…"            # authenticates /admin and the portal
-database: "./gateway.db"
+database: "./gateway.db"      # SQLite path, or a postgres:// URL (override via AGL_DATABASE)
 defaults:
   retry: { max_retries: 3, base_delay: 200ms, max_delay: 10s }
 payload_capture:

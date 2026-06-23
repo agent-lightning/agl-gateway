@@ -1,13 +1,15 @@
-// Package store is the SQLite persistence layer for API keys and request logs.
+// Package store is the SQLite-or-PostgreSQL persistence layer for API keys and request
+// logs. The backend is chosen at Open time by the database string: a postgres://
+// (or postgresql://) URL selects PostgreSQL, anything else is treated as a SQLite file
+// path. The query logic is shared; a small dialect isolates the few real SQL differences.
 package store
 
 import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 // APIKey is a stored gateway credential. The plaintext key itself is never stored;
@@ -82,157 +84,42 @@ type Stat struct {
 	Cost         float64 `json:"cost"`
 }
 
-// Store wraps the SQLite database.
+// Store wraps the database, delegating the handful of backend-specific SQL details to a
+// dialect. Query bodies are written once with neutral '?' placeholders and rebound per
+// driver.
 type Store struct {
 	db *sql.DB
+	d  dialect
 }
 
-// Open opens (creating if needed) the SQLite database at path and applies the schema.
-// An empty path or ":memory:" yields an in-memory database (useful for tests).
-func Open(path string) (*Store, error) {
-	if path == "" {
-		path = ":memory:"
+// dialect captures the SQL differences between the SQLite and PostgreSQL backends. The
+// CRUD query bodies and row scanning live in store.go and are shared by both.
+type dialect interface {
+	// rebind rewrites neutral '?' placeholders into the driver's parameter syntax.
+	// SQLite keeps '?'; PostgreSQL rewrites them to $1, $2, … in order.
+	rebind(q string) string
+	// sumInt wraps an aggregate over an integer column so the result scans into int64.
+	// SQLite returns SUM(col); PostgreSQL casts because SUM(bigint) is numeric.
+	sumInt(col string) string
+	// migrate creates the schema and applies any in-place column upgrades.
+	migrate(db *sql.DB) error
+	// afterDeleteKey reclaims space freed by a cascade delete. No-op on PostgreSQL.
+	afterDeleteKey(db *sql.DB) error
+}
+
+// Open opens (creating if needed) the persistence backend and applies the schema. A
+// postgres:// or postgresql:// URL selects PostgreSQL; anything else (including an empty
+// string or ":memory:") is a SQLite file path, yielding an in-memory DB when empty or
+// ":memory:" (useful for tests).
+func Open(database string) (*Store, error) {
+	if strings.HasPrefix(database, "postgres://") || strings.HasPrefix(database, "postgresql://") {
+		return openPostgres(database)
 	}
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", path)
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
-	s := &Store{db: db}
-	if err := s.migrate(); err != nil {
-		db.Close()
-		return nil, err
-	}
-	return s, nil
+	return openSQLite(database)
 }
 
 // Close closes the underlying database.
 func (s *Store) Close() error { return s.db.Close() }
-
-func (s *Store) migrate() error {
-	// auto_vacuum must be set before any table exists; it is a no-op on a populated DB.
-	// It lets incremental_vacuum (run after cascade deletes) return freed pages to the OS.
-	if _, err := s.db.Exec(`PRAGMA auto_vacuum=INCREMENTAL;`); err != nil {
-		return fmt.Errorf("migrate (auto_vacuum): %w", err)
-	}
-	const schema = `
-CREATE TABLE IF NOT EXISTS api_keys (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    name           TEXT NOT NULL,
-    hash           TEXT NOT NULL UNIQUE,
-    prefix         TEXT NOT NULL,
-    providers      TEXT NOT NULL,
-    provider_start TEXT NOT NULL DEFAULT 'first',
-    provider_order TEXT NOT NULL DEFAULT 'round_robin',
-    created_at     INTEGER NOT NULL,
-    disabled       INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS request_logs (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    api_key_id         INTEGER NOT NULL,
-    key_name           TEXT NOT NULL,
-    provider           TEXT NOT NULL,
-    model              TEXT NOT NULL,
-    mapped_model       TEXT NOT NULL DEFAULT '',
-    request_content_type  TEXT NOT NULL DEFAULT '',
-    response_content_type TEXT NOT NULL DEFAULT '',
-    status_code        INTEGER NOT NULL,
-    streaming          INTEGER NOT NULL,
-    attempts           INTEGER NOT NULL DEFAULT 0,
-    ttft_ms            INTEGER NOT NULL,
-    duration_ms        INTEGER NOT NULL,
-    input_tokens       INTEGER NOT NULL,
-    output_tokens      INTEGER NOT NULL,
-    cache_read_tokens  INTEGER NOT NULL,
-    cache_write_tokens INTEGER NOT NULL,
-    cost               REAL NOT NULL,
-    error              TEXT NOT NULL,
-    api_type           TEXT NOT NULL DEFAULT '',
-    assemble_error     TEXT NOT NULL DEFAULT '',
-    raw_request        BLOB,
-    raw_response       BLOB,
-    assembled_response BLOB,
-    raw_request_truncated        INTEGER NOT NULL DEFAULT 0,
-    raw_response_truncated       INTEGER NOT NULL DEFAULT 0,
-    assembled_response_truncated INTEGER NOT NULL DEFAULT 0,
-    created_at         INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_logs_created_at ON request_logs(created_at);
-CREATE INDEX IF NOT EXISTS idx_logs_api_key_id ON request_logs(api_key_id);
-`
-	if _, err := s.db.Exec(schema); err != nil {
-		return fmt.Errorf("migrate: %w", err)
-	}
-	// Additive columns for databases created by older versions.
-	if err := s.ensureColumn("request_logs", "mapped_model", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("request_logs", "attempts", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("request_logs", "request_content_type", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("request_logs", "response_content_type", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("request_logs", "api_type", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("request_logs", "assemble_error", "TEXT NOT NULL DEFAULT ''"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("request_logs", "raw_request", "BLOB"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("request_logs", "raw_response", "BLOB"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("request_logs", "assembled_response", "BLOB"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("request_logs", "raw_request_truncated", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("request_logs", "raw_response_truncated", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("request_logs", "assembled_response_truncated", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("api_keys", "provider_start", "TEXT NOT NULL DEFAULT 'first'"); err != nil {
-		return err
-	}
-	if err := s.ensureColumn("api_keys", "provider_order", "TEXT NOT NULL DEFAULT 'round_robin'"); err != nil {
-		return err
-	}
-	return nil
-}
-
-// ensureColumn adds a column to a table if it does not already exist.
-func (s *Store) ensureColumn(table, column, decl string) error {
-	rows, err := s.db.Query(`SELECT name FROM pragma_table_info(?)`, table)
-	if err != nil {
-		return fmt.Errorf("inspect %s: %w", table, err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return err
-		}
-		if name == column {
-			return nil
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if _, err := s.db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, decl)); err != nil {
-		return fmt.Errorf("add column %s.%s: %w", table, column, err)
-	}
-	return nil
-}
 
 // CreateKey inserts a new API key and returns the stored row.
 func (s *Store) CreateKey(name, hash, prefix string, providers []string, start, order string) (*APIKey, error) {
@@ -241,14 +128,15 @@ func (s *Store) CreateKey(name, hash, prefix string, providers []string, start, 
 		return nil, err
 	}
 	now := time.Now()
-	res, err := s.db.Exec(
-		`INSERT INTO api_keys (name, hash, prefix, providers, provider_start, provider_order, created_at, disabled) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+	var id int64
+	err = s.db.QueryRow(s.d.rebind(
+		`INSERT INTO api_keys (name, hash, prefix, providers, provider_start, provider_order, created_at, disabled)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 0) RETURNING id`),
 		name, hash, prefix, string(provJSON), start, order, now.UnixMilli(),
-	)
+	).Scan(&id)
 	if err != nil {
 		return nil, fmt.Errorf("create key: %w", err)
 	}
-	id, _ := res.LastInsertId()
 	return &APIKey{
 		ID:            id,
 		Name:          name,
@@ -264,23 +152,23 @@ func (s *Store) CreateKey(name, hash, prefix string, providers []string, start, 
 // KeyByHash looks up an API key by its SHA-256 hash. It returns (nil, nil) when no
 // matching key exists.
 func (s *Store) KeyByHash(hash string) (*APIKey, error) {
-	row := s.db.QueryRow(
-		`SELECT id, name, hash, prefix, providers, provider_start, provider_order, created_at, disabled FROM api_keys WHERE hash = ?`, hash)
+	row := s.db.QueryRow(s.d.rebind(
+		`SELECT id, name, hash, prefix, providers, provider_start, provider_order, created_at, disabled FROM api_keys WHERE hash = ?`), hash)
 	return scanKey(row)
 }
 
 // KeyByID looks up an API key by numeric id. It returns (nil, nil) when no matching key
 // exists.
 func (s *Store) KeyByID(id int64) (*APIKey, error) {
-	row := s.db.QueryRow(
-		`SELECT id, name, hash, prefix, providers, provider_start, provider_order, created_at, disabled FROM api_keys WHERE id = ?`, id)
+	row := s.db.QueryRow(s.d.rebind(
+		`SELECT id, name, hash, prefix, providers, provider_start, provider_order, created_at, disabled FROM api_keys WHERE id = ?`), id)
 	return scanKey(row)
 }
 
 // ListKeys returns all API keys, newest first.
 func (s *Store) ListKeys() ([]APIKey, error) {
-	rows, err := s.db.Query(
-		`SELECT id, name, hash, prefix, providers, provider_start, provider_order, created_at, disabled FROM api_keys ORDER BY id DESC`)
+	rows, err := s.db.Query(s.d.rebind(
+		`SELECT id, name, hash, prefix, providers, provider_start, provider_order, created_at, disabled FROM api_keys ORDER BY id DESC`))
 	if err != nil {
 		return nil, err
 	}
@@ -305,10 +193,10 @@ func (s *Store) DeleteKey(id int64) (bool, error) {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.Exec(`DELETE FROM request_logs WHERE api_key_id = ?`, id); err != nil {
+	if _, err := tx.Exec(s.d.rebind(`DELETE FROM request_logs WHERE api_key_id = ?`), id); err != nil {
 		return false, err
 	}
-	res, err := tx.Exec(`DELETE FROM api_keys WHERE id = ?`, id)
+	res, err := tx.Exec(s.d.rebind(`DELETE FROM api_keys WHERE id = ?`), id)
 	if err != nil {
 		return false, err
 	}
@@ -317,8 +205,8 @@ func (s *Store) DeleteKey(id int64) (bool, error) {
 	}
 	n, _ := res.RowsAffected()
 	if n > 0 {
-		// Best-effort: reclaim the space freed by the deleted logs.
-		_, _ = s.db.Exec(`PRAGMA incremental_vacuum;`)
+		// Best-effort: reclaim the space freed by the deleted logs (SQLite only).
+		_ = s.d.afterDeleteKey(s.db)
 	}
 	return n > 0, nil
 }
@@ -354,14 +242,14 @@ func (s *Store) InsertLog(l *RequestLog) error {
 	if l.CreatedAt.IsZero() {
 		l.CreatedAt = time.Now()
 	}
-	_, err := s.db.Exec(`
+	_, err := s.db.Exec(s.d.rebind(`
 INSERT INTO request_logs
  (api_key_id, key_name, provider, model, mapped_model, request_content_type,
   response_content_type, status_code, streaming, attempts,
   ttft_ms, duration_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
   cost, error, api_type, assemble_error, raw_request, raw_response, assembled_response, raw_request_truncated,
   raw_response_truncated, assembled_response_truncated, created_at)
- VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
 		l.APIKeyID, l.KeyName, l.Provider, l.Model, l.MappedModel, l.RequestContentType,
 		l.ResponseContentType, l.StatusCode, b2i(l.Streaming),
 		l.Attempts, l.TTFTMillis, l.DurationMillis, l.InputTokens, l.OutputTokens, l.CacheReadTokens,
@@ -411,7 +299,7 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 		q += " OFFSET ?"
 		args = append(args, f.Offset)
 	}
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.db.Query(s.d.rebind(q), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -450,8 +338,8 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 // Stats returns aggregate usage grouped by (api_key_id, model), highest cost first.
 func (s *Store) Stats(f LogFilter) ([]Stat, error) {
 	q := `SELECT api_key_id, key_name, model, COUNT(*),
-	             SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens),
-	             SUM(cache_write_tokens), SUM(cost)
+	             ` + s.d.sumInt("input_tokens") + `, ` + s.d.sumInt("output_tokens") + `, ` +
+		s.d.sumInt("cache_read_tokens") + `, ` + s.d.sumInt("cache_write_tokens") + `, SUM(cost)
 	      FROM request_logs WHERE 1=1`
 	var args []any
 	if f.APIKeyID > 0 {
@@ -462,8 +350,8 @@ func (s *Store) Stats(f LogFilter) ([]Stat, error) {
 		q += " AND created_at >= ?"
 		args = append(args, f.Since.UnixMilli())
 	}
-	q += " GROUP BY api_key_id, model ORDER BY SUM(cost) DESC"
-	rows, err := s.db.Query(q, args...)
+	q += " GROUP BY api_key_id, key_name, model ORDER BY SUM(cost) DESC"
+	rows, err := s.db.Query(s.d.rebind(q), args...)
 	if err != nil {
 		return nil, err
 	}
