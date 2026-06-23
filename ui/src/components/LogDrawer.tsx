@@ -91,8 +91,8 @@ export function LogDrawer({ logId, preview, open, onClose }: Props) {
               </SheetDescription>
             </SheetHeader>
 
-            <ScrollArea className="h-[calc(100dvh-7rem)]">
-              <div className="flex flex-col gap-5 px-6 pb-10">
+            <ScrollArea className="h-[calc(100dvh-7rem)] [&_[data-slot=scroll-area-viewport]>div]:!block">
+              <div className="flex min-w-0 flex-col gap-5 px-6 pb-10">
                 <MetaGrid log={log} />
 
                 <RequestInfo log={log} />
@@ -245,7 +245,7 @@ function PayloadSection({
   const bytes = b64 ? base64ByteLength(b64) : 0
 
   return (
-    <div className="flex flex-col gap-2">
+    <div className="flex min-w-0 flex-col gap-2">
       <div className="flex items-center gap-2">
         <h3 className="text-sm font-semibold">{title}</h3>
         {bytes > 0 && (
@@ -287,7 +287,7 @@ function PayloadSection({
       ) : raw ? (
         <pre
           className={cn(
-            'bg-muted/30 max-h-[28rem] overflow-auto rounded-lg border p-3 font-mono text-xs leading-relaxed',
+            'bg-muted/30 max-h-[28rem] w-full max-w-full overflow-auto rounded-lg border p-3 font-mono text-xs leading-relaxed',
             wrap ? 'break-words whitespace-pre-wrap' : 'whitespace-pre',
           )}
         >
