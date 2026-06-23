@@ -605,3 +605,206 @@ func TestFinalizeNonStreamingReturnsBodyVerbatim(t *testing.T) {
 		}
 	}
 }
+
+// --- Doc-grounded comprehensive streaming tests -----------------------------------------------
+// The event sequences below are taken from the provider streaming reference docs (Anthropic
+// "Streaming messages", OpenAI Chat Completions and Responses API references) so the assembler is
+// exercised against the real wire format, including ping/error noise and full lifecycle events.
+
+// TestAssembleAnthropicIgnoresPingAndError feeds the documented basic stream interleaved with ping
+// events and a mid-stream overloaded error event (anthropic-streaming-messages.md). Unknown events
+// must be skipped without failing assembly, and text + cumulative usage must still come through.
+func TestAssembleAnthropicIgnoresPingAndError(t *testing.T) {
+	out, ok := assemble(t, FormatAnthropicMessages,
+		"event: message_start\n"+
+			`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-opus-4-8","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1}}}`+"\n\n",
+		"event: content_block_start\n"+
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`+"\n\n",
+		"event: ping\n"+`data: {"type": "ping"}`+"\n\n",
+		"event: content_block_delta\n"+
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}`+"\n\n",
+		"event: error\n"+
+			`data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`+"\n\n",
+		"event: content_block_delta\n"+
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"!"}}`+"\n\n",
+		"event: content_block_stop\n"+`data: {"type":"content_block_stop","index":0}`+"\n\n",
+		"event: message_delta\n"+
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":15}}`+"\n\n",
+		"event: message_stop\n"+`data: {"type":"message_stop"}`+"\n\n",
+	)
+	if !ok {
+		t.Fatal("Finalize returned ok=false (ping/error event broke assembly)")
+	}
+	var got struct {
+		StopReason string `json:"stop_reason"`
+		Content    []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("assembled JSON invalid: %v\n%s", err, out)
+	}
+	if len(got.Content) != 1 || got.Content[0].Text != "Hello!" || got.StopReason != "end_turn" {
+		t.Errorf("text/stop = %+v / %q\n%s", got.Content, got.StopReason, out)
+	}
+}
+
+// TestAssembleAnthropicDocumentedToolUse replays the canonical get_weather tool_use stream
+// (anthropic-streaming-messages.md): a text block followed by a tool_use block whose input arrives
+// as partial_json deltas. The assembled tool_use input must parse back to the complete object.
+func TestAssembleAnthropicDocumentedToolUse(t *testing.T) {
+	out, ok := assemble(t, FormatAnthropicMessages,
+		"event: message_start\n"+
+			`data: {"type":"message_start","message":{"id":"msg_014p7gG3wDgGV9EUtLvnow3U","type":"message","role":"assistant","model":"claude-opus-4-8","stop_sequence":null,"usage":{"input_tokens":472,"output_tokens":2},"content":[],"stop_reason":null}}`+"\n\n",
+		"event: content_block_start\n"+
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`+"\n\n",
+		"event: content_block_delta\n"+
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Okay, let's check the weather for San Francisco, CA:"}}`+"\n\n",
+		"event: content_block_stop\n"+`data: {"type":"content_block_stop","index":0}`+"\n\n",
+		"event: content_block_start\n"+
+			`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_01T1x1fJ34qAmk2tNTrN7Up6","name":"get_weather","input":{}}}`+"\n\n",
+		"event: content_block_delta\n"+
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":""}}`+"\n\n",
+		"event: content_block_delta\n"+
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"location\":"}}`+"\n\n",
+		"event: content_block_delta\n"+
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":" \"San"}}`+"\n\n",
+		"event: content_block_delta\n"+
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":" Francisc"}}`+"\n\n",
+		"event: content_block_delta\n"+
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"o,"}}`+"\n\n",
+		"event: content_block_delta\n"+
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":" CA\"}"}}`+"\n\n",
+		"event: content_block_stop\n"+`data: {"type":"content_block_stop","index":1}`+"\n\n",
+		"event: message_delta\n"+
+			`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":89}}`+"\n\n",
+		"event: message_stop\n"+`data: {"type":"message_stop"}`+"\n\n",
+	)
+	if !ok {
+		t.Fatal("Finalize returned ok=false")
+	}
+	var got struct {
+		StopReason string `json:"stop_reason"`
+		Content    []struct {
+			Type  string `json:"type"`
+			Text  string `json:"text"`
+			ID    string `json:"id"`
+			Name  string `json:"name"`
+			Input struct {
+				Location string `json:"location"`
+			} `json:"input"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("assembled JSON invalid: %v\n%s", err, out)
+	}
+	if got.StopReason != "tool_use" || len(got.Content) != 2 {
+		t.Fatalf("stop=%q blocks=%d\n%s", got.StopReason, len(got.Content), out)
+	}
+	if got.Content[0].Type != "text" || got.Content[0].Text != "Okay, let's check the weather for San Francisco, CA:" {
+		t.Errorf("text block = %+v", got.Content[0])
+	}
+	tc := got.Content[1]
+	if tc.Type != "tool_use" || tc.ID != "toolu_01T1x1fJ34qAmk2tNTrN7Up6" || tc.Name != "get_weather" || tc.Input.Location != "San Francisco, CA" {
+		t.Errorf("tool_use block = %+v\n%s", tc, out)
+	}
+}
+
+// TestAssembleOpenAIChatDocumentedStream replays the documented Chat Completions stream
+// (openai-api-chat-completions.md): role-only first chunk, content deltas, a finish chunk, all
+// carrying system_fingerprint and logprobs:null, plus a trailing include_usage chunk with an empty
+// choices array. The assembled completion must carry content, system_fingerprint, and usage.
+func TestAssembleOpenAIChatDocumentedStream(t *testing.T) {
+	out, ok := assemble(t, FormatOpenAIChat,
+		`data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190,"model":"gpt-4o-mini","system_fingerprint":"fp_44709d6fcb","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}`+"\n\n",
+		`data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190,"model":"gpt-4o-mini","system_fingerprint":"fp_44709d6fcb","choices":[{"index":0,"delta":{"content":"Hello"},"logprobs":null,"finish_reason":null}]}`+"\n\n",
+		`data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190,"model":"gpt-4o-mini","system_fingerprint":"fp_44709d6fcb","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}]}`+"\n\n",
+		`data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1694268190,"model":"gpt-4o-mini","system_fingerprint":"fp_44709d6fcb","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":1,"total_tokens":10}}`+"\n\n",
+		"data: [DONE]\n\n",
+	)
+	if !ok {
+		t.Fatal("Finalize returned ok=false")
+	}
+	var got struct {
+		Model             string `json:"model"`
+		SystemFingerprint string `json:"system_fingerprint"`
+		Choices           []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("assembled JSON invalid: %v\n%s", err, out)
+	}
+	if got.Model != "gpt-4o-mini" || got.SystemFingerprint != "fp_44709d6fcb" {
+		t.Errorf("identity lost: model=%q fp=%q\n%s", got.Model, got.SystemFingerprint, out)
+	}
+	if len(got.Choices) != 1 || got.Choices[0].Message.Content != "Hello" || got.Choices[0].FinishReason != "stop" {
+		t.Errorf("choice = %+v\n%s", got.Choices, out)
+	}
+	if got.Usage.PromptTokens != 9 || got.Usage.CompletionTokens != 1 {
+		t.Errorf("usage from trailing empty-choices chunk lost = %+v\n%s", got.Usage, out)
+	}
+}
+
+// TestAssembleOpenAIResponsesFullLifecycle feeds the complete documented Responses event sequence
+// (openai-api-responses.md): created, in_progress, output_item.added, content_part.added,
+// output_text.delta, output_text.done, content_part.done, output_item.done, completed. Only the
+// terminal response.completed object should drive the assembled output; the rest are ignored.
+func TestAssembleOpenAIResponsesFullLifecycle(t *testing.T) {
+	const completed = `{"id":"resp_67c9","object":"response","created_at":1741290958,"status":"completed","error":null,"model":"gpt-5.4","output":[{"id":"msg_67c9","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Hi there! How can I assist you today?","annotations":[]}]}],"usage":{"input_tokens":37,"output_tokens":11,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":48}}`
+	out, ok := assemble(t, FormatOpenAIResponses,
+		"event: response.created\n"+`data: {"type":"response.created","response":{"id":"resp_67c9","object":"response","status":"in_progress","model":"gpt-5.4","output":[],"usage":null}}`+"\n\n",
+		"event: response.in_progress\n"+`data: {"type":"response.in_progress","response":{"id":"resp_67c9","object":"response","status":"in_progress","output":[]}}`+"\n\n",
+		"event: response.output_item.added\n"+`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_67c9","type":"message","status":"in_progress","role":"assistant","content":[]}}`+"\n\n",
+		"event: response.content_part.added\n"+`data: {"type":"response.content_part.added","item_id":"msg_67c9","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}}`+"\n\n",
+		"event: response.output_text.delta\n"+`data: {"type":"response.output_text.delta","item_id":"msg_67c9","output_index":0,"content_index":0,"delta":"Hi there! How can I assist you today?"}`+"\n\n",
+		"event: response.output_text.done\n"+`data: {"type":"response.output_text.done","item_id":"msg_67c9","output_index":0,"content_index":0,"text":"Hi there! How can I assist you today?"}`+"\n\n",
+		"event: response.content_part.done\n"+`data: {"type":"response.content_part.done","item_id":"msg_67c9","output_index":0,"content_index":0,"part":{"type":"output_text","text":"Hi there! How can I assist you today?","annotations":[]}}`+"\n\n",
+		"event: response.output_item.done\n"+`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_67c9","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Hi there! How can I assist you today?","annotations":[]}]}}`+"\n\n",
+		"event: response.completed\n"+`data: {"type":"response.completed","response":`+completed+`}`+"\n\n",
+	)
+	if !ok {
+		t.Fatal("Finalize returned ok=false")
+	}
+	if string(out) != completed {
+		t.Errorf("assembled is not the terminal Response verbatim\n got: %s\nwant: %s", out, completed)
+	}
+	// And usage is read from that same terminal Response.
+	a := NewAccumulator(FormatOpenAIResponses, true)
+	a.Write([]byte("event: response.completed\n" + `data: {"type":"response.completed","response":` + completed + `}` + "\n\n"))
+	if u, ok := a.Usage(); !ok || u.InputTokens != 37 || u.OutputTokens != 11 {
+		t.Errorf("usage = %+v ok=%v, want input 37 output 11", u, ok)
+	}
+}
+
+// TestAssembleOpenAIResponsesFailedTerminal verifies response.failed is treated as terminal (like
+// completed/incomplete) and its Response object drives the assembled output.
+func TestAssembleOpenAIResponsesFailedTerminal(t *testing.T) {
+	out, ok := assemble(t, FormatOpenAIResponses,
+		"event: response.output_text.delta\n"+`data: {"type":"response.output_text.delta","delta":"partial"}`+"\n\n",
+		"event: response.failed\n"+`data: {"type":"response.failed","response":{"id":"resp_fail","object":"response","status":"failed","error":{"code":"server_error","message":"boom"},"usage":{"input_tokens":3,"output_tokens":0}}}`+"\n\n",
+	)
+	if !ok {
+		t.Fatal("Finalize returned ok=false")
+	}
+	var got struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+		Error  struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("assembled JSON invalid: %v\n%s", err, out)
+	}
+	if got.ID != "resp_fail" || got.Status != "failed" || got.Error.Code != "server_error" {
+		t.Errorf("failed terminal not used: %+v\n%s", got, out)
+	}
+}

@@ -585,7 +585,10 @@ func faithfulUsage(v any, present bool) json.RawMessage {
 // Known (SDK-modeled) keys at each level of the recognized formats. Any key not listed is treated
 // as a provider extra and re-captured for the assembled output.
 var (
-	chatTopKeys        = set("id", "object", "created", "model", "choices", "usage", "system_fingerprint", "service_tier")
+	// system_fingerprint and service_tier are intentionally absent: the SDK models them but
+	// system_fingerprint is deprecated, so rather than special-case the typed accessors we let both
+	// ride the extra-field passthrough below — captured from the raw chunks and re-emitted as-is.
+	chatTopKeys        = set("id", "object", "created", "model", "choices", "usage")
 	chatChoiceKeys     = set("index", "delta", "finish_reason", "logprobs")
 	chatDeltaKeys      = set("role", "content", "refusal", "tool_calls", "function_call")
 	anthropicMsgKeys   = set("id", "type", "role", "model", "content", "stop_reason", "stop_sequence", "usage")
