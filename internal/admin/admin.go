@@ -53,6 +53,7 @@ func (a *Admin) Handler() http.Handler {
 	mux.HandleFunc("GET /admin/keys", a.listKeys)
 	mux.HandleFunc("DELETE /admin/keys/{id}", a.deleteKey)
 	mux.HandleFunc("GET /admin/logs", a.listLogs)
+	mux.HandleFunc("GET /admin/logs/{id}", a.getLog)
 	mux.HandleFunc("GET /admin/stats", a.stats)
 	mux.HandleFunc("GET /admin/providers", a.providers)
 	mux.HandleFunc("POST /admin/test", a.test)
@@ -193,6 +194,7 @@ func (a *Admin) listLogs(w http.ResponseWriter, r *http.Request) {
 		APIKeyID:        apiKeyID,
 		Provider:        r.URL.Query().Get("provider"),
 		Since:           querySince(r),
+		Until:           queryTime(r, "until"),
 		Limit:           limit + 1, // fetch one extra to detect a further page
 		Offset:          offset,
 		IncludePayloads: queryBool(r, "include_payloads"),
@@ -220,8 +222,29 @@ func (a *Admin) listLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// getLog returns a single request log by id, always including the heavy raw_request,
+// raw_response, and assembled_response payloads so the portal's inspector drawer can show
+// the full request/response without re-fetching a whole page of payloads.
+func (a *Admin) getLog(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeJSON(w, http.StatusBadRequest, errBody("invalid log id"))
+		return
+	}
+	logs, err := a.store.QueryLogs(store.LogFilter{ID: id, Limit: 1, IncludePayloads: true})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errBody("could not query log"))
+		return
+	}
+	if len(logs) == 0 {
+		writeJSON(w, http.StatusNotFound, errBody("log not found"))
+		return
+	}
+	writeJSON(w, http.StatusOK, logs[0])
+}
+
 func (a *Admin) stats(w http.ResponseWriter, r *http.Request) {
-	f := store.LogFilter{APIKeyID: queryInt64(r, "api_key_id"), Since: querySince(r)}
+	f := store.LogFilter{APIKeyID: queryInt64(r, "api_key_id"), Since: querySince(r), Until: queryTime(r, "until")}
 	st, err := a.store.Stats(f)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errBody("could not query stats"))
@@ -524,8 +547,13 @@ func queryBool(r *http.Request, key string) bool {
 
 // querySince accepts an RFC3339 timestamp, a Go duration window (e.g. "24h"), or unix
 // milliseconds. It returns the zero time when absent or unparseable.
-func querySince(r *http.Request) time.Time {
-	v := strings.TrimSpace(r.URL.Query().Get("since"))
+func querySince(r *http.Request) time.Time { return queryTime(r, "since") }
+
+// queryTime parses the named query parameter as an RFC3339 timestamp, a Go duration window
+// relative to now (e.g. "24h" → 24 hours ago), or unix milliseconds. It returns the zero
+// time when the parameter is absent or unparseable.
+func queryTime(r *http.Request, key string) time.Time {
+	v := strings.TrimSpace(r.URL.Query().Get(key))
 	if v == "" {
 		return time.Time{}
 	}

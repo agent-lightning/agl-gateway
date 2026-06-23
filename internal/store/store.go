@@ -60,11 +60,19 @@ type RequestLog struct {
 
 // LogFilter constrains a log query. Zero-valued fields are ignored.
 type LogFilter struct {
+	// ID selects a single log by primary key. When > 0 every other constraint
+	// (key/provider/window/pagination) is still applied, but a lookup-by-id is normally
+	// issued on its own to fetch one row (with payloads) for the inspector drawer.
+	ID       int64
 	APIKeyID int64
 	Provider string
-	Since    time.Time
-	Limit    int
-	Offset   int
+	// Since and Until bound the created_at window: created_at >= Since and created_at <
+	// Until. Either may be zero to leave that side unbounded, so a fixed period is expressed
+	// by setting both.
+	Since  time.Time
+	Until  time.Time
+	Limit  int
+	Offset int
 	// IncludePayloads selects the heavy raw_request/raw_response/assembled_response BLOB
 	// columns. When false (the default) they are omitted from the query, so the returned
 	// RequestLogs carry nil payload bytes regardless of what was captured.
@@ -276,6 +284,10 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 	cols += ` raw_request_truncated, raw_response_truncated, assembled_response_truncated, created_at`
 	q := `SELECT ` + cols + ` FROM request_logs WHERE 1=1`
 	var args []any
+	if f.ID > 0 {
+		q += " AND id = ?"
+		args = append(args, f.ID)
+	}
 	if f.APIKeyID > 0 {
 		q += " AND api_key_id = ?"
 		args = append(args, f.APIKeyID)
@@ -287,6 +299,10 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 	if !f.Since.IsZero() {
 		q += " AND created_at >= ?"
 		args = append(args, f.Since.UnixMilli())
+	}
+	if !f.Until.IsZero() {
+		q += " AND created_at < ?"
+		args = append(args, f.Until.UnixMilli())
 	}
 	q += " ORDER BY id DESC"
 	limit := f.Limit
@@ -349,6 +365,10 @@ func (s *Store) Stats(f LogFilter) ([]Stat, error) {
 	if !f.Since.IsZero() {
 		q += " AND created_at >= ?"
 		args = append(args, f.Since.UnixMilli())
+	}
+	if !f.Until.IsZero() {
+		q += " AND created_at < ?"
+		args = append(args, f.Until.UnixMilli())
 	}
 	q += " GROUP BY api_key_id, key_name, model ORDER BY SUM(cost) DESC"
 	rows, err := s.db.Query(s.d.rebind(q), args...)

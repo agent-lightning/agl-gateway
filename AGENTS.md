@@ -54,8 +54,8 @@ Packages:
 | `internal/keys`   | Mint + SHA-256-hash gateway keys. |
 | `internal/probe`  | Shared model-probe logic (endpoint/body/summary, worker pool); used by `cmd/modelcheck` and `/admin/test`. |
 | `internal/proxy`  | Data plane: auth, routing, retry, streaming, metering. |
-| `internal/admin`  | Master-key control plane (`/admin/*`); `/admin/providers` probes upstream `/v1/models`; `/admin/test` runs the model check in-process through the proxy. |
-| `internal/portal` | Embedded management/inspection SPA (keys, logs, stats, model test). |
+| `internal/admin`  | Master-key control plane (`/admin/*`); `/admin/providers` probes upstream `/v1/models`; `/admin/test` runs the model check in-process through the proxy; `/admin/logs/{id}` returns one log with its captured payloads for the portal's inspector. |
+| `internal/portal` | Embedded management/inspection SPA (keys, logs, stats, model test). The UI is a Vite + React + Tailwind/shadcn app whose source lives at the repo root in `/ui`; its production build is emitted to `internal/portal/dist` (gitignored) and embedded via `go:embed`. A committed `.gitkeep` anchors the embed so `go build` works before the UI is compiled; when the build is absent the handler serves a "portal not built" placeholder. |
 | `internal/server` | Top-level HTTP routing. |
 | `internal/version`| Build version string (`var Version`), stamped via `-ldflags` at release. |
 | `cmd/gateway`     | Entrypoint. |
@@ -113,6 +113,23 @@ go vet ./...
 go run ./cmd/gateway -config config.yaml
 ```
 
+### Portal UI (`/ui`)
+
+The management portal is a Vite + React + TypeScript + Tailwind/shadcn app under `/ui`. Its
+build output (`internal/portal/dist`) is **gitignored** and embedded by Go via `go:embed`, so
+rebuild it whenever the UI source changes:
+
+```sh
+npm --prefix ui ci          # first time / lockfile change
+npm --prefix ui run build   # emits internal/portal/dist, then re-anchors the .gitkeep
+npm --prefix ui run dev      # hot-reload dev server (proxy /admin and /healthz to a gateway)
+```
+
+CI and the Docker image build the UI automatically before the Go build, so a fresh checkout
+needs no manual step to ship. A bare `go build`/`go test` without a prior UI build still works
+— `go:embed` falls back to the committed `.gitkeep` anchor and the portal serves a
+"not built" placeholder; the portal tests skip rather than fail.
+
 The `internal/store` tests run against in-memory SQLite by default. To also exercise the
 PostgreSQL backend, point `AGL_DATABASE` at a throwaway database (the same env var the
 gateway honors at runtime); the store tests then run every portable case against both
@@ -160,7 +177,9 @@ identically.
 
 ### Docker image
 
-The image is a static binary on Debian slim (non-root, ~13 MB layer for the binary). It
+The image is a static binary on Debian slim (non-root, ~13 MB layer for the binary). A first
+`node` build stage compiles the portal UI (`/ui` → `internal/portal/dist`) and the Go stage
+embeds it, so the final image still ships a single static binary with the SPA baked in. It
 expects a config at `/data/config.yaml` and keeps the SQLite database in `/data` (when
 `database` is a `postgres://` URL the gateway uses that instead and the `/data` SQLite file is
 unused). Build it

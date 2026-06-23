@@ -16,6 +16,11 @@ config.yaml
 /modelcheck
 /dist
 
+# Node / portal build artifacts — the image's ui stage installs and builds these fresh.
+ui/node_modules
+ui/dist
+internal/portal/dist
+
 # Docs / editor cruft
 *.md
 .vscode

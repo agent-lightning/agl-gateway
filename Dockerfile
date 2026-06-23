@@ -1,5 +1,16 @@
 # syntax=docker/dockerfile:1
 
+# ---- ui ----
+# Build the portal SPA (Vite/React, source in /ui) into internal/portal/dist, which the Go
+# build then embeds via go:embed. The build output is not committed, so it is produced here.
+FROM --platform=$BUILDPLATFORM node:24-slim AS ui
+WORKDIR /app
+COPY ui/package.json ui/package-lock.json ./ui/
+RUN --mount=type=cache,target=/root/.npm \
+    npm --prefix ui ci
+COPY ui ./ui
+RUN npm --prefix ui run build
+
 # ---- build ----
 # golang:1.26-trixie is the latest Go on the latest Debian (13 "trixie"). The only
 # third-party deps are pure Go (modernc.org/sqlite, gopkg.in/yaml.v3), so CGO stays
@@ -13,6 +24,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download
 
 COPY . .
+# Bring in the compiled portal assets from the ui stage (the dist tree is gitignored, so it
+# is not present in the build context).
+COPY --from=ui /app/internal/portal/dist ./internal/portal/dist
 # Static, stripped binary. The portal SPA is embedded via go:embed, so no extra assets
 # need to be copied into the runtime image. VERSION is stamped into the binary so it is
 # reported by GET /healthz and `gateway -version`; it defaults to "dev" for local builds.

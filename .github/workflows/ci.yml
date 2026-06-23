@@ -14,6 +14,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build portal UI
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
@@ -22,7 +35,8 @@ jobs:
 
       - name: Verify formatting
         run: |
-          unformatted=$(gofmt -l .)
+          # Scope to tracked Go files so vendored Go under ui/node_modules is not checked.
+          unformatted=$(gofmt -l $(git ls-files '*.go'))
           if [ -n "$unformatted" ]; then
             echo "These files are not gofmt-ed:"
             echo "$unformatted"

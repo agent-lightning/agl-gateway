@@ -6,3 +6,13 @@
 /modelcheck
 /dist
 /config.yaml
+
+# Portal UI build output — produced by `npm --prefix ui run build` (and by CI / the Docker
+# image), not committed. The .gitkeep anchor keeps the go:embed target present so the Go
+# build works before the UI is compiled.
+/internal/portal/dist/*
+!/internal/portal/dist/.gitkeep
+
+# Node / Vite (UI source lives in /ui)
+/ui/node_modules
+/ui/dist

@@ -230,6 +230,67 @@ func TestLogsPayloadsOptIn(t *testing.T) {
 	}
 }
 
+func TestGetLogByID(t *testing.T) {
+	h, st := newAdmin(t)
+	if err := st.InsertLog(&store.RequestLog{
+		APIKeyID: 1, KeyName: "dev", Provider: "openai", Model: "gpt-5.4", StatusCode: 200,
+		RawRequest: []byte(`{"hello":"world"}`), RawResponse: []byte(`{"ok":true}`),
+	}); err != nil {
+		t.Fatalf("InsertLog: %v", err)
+	}
+
+	// A single log is returned with its heavy payloads, even though the list view omits them.
+	rec := req(t, h, "GET", "/admin/logs/1", master, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var l store.RequestLog
+	if err := json.Unmarshal(rec.Body.Bytes(), &l); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if l.ID != 1 || string(l.RawRequest) != `{"hello":"world"}` || string(l.RawResponse) != `{"ok":true}` {
+		t.Fatalf("log = %+v, want id 1 with payloads", l)
+	}
+
+	if rec := req(t, h, "GET", "/admin/logs/999", master, ""); rec.Code != http.StatusNotFound {
+		t.Errorf("missing log status = %d, want 404", rec.Code)
+	}
+	if rec := req(t, h, "GET", "/admin/logs/abc", master, ""); rec.Code != http.StatusBadRequest {
+		t.Errorf("bad id status = %d, want 400", rec.Code)
+	}
+}
+
+func TestLogsTimeWindow(t *testing.T) {
+	h, st := newAdmin(t)
+	base := time.Now().UTC()
+	// Three logs at -3h, -2h, -1h. Inserted via the store with explicit timestamps.
+	for i, ago := range []time.Duration{3 * time.Hour, 2 * time.Hour, time.Hour} {
+		l := &store.RequestLog{APIKeyID: 1, KeyName: "dev", Provider: "openai", Model: "gpt-5.4", StatusCode: 200}
+		l.CreatedAt = base.Add(-ago)
+		if err := st.InsertLog(l); err != nil {
+			t.Fatalf("InsertLog[%d]: %v", i, err)
+		}
+	}
+
+	// since: a 150-minute window keeps the two most recent.
+	rec := req(t, h, "GET", "/admin/logs?since=150m", master, "")
+	var page logsResponse
+	json.Unmarshal(rec.Body.Bytes(), &page)
+	if len(page.Logs) != 2 {
+		t.Fatalf("since window logs = %d, want 2", len(page.Logs))
+	}
+
+	// fixed period: since+until bracket only the middle (-2h) log.
+	from := base.Add(-150 * time.Minute).Format(time.RFC3339)
+	to := base.Add(-90 * time.Minute).Format(time.RFC3339)
+	rec = req(t, h, "GET", "/admin/logs?since="+from+"&until="+to, master, "")
+	page = logsResponse{}
+	json.Unmarshal(rec.Body.Bytes(), &page)
+	if len(page.Logs) != 1 {
+		t.Fatalf("fixed-period logs = %d, want 1", len(page.Logs))
+	}
+}
+
 func TestLogsMissingKeyReturnsEmpty(t *testing.T) {
 	h, _ := newAdmin(t)
 	rec := req(t, h, "GET", "/admin/logs?api_key_id=404", master, "")
