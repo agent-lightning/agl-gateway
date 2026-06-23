@@ -51,6 +51,13 @@ func TestRouting(t *testing.T) {
 		t.Errorf("portal = %d %q", rec.Code, rec.Body.String())
 	}
 
+	// The bare root redirects a browser to the portal.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/portal/" {
+		t.Errorf("root = %d %q, want 302 -> /portal/", rec.Code, rec.Header().Get("Location"))
+	}
+
 	// Data-plane catch-all hits the proxy, which rejects a missing API key.
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", nil))

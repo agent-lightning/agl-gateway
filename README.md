@@ -91,9 +91,21 @@ curl localhost:8080/v1/chat/completions \
   -d '{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-Open the portal at <http://localhost:8080/portal> and paste the master key to manage keys
-and browse logs, stats, and the model test. (When running from source, build the UI first —
-see [From source](#from-source).)
+### Web portal
+
+The gateway serves a management portal for everything you'd otherwise do over the admin API.
+Point a browser at the gateway and you're taken straight there — the root path
+<http://localhost:8080> redirects to <http://localhost:8080/portal>:
+
+```sh
+open http://localhost:8080        # redirects to /portal
+```
+
+Paste the **master key** to unlock it, then create and manage keys, browse request logs with
+their captured payloads, view usage and cost stats, and run the model test — all from the UI.
+The key stays in this browser's `localStorage` only. (When running from source, build the UI
+first — see [From source](#from-source); otherwise `/portal` serves a "portal not built"
+placeholder.)
 
 ## Configuration
 

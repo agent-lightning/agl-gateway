@@ -28,6 +28,11 @@ func New(p *proxy.Proxy, a *admin.Admin, portal http.Handler) http.Handler {
 	if portal != nil {
 		mux.Handle("/portal", portal)
 		mux.Handle("/portal/", portal)
+		// A browser hitting the bare root is sent to the portal. {$} matches only the
+		// exact path "/", so every other path still falls through to the data plane.
+		mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/portal/", http.StatusFound)
+		})
 	}
 
 	// Data plane: everything else is proxied based on the inbound API key.
