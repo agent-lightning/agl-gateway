@@ -117,7 +117,7 @@ export default function App() {
       <div className="min-h-dvh">
         <header className="bg-card/60 sticky top-0 z-30 border-b backdrop-blur">
           <div className="mx-auto flex h-14 max-w-[1600px] items-center gap-3 px-4 sm:px-6">
-            <img src="/portal/favicon.svg" alt="" className="size-6" />
+            <img src="/portal/favicon.png" alt="" className="size-6" />
             <span className="text-[15px] font-semibold tracking-tight">
               agl-gateway
             </span>

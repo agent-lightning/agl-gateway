@@ -22,21 +22,21 @@ export function Login({ onConnect, error, connecting }: Props) {
 
   return (
     <div className="relative flex min-h-dvh items-center justify-center overflow-hidden p-6">
-      {/* Ambient violet glow backdrop. */}
+      {/* Ambient brand glow backdrop (primary red + accent orange). */}
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0 -z-10"
         style={{
           background:
-            'radial-gradient(60rem 40rem at 50% -10%, oklch(0.7 0.16 280 / 0.18), transparent 70%), radial-gradient(40rem 30rem at 110% 110%, oklch(0.7 0.16 220 / 0.12), transparent 70%)',
+            'radial-gradient(60rem 40rem at 50% -10%, oklch(0.62 0.158 20 / 0.2), transparent 70%), radial-gradient(40rem 30rem at 110% 110%, oklch(0.749 0.151 53 / 0.14), transparent 70%)',
         }}
       />
       <div className="w-full max-w-md">
         <div className="mb-8 flex flex-col items-center text-center">
           <img
-            src="/portal/favicon.svg"
+            src="/portal/favicon.png"
             alt=""
-            className="mb-4 size-14 drop-shadow-[0_0_24px_oklch(0.7_0.16_280_/_0.5)]"
+            className="mb-4 size-14 drop-shadow-[0_0_24px_oklch(0.749_0.151_53_/_0.55)]"
           />
           <h1 className="text-2xl font-semibold tracking-tight">agl-gateway</h1>
           <p className="text-muted-foreground mt-1 text-sm">
