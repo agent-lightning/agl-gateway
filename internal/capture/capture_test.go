@@ -513,3 +513,95 @@ func TestFinalizeAnthropicIndexGapGivesUp(t *testing.T) {
 		t.Errorf("usage after failure = %+v ok=%v, want empty", u, ok)
 	}
 }
+
+// TestAssembleOpenAIChatStreamPreservesExtras verifies provider-custom fields survive streaming
+// assembly at every level — the SDK accumulator discards them, so handleChat re-captures top-level,
+// per-choice, and per-delta keys from the raw chunk bytes.
+func TestAssembleOpenAIChatStreamPreservesExtras(t *testing.T) {
+	out, ok := assemble(t, FormatOpenAIChat,
+		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","created":1,"model":"m","x_top":{"k":1},"choices":[{"index":0,"delta":{"role":"assistant","content":"hi","x_delta":"dval"},"finish_reason":null,"x_choice":"cval"}]}`+"\n\n",
+		`data: {"id":"chatcmpl_1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`+"\n\n",
+		"data: [DONE]\n\n",
+	)
+	if !ok {
+		t.Fatal("Finalize returned ok=false")
+	}
+	var got struct {
+		XTop    map[string]int `json:"x_top"`
+		Choices []struct {
+			XChoice string `json:"x_choice"`
+			Message struct {
+				Content string `json:"content"`
+				XDelta  string `json:"x_delta"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("assembled JSON invalid: %v\n%s", err, out)
+	}
+	if got.XTop["k"] != 1 {
+		t.Errorf("top-level extra lost: %v\n%s", got.XTop, out)
+	}
+	if len(got.Choices) != 1 {
+		t.Fatalf("choices = %d\n%s", len(got.Choices), out)
+	}
+	c := got.Choices[0]
+	if c.XChoice != "cval" || c.Message.XDelta != "dval" || c.Message.Content != "hi" {
+		t.Errorf("nested extras lost: choice=%q delta=%q content=%q\n%s", c.XChoice, c.Message.XDelta, c.Message.Content, out)
+	}
+}
+
+// TestAssembleAnthropicStreamPreservesExtras verifies top-level (message_start) and per-block
+// (content_block_start) provider-custom fields survive streaming assembly.
+func TestAssembleAnthropicStreamPreservesExtras(t *testing.T) {
+	out, ok := assemble(t, FormatAnthropicMessages,
+		"event: message_start\n"+
+			`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude","content":[],"x_msg":"mval","usage":{"input_tokens":1,"output_tokens":1}}}`+"\n\n",
+		"event: content_block_start\n"+
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"","x_block":"bval"}}`+"\n\n",
+		"event: content_block_delta\n"+
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`+"\n\n",
+		"event: message_stop\n"+`data: {"type":"message_stop"}`+"\n\n",
+	)
+	if !ok {
+		t.Fatal("Finalize returned ok=false")
+	}
+	var got struct {
+		XMsg    string `json:"x_msg"`
+		Content []struct {
+			Text   string `json:"text"`
+			XBlock string `json:"x_block"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("assembled JSON invalid: %v\n%s", err, out)
+	}
+	if got.XMsg != "mval" {
+		t.Errorf("top-level extra lost: %q\n%s", got.XMsg, out)
+	}
+	if len(got.Content) != 1 || got.Content[0].Text != "hi" || got.Content[0].XBlock != "bval" {
+		t.Errorf("block extra lost: %+v\n%s", got.Content, out)
+	}
+}
+
+// TestFinalizeNonStreamingReturnsBodyVerbatim confirms a non-streaming response is emitted byte-for-
+// byte (the typed struct is internal-only for usage): provider extras and a real content:null
+// survive without round-tripping through the manual reconstruction.
+func TestFinalizeNonStreamingReturnsBodyVerbatim(t *testing.T) {
+	cases := map[StreamFormat]string{
+		FormatOpenAIChat:        `{"id":"c","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"t","type":"function","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"x_custom":"keep"}`,
+		FormatAnthropicMessages: `{"id":"m","type":"message","role":"assistant","model":"claude","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1},"x_custom":"keep"}`,
+	}
+	for format, body := range cases {
+		a := NewAccumulator(format, false)
+		a.Write([]byte(body))
+		out, reason := a.Finalize()
+		if reason != "" {
+			t.Errorf("%v: reason = %q, want empty", format, reason)
+			continue
+		}
+		if string(out) != body {
+			t.Errorf("%v: not byte-for-byte\n got: %s\nwant: %s", format, out, body)
+		}
+	}
+}
