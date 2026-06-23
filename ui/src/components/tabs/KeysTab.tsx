@@ -19,6 +19,11 @@ import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
+import {
   Card,
   CardContent,
   CardDescription,
@@ -226,9 +231,34 @@ export function KeysTab() {
                     >
                       <Checkbox checked={on} className="pointer-events-none" />
                       <span className="font-medium">{p.name}</span>
-                      <span className="text-muted-foreground text-xs">
-                        {p.error ? 'unreachable' : `${p.models.length} models`}
-                      </span>
+                      {p.error ? (
+                        <span className="text-destructive text-xs">
+                          unreachable
+                        </span>
+                      ) : p.models.length === 0 ? (
+                        <span className="text-foreground/70 text-xs">
+                          0 models
+                        </span>
+                      ) : (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span className="text-foreground/70 hover:text-foreground hover:decoration-foreground/40 text-xs underline decoration-dotted underline-offset-2 transition-colors">
+                              {p.models.length} models
+                            </span>
+                          </TooltipTrigger>
+                          <TooltipContent
+                            side="bottom"
+                            className="max-w-xs"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <ul className="flex flex-col gap-0.5 font-mono">
+                              {p.models.map((m) => (
+                                <li key={m}>{m}</li>
+                              ))}
+                            </ul>
+                          </TooltipContent>
+                        </Tooltip>
+                      )}
                     </button>
                   )
                 })}
