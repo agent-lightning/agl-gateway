@@ -22,13 +22,13 @@ export function Login({ onConnect, error, connecting }: Props) {
 
   return (
     <div className="relative flex min-h-dvh items-center justify-center overflow-hidden p-6">
-      {/* Ambient brand glow backdrop (primary red + accent orange). */}
+      {/* Subtle brand glow backdrop (primary red + accent orange). */}
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0 -z-10"
         style={{
           background:
-            'radial-gradient(60rem 40rem at 50% -10%, oklch(0.62 0.158 20 / 0.2), transparent 70%), radial-gradient(40rem 30rem at 110% 110%, oklch(0.749 0.151 53 / 0.14), transparent 70%)',
+            'radial-gradient(60rem 40rem at 50% -10%, oklch(0.62 0.158 20 / 0.13), transparent 70%), radial-gradient(40rem 30rem at 110% 110%, oklch(0.749 0.151 53 / 0.09), transparent 70%)',
         }}
       />
       <div className="w-full max-w-md">
@@ -36,7 +36,7 @@ export function Login({ onConnect, error, connecting }: Props) {
           <img
             src="/portal/favicon.png"
             alt=""
-            className="mb-4 size-14 drop-shadow-[0_0_24px_oklch(0.749_0.151_53_/_0.55)]"
+            className="mb-4 size-14 drop-shadow-[0_0_22px_oklch(0.749_0.151_53_/_0.4)]"
           />
           <h1 className="text-2xl font-semibold tracking-tight">agl-gateway</h1>
           <p className="text-muted-foreground mt-1 text-sm">
