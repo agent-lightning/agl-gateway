@@ -65,7 +65,7 @@ export function LogDrawer({ logId, preview, open, onClose }: Props) {
 
   return (
     <Sheet open={open} onOpenChange={(o) => !o && onClose()}>
-      <SheetContent side="right" className="w-full gap-0 sm:max-w-3xl">
+      <SheetContent side="right" className="w-full gap-0 sm:max-w-4xl lg:max-w-6xl">
         {log && (
           <>
             <SheetHeader className="pb-4">
@@ -210,6 +210,7 @@ function PayloadSection({
   contentType?: string
 }) {
   const [pretty, setPretty] = useState(true)
+  const [wrap, setWrap] = useState(true)
   const raw = b64 ? decodeBase64(b64) : ''
   const json = raw && isJSON(raw)
   const text = json && pretty ? prettyJSON(raw) : raw
@@ -226,6 +227,16 @@ function PayloadSection({
         )}
         {truncated && <Badge variant="warning">truncated</Badge>}
         <div className="flex-1" />
+        {raw && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2 text-xs"
+            onClick={() => setWrap((w) => !w)}
+          >
+            {wrap ? 'Nowrap' : 'Wrap'}
+          </Button>
+        )}
         {json && (
           <Button
             variant="ghost"
@@ -246,7 +257,12 @@ function PayloadSection({
           Loading payload…
         </div>
       ) : raw ? (
-        <pre className="bg-muted/30 max-h-[28rem] overflow-auto rounded-lg border p-3 font-mono text-xs leading-relaxed">
+        <pre
+          className={cn(
+            'bg-muted/30 max-h-[28rem] overflow-auto rounded-lg border p-3 font-mono text-xs leading-relaxed',
+            wrap ? 'break-words whitespace-pre-wrap' : 'whitespace-pre',
+          )}
+        >
           {text}
         </pre>
       ) : (
