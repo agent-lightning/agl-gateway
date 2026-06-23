@@ -95,6 +95,8 @@ export function LogDrawer({ logId, preview, open, onClose }: Props) {
               <div className="flex flex-col gap-5 px-6 pb-10">
                 <MetaGrid log={log} />
 
+                <RequestInfo log={log} />
+
                 {(log.error || log.assemble_error) && (
                   <ErrorPanel log={log} />
                 )}
@@ -169,6 +171,32 @@ function MetaGrid({ log }: { log: RequestLog }) {
           log.cache_write_tokens,
         )}`}
       />
+      <MetaItem
+        label="Client"
+        value={log.client_addr || '—'}
+        className="font-mono text-xs"
+      />
+      <MetaItem label="Request size" value={formatBytes(log.request_bytes)} />
+      <MetaItem label="Response size" value={formatBytes(log.response_bytes)} />
+    </div>
+  )
+}
+
+function RequestInfo({ log }: { log: RequestLog }) {
+  const target = `${log.path}${log.query ? `?${log.query}` : ''}`
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border p-4">
+      <div className="flex items-baseline gap-2">
+        <Badge variant="outline" className="font-mono">
+          {log.method || '—'}
+        </Badge>
+        <code className="text-sm break-all">{target || '—'}</code>
+      </div>
+      {log.user_agent && (
+        <div className="text-muted-foreground text-xs break-all">
+          <span className="font-medium">User-Agent:</span> {log.user_agent}
+        </div>
+      )}
     </div>
   )
 }

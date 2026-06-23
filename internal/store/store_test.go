@@ -79,6 +79,9 @@ func TestLogMappedModelAndAttempts(t *testing.T) {
 			Model: "alias", MappedModel: "gpt-5.4", Attempts: 3, StatusCode: 200,
 			APIType: "openai_chat", AssembleError: "anthropic accumulate: boom",
 			RequestContentType: "application/json", ResponseContentType: "text/event-stream",
+			Method: "POST", Path: "/v1/chat/completions", Query: "beta=true",
+			ClientAddr: "203.0.113.7:54321", UserAgent: "agl-test/1.0",
+			RequestBytes: 42, ResponseBytes: 1024,
 		}); err != nil {
 			t.Fatalf("InsertLog: %v", err)
 		}
@@ -95,6 +98,17 @@ func TestLogMappedModelAndAttempts(t *testing.T) {
 		}
 		if logs[0].RequestContentType != "application/json" || logs[0].ResponseContentType != "text/event-stream" {
 			t.Errorf("content types = %q/%q", logs[0].RequestContentType, logs[0].ResponseContentType)
+		}
+		// Request-line metadata round-trips without IncludePayloads.
+		got := logs[0]
+		if got.Method != "POST" || got.Path != "/v1/chat/completions" || got.Query != "beta=true" {
+			t.Errorf("request line = %q %q?%q", got.Method, got.Path, got.Query)
+		}
+		if got.ClientAddr != "203.0.113.7:54321" || got.UserAgent != "agl-test/1.0" {
+			t.Errorf("client/user-agent = %q / %q", got.ClientAddr, got.UserAgent)
+		}
+		if got.RequestBytes != 42 || got.ResponseBytes != 1024 {
+			t.Errorf("byte counts = %d / %d", got.RequestBytes, got.ResponseBytes)
 		}
 	})
 }
@@ -346,5 +360,55 @@ func TestLegacyDBUpgradesPolicyColumns(t *testing.T) {
 	}
 	if k.ProviderStart != "first" || k.ProviderOrder != "round_robin" {
 		t.Errorf("upgraded policy = %q/%q, want first/round_robin", k.ProviderStart, k.ProviderOrder)
+	}
+}
+
+// TestLegacyDBUpgradesLogColumns is SQLite-only: it seeds a request_logs table from an older
+// version (missing the request-metadata columns) and confirms ensureColumn adds them so the
+// new fields insert and round-trip. PostgreSQL's matching ADD COLUMN IF NOT EXISTS path runs
+// on every Open and is covered by the eachBackend round-trip tests.
+func TestLegacyDBUpgradesLogColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-logs.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	// An older request_logs without method/path/query/client_addr/user_agent/request_bytes/
+	// response_bytes (only the columns that have never been additive).
+	_, err = raw.Exec(`CREATE TABLE request_logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, api_key_id INTEGER NOT NULL, key_name TEXT NOT NULL,
+		provider TEXT NOT NULL, model TEXT NOT NULL, status_code INTEGER NOT NULL,
+		streaming INTEGER NOT NULL, ttft_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
+		input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+		cache_read_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL,
+		cost REAL NOT NULL, error TEXT NOT NULL, created_at INTEGER NOT NULL);`)
+	if err != nil {
+		t.Fatalf("seed legacy: %v", err)
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	// The new columns now exist, so a row carrying them inserts and reads back unchanged.
+	if err := s.InsertLog(&RequestLog{
+		APIKeyID: 1, KeyName: "dev", Provider: "openai", Model: "m", StatusCode: 200,
+		Method: "POST", Path: "/v1/messages", Query: "x=1",
+		ClientAddr: "203.0.113.7:443", UserAgent: "ua/2", RequestBytes: 7, ResponseBytes: 99,
+	}); err != nil {
+		t.Fatalf("InsertLog after upgrade: %v", err)
+	}
+	logs, err := s.QueryLogs(LogFilter{})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("QueryLogs: %v (n=%d)", err, len(logs))
+	}
+	got := logs[0]
+	if got.Method != "POST" || got.Path != "/v1/messages" || got.Query != "x=1" ||
+		got.ClientAddr != "203.0.113.7:443" || got.UserAgent != "ua/2" ||
+		got.RequestBytes != 7 || got.ResponseBytes != 99 {
+		t.Errorf("upgraded log round-trip mismatch: %+v", got)
 	}
 }

@@ -104,6 +104,16 @@ func TestForwardNonStreaming(t *testing.T) {
 	if l.RequestContentType != "application/json" || l.ResponseContentType != "application/json" {
 		t.Errorf("content types = %q/%q", l.RequestContentType, l.ResponseContentType)
 	}
+	// Request-line metadata is recorded independently of payload capture.
+	if l.Method != http.MethodPost || l.Path != "/v1/chat/completions" {
+		t.Errorf("method/path = %q %q", l.Method, l.Path)
+	}
+	if l.ClientAddr == "" || l.RequestBytes != int64(len(`{"model":"gpt-5.4"}`)) {
+		t.Errorf("client/request bytes = %q / %d", l.ClientAddr, l.RequestBytes)
+	}
+	if l.ResponseBytes == 0 {
+		t.Errorf("response bytes = %d, want > 0", l.ResponseBytes)
+	}
 }
 
 func TestForwardStreamingSSE(t *testing.T) {

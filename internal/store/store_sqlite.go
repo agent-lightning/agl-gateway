@@ -67,8 +67,15 @@ CREATE TABLE IF NOT EXISTS request_logs (
     provider           TEXT NOT NULL,
     model              TEXT NOT NULL,
     mapped_model       TEXT NOT NULL DEFAULT '',
+    method             TEXT NOT NULL DEFAULT '',
+    path               TEXT NOT NULL DEFAULT '',
+    query              TEXT NOT NULL DEFAULT '',
+    client_addr        TEXT NOT NULL DEFAULT '',
+    user_agent         TEXT NOT NULL DEFAULT '',
     request_content_type  TEXT NOT NULL DEFAULT '',
     response_content_type TEXT NOT NULL DEFAULT '',
+    request_bytes      INTEGER NOT NULL DEFAULT 0,
+    response_bytes     INTEGER NOT NULL DEFAULT 0,
     status_code        INTEGER NOT NULL,
     streaming          INTEGER NOT NULL,
     attempts           INTEGER NOT NULL DEFAULT 0,
@@ -96,12 +103,20 @@ CREATE INDEX IF NOT EXISTS idx_logs_api_key_id ON request_logs(api_key_id);
 	if _, err := db.Exec(schema); err != nil {
 		return fmt.Errorf("migrate: %w", err)
 	}
-	// Additive columns for databases created by older versions.
+	// Additive columns for databases created by older versions. Keep this list in sync with
+	// the ADD COLUMN IF NOT EXISTS list in store_postgres.go.
 	cols := []struct{ table, column, decl string }{
 		{"request_logs", "mapped_model", "TEXT NOT NULL DEFAULT ''"},
+		{"request_logs", "method", "TEXT NOT NULL DEFAULT ''"},
+		{"request_logs", "path", "TEXT NOT NULL DEFAULT ''"},
+		{"request_logs", "query", "TEXT NOT NULL DEFAULT ''"},
+		{"request_logs", "client_addr", "TEXT NOT NULL DEFAULT ''"},
+		{"request_logs", "user_agent", "TEXT NOT NULL DEFAULT ''"},
 		{"request_logs", "attempts", "INTEGER NOT NULL DEFAULT 0"},
 		{"request_logs", "request_content_type", "TEXT NOT NULL DEFAULT ''"},
 		{"request_logs", "response_content_type", "TEXT NOT NULL DEFAULT ''"},
+		{"request_logs", "request_bytes", "INTEGER NOT NULL DEFAULT 0"},
+		{"request_logs", "response_bytes", "INTEGER NOT NULL DEFAULT 0"},
 		{"request_logs", "api_type", "TEXT NOT NULL DEFAULT ''"},
 		{"request_logs", "assemble_error", "TEXT NOT NULL DEFAULT ''"},
 		{"request_logs", "raw_request", "BLOB"},

@@ -34,8 +34,15 @@ type RequestLog struct {
 	Provider                   string    `json:"provider"`
 	Model                      string    `json:"model"`
 	MappedModel                string    `json:"mapped_model"`
+	Method                     string    `json:"method"`
+	Path                       string    `json:"path"`
+	Query                      string    `json:"query"`
+	ClientAddr                 string    `json:"client_addr"`
+	UserAgent                  string    `json:"user_agent"`
 	RequestContentType         string    `json:"request_content_type"`
 	ResponseContentType        string    `json:"response_content_type"`
+	RequestBytes               int64     `json:"request_bytes"`
+	ResponseBytes              int64     `json:"response_bytes"`
 	StatusCode                 int       `json:"status_code"`
 	Streaming                  bool      `json:"streaming"`
 	APIType                    string    `json:"api_type,omitempty"`
@@ -252,14 +259,16 @@ func (s *Store) InsertLog(l *RequestLog) error {
 	}
 	_, err := s.db.Exec(s.d.rebind(`
 INSERT INTO request_logs
- (api_key_id, key_name, provider, model, mapped_model, request_content_type,
-  response_content_type, status_code, streaming, attempts,
+ (api_key_id, key_name, provider, model, mapped_model, method, path, query,
+  client_addr, user_agent, request_content_type, response_content_type,
+  request_bytes, response_bytes, status_code, streaming, attempts,
   ttft_ms, duration_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
   cost, error, api_type, assemble_error, raw_request, raw_response, assembled_response, raw_request_truncated,
   raw_response_truncated, assembled_response_truncated, created_at)
- VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
-		l.APIKeyID, l.KeyName, l.Provider, l.Model, l.MappedModel, l.RequestContentType,
-		l.ResponseContentType, l.StatusCode, b2i(l.Streaming),
+ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+		l.APIKeyID, l.KeyName, l.Provider, l.Model, l.MappedModel, l.Method, l.Path, l.Query,
+		l.ClientAddr, l.UserAgent, l.RequestContentType, l.ResponseContentType,
+		l.RequestBytes, l.ResponseBytes, l.StatusCode, b2i(l.Streaming),
 		l.Attempts, l.TTFTMillis, l.DurationMillis, l.InputTokens, l.OutputTokens, l.CacheReadTokens,
 		l.CacheWriteTokens, l.Cost, l.Error, l.APIType, l.AssembleError, l.RawRequest, l.RawResponse, l.AssembledResponse,
 		b2i(l.RawRequestTruncated), b2i(l.RawResponseTruncated), b2i(l.AssembledResponseTruncated),
@@ -274,8 +283,10 @@ INSERT INTO request_logs
 // QueryLogs returns request logs matching the filter, newest first. The heavy payload
 // BLOB columns are only read when f.IncludePayloads is set.
 func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
-	cols := `id, api_key_id, key_name, provider, model, mapped_model, status_code, streaming,
-	             request_content_type, response_content_type, attempts, ttft_ms, duration_ms,
+	cols := `id, api_key_id, key_name, provider, model, mapped_model, method, path, query,
+	             client_addr, user_agent, status_code, streaming,
+	             request_content_type, response_content_type, request_bytes, response_bytes,
+	             attempts, ttft_ms, duration_ms,
 	             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost, error,
 	             api_type, assemble_error,`
 	if f.IncludePayloads {
@@ -331,7 +342,9 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 			createdMs          int64
 		)
 		dest := []any{&l.ID, &l.APIKeyID, &l.KeyName, &l.Provider, &l.Model, &l.MappedModel,
+			&l.Method, &l.Path, &l.Query, &l.ClientAddr, &l.UserAgent,
 			&l.StatusCode, &streaming, &l.RequestContentType, &l.ResponseContentType,
+			&l.RequestBytes, &l.ResponseBytes,
 			&l.Attempts, &l.TTFTMillis, &l.DurationMillis, &l.InputTokens, &l.OutputTokens,
 			&l.CacheReadTokens, &l.CacheWriteTokens, &l.Cost, &l.Error, &l.APIType, &l.AssembleError}
 		if f.IncludePayloads {

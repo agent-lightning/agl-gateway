@@ -21,8 +21,15 @@ function makeLog(): RequestLog {
     provider: 'mock',
     model: 'gpt-test',
     mapped_model: '',
+    method: 'POST',
+    path: '/v1/chat/completions',
+    query: 'beta=true',
+    client_addr: '203.0.113.7:54321',
+    user_agent: 'agl-test/1.0',
     request_content_type: 'application/json',
     response_content_type: 'application/json',
+    request_bytes: 42,
+    response_bytes: 128,
     status_code: 200,
     streaming: false,
     attempts: 1,
@@ -82,5 +89,19 @@ describe('LogDrawer payload wrapping', () => {
     expect(await payloadPre()).not.toHaveClass('whitespace-pre-wrap')
     // The button now offers to switch back to wrap.
     expect(within(section).getByRole('button', { name: /^wrap$/i })).toBeInTheDocument()
+  })
+
+  it('shows the request line, client, and byte sizes', async () => {
+    renderDrawer()
+
+    // The request method + path + query are surfaced together.
+    expect(await screen.findByText('POST')).toBeInTheDocument()
+    expect(screen.getByText('/v1/chat/completions?beta=true')).toBeInTheDocument()
+    // Client address and user agent.
+    expect(screen.getByText('203.0.113.7:54321')).toBeInTheDocument()
+    expect(screen.getByText(/agl-test\/1\.0/)).toBeInTheDocument()
+    // Request/response byte sizes are formatted.
+    expect(screen.getByText('42 B')).toBeInTheDocument()
+    expect(screen.getByText('128 B')).toBeInTheDocument()
   })
 })

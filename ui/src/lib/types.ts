@@ -23,8 +23,15 @@ export interface RequestLog {
   provider: string
   model: string
   mapped_model: string
+  method: string
+  path: string
+  query: string
+  client_addr: string
+  user_agent: string
   request_content_type: string
   response_content_type: string
+  request_bytes: number
+  response_bytes: number
   status_code: number
   streaming: boolean
   api_type?: string

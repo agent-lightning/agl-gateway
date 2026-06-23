@@ -213,9 +213,11 @@ hardcoded number, so there is no constant to keep in sync.
 - **New model price:** config only — add to `pricing:`.
 - **Schema change:** add the column to the SQLite `CREATE TABLE` *and* an `ensureColumn` call
   in `store_sqlite.go` so existing databases upgrade in place, **and** add it to the
-  `postgresSchema` DDL in `store_postgres.go` (keep the types in sync — SQLite
-  `INTEGER`/`BLOB`/`REAL` map to PostgreSQL `BIGINT`/`BYTEA`/`DOUBLE PRECISION`); extend
-  `RequestLog`, the `INSERT`, and the `QueryLogs` `SELECT`/scan together.
+  `postgresSchema` DDL *and* the matching `ALTER TABLE … ADD COLUMN IF NOT EXISTS` entry in
+  `store_postgres.go` so existing PostgreSQL databases upgrade too (keep the two additive
+  lists in sync, and the types in sync — SQLite `INTEGER`/`BLOB`/`REAL` map to PostgreSQL
+  `BIGINT`/`BYTEA`/`DOUBLE PRECISION`); extend `RequestLog`, the `INSERT`, and the
+  `QueryLogs` `SELECT`/scan together.
 - **New usage shape:** for a *recognized* format, prefer bumping the provider SDK version in
   `internal/capture` (the SDK accumulator/usage types own these shapes). For an *unrecognized*
   endpoint, extend the generic fallback in `internal/usage` (`rawUsage`/`usageEnvelope`/`normalize`).

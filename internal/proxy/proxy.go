@@ -247,6 +247,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 		KeyName:            key.Name,
 		Model:              model,
 		APIType:            format.String(),
+		Method:             r.Method,
+		Path:               r.URL.Path,
+		Query:              r.URL.RawQuery,
+		ClientAddr:         r.RemoteAddr,
+		UserAgent:          r.UserAgent(),
+		RequestBytes:       int64(len(body)),
 		RequestContentType: strings.TrimSpace(r.Header.Get("Content-Type")),
 	}
 	if p.cfg.PayloadCapture.Enabled {
@@ -378,7 +384,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	if payloads != nil {
 		payloadWriter = payloads
 	}
-	ttft, gotByte, head := streamBody(w, resp.Body, meter, start, captureLimit, payloadWriter)
+	ttft, gotByte, respBytes, head := streamBody(w, resp.Body, meter, start, captureLimit, payloadWriter)
 
 	var u pricing.Usage
 	if capAcc != nil {
@@ -395,6 +401,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 
 	logRow.StatusCode = resp.StatusCode
 	logRow.ResponseContentType = strings.TrimSpace(resp.Header.Get("Content-Type"))
+	logRow.ResponseBytes = respBytes
 	logRow.Streaming = streaming
 	if isErr {
 		msg := fmt.Sprintf("upstream provider %q returned HTTP %d after %d attempt(s)",
@@ -502,22 +509,23 @@ func payloadLimit(limit int) int {
 }
 
 // streamBody copies upstream->client, flushing each chunk (for SSE liveness), tees bytes
-// into the usage accumulator, and reports time-to-first-byte measured from reqStart. When
-// captureLimit > 0 it also returns up to that many leading bytes of the body (used to log
-// the upstream's error payload).
-func streamBody(w http.ResponseWriter, body io.Reader, acc io.Writer, reqStart time.Time, captureLimit int, payloads io.Writer) (ttft time.Duration, gotByte bool, head []byte) {
+// into the usage accumulator, and reports time-to-first-byte measured from reqStart and the
+// total number of body bytes read from upstream. When captureLimit > 0 it also returns up to
+// that many leading bytes of the body (used to log the upstream's error payload).
+func streamBody(w http.ResponseWriter, body io.Reader, acc io.Writer, reqStart time.Time, captureLimit int, payloads io.Writer) (ttft time.Duration, gotByte bool, written int64, head []byte) {
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := body.Read(buf)
 		if n > 0 {
+			written += int64(n)
 			if !gotByte {
 				ttft = time.Since(reqStart)
 				gotByte = true
 			}
 			chunk := buf[:n]
 			if _, werr := w.Write(chunk); werr != nil {
-				return ttft, gotByte, head
+				return ttft, gotByte, written, head
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -535,7 +543,7 @@ func streamBody(w http.ResponseWriter, body io.Reader, acc io.Writer, reqStart t
 			}
 		}
 		if err != nil {
-			return ttft, gotByte, head
+			return ttft, gotByte, written, head
 		}
 	}
 }

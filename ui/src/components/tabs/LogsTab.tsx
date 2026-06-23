@@ -162,6 +162,7 @@ export function LogsTab() {
                 <TableHead>Provider</TableHead>
                 <TableHead>Model</TableHead>
                 <TableHead>API</TableHead>
+                <TableHead>Path</TableHead>
                 <TableHead className="text-center">Status</TableHead>
                 <TableHead className="text-right">Tries</TableHead>
                 <TableHead className="text-right">TTFT</TableHead>
@@ -176,7 +177,7 @@ export function LogsTab() {
               {loading ? (
                 Array.from({ length: 8 }).map((_, i) => (
                   <TableRow key={i}>
-                    <TableCell colSpan={13} className="px-4">
+                    <TableCell colSpan={14} className="px-4">
                       <Skeleton className="h-6 w-full" />
                     </TableCell>
                   </TableRow>
@@ -184,7 +185,7 @@ export function LogsTab() {
               ) : logs.length === 0 ? (
                 <TableRow>
                   <TableCell
-                    colSpan={13}
+                    colSpan={14}
                     className="text-muted-foreground py-12 text-center"
                   >
                     No requests logged for this filter.
@@ -218,6 +219,22 @@ export function LogsTab() {
                     </TableCell>
                     <TableCell className="text-muted-foreground text-xs">
                       {l.api_type || '—'}
+                    </TableCell>
+                    <TableCell
+                      className="text-muted-foreground max-w-[200px] truncate font-mono text-xs"
+                      title={`${l.method} ${l.path}${l.query ? `?${l.query}` : ''}`}
+                    >
+                      {l.path ? (
+                        <>
+                          <span className="text-foreground/60">{l.method} </span>
+                          {l.path}
+                          {l.query && (
+                            <span className="opacity-60">?{l.query}</span>
+                          )}
+                        </>
+                      ) : (
+                        '—'
+                      )}
                     </TableCell>
                     <TableCell className="text-center">
                       <span className="inline-flex items-center gap-1">
