@@ -123,12 +123,14 @@ rebuild it whenever the UI source changes:
 npm --prefix ui ci          # first time / lockfile change
 npm --prefix ui run build   # emits internal/portal/dist, then re-anchors the .gitkeep
 npm --prefix ui run dev      # hot-reload dev server (proxy /admin and /healthz to a gateway)
+npm --prefix ui run lint     # ESLint (zero warnings enforced)
+npm --prefix ui test         # Vitest unit/component tests (jsdom + Testing Library)
 ```
 
-CI and the Docker image build the UI automatically before the Go build, so a fresh checkout
-needs no manual step to ship. A bare `go build`/`go test` without a prior UI build still works
-— `go:embed` falls back to the committed `.gitkeep` anchor and the portal serves a
-"not built" placeholder; the portal tests skip rather than fail.
+CI lints, tests, and builds the UI before the Go steps, and the Docker image builds it before
+the Go build, so a fresh checkout needs no manual step to ship. A bare `go build`/`go test`
+without a prior UI build still works — `go:embed` falls back to the committed `.gitkeep` anchor
+and the portal serves a "not built" placeholder; the portal tests skip rather than fail.
 
 The `internal/store` tests run against in-memory SQLite by default. To also exercise the
 PostgreSQL backend, point `AGL_DATABASE` at a throwaway database (the same env var the

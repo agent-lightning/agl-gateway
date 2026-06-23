@@ -55,6 +55,20 @@ cp config.example.yaml config.yaml
 docker compose up -d
 ```
 
+### From source
+
+The container image builds the web portal for you. When building from source, compile the
+portal UI first — it is embedded into the binary and is **not** committed, so a fresh checkout
+has no portal until you build it (see [Development](#development)):
+
+```sh
+npm --prefix ui ci && npm --prefix ui run build   # emits the embedded portal assets
+go run ./cmd/gateway -config config.yaml          # or: go build -o gateway ./cmd/gateway
+```
+
+Without that step the gateway still runs, but `/portal` serves a "portal not built"
+placeholder.
+
 Create a key (master key required), then use it like any OpenAI/Anthropic base URL:
 
 ```sh
@@ -78,7 +92,8 @@ curl localhost:8080/v1/chat/completions \
 ```
 
 Open the portal at <http://localhost:8080/portal> and paste the master key to manage keys
-and browse logs, stats, and the model test.
+and browse logs, stats, and the model test. (When running from source, build the UI first —
+see [From source](#from-source).)
 
 ## Configuration
 
@@ -203,3 +218,38 @@ the request logs they produced — so a test run leaves no lasting entries.
 - The portal keeps the master key in the browser's `localStorage` only; it is sent solely to
   this gateway's `/admin` endpoints. Serve the gateway over TLS in production (e.g. behind a
   reverse proxy).
+
+## Development
+
+### Build the gateway
+
+```sh
+go build -o gateway ./cmd/gateway
+go test ./...          # all Go packages have tests
+```
+
+### Build the web portal
+
+The portal is a Vite + React + TypeScript + Tailwind/shadcn app under [`/ui`](ui/). Its
+production build is emitted to `internal/portal/dist` and embedded into the gateway binary via
+`go:embed`. The build output is **not** committed, so rebuild it whenever the UI changes:
+
+```sh
+npm --prefix ui ci          # install dependencies (first time / lockfile change)
+npm --prefix ui run build   # emit internal/portal/dist, embedded by the Go build
+```
+
+Then build the gateway as above and the portal is served at `/portal`.
+
+Other UI scripts:
+
+```sh
+npm --prefix ui run dev     # hot-reload dev server (point /admin + /healthz at a gateway)
+npm --prefix ui run lint    # ESLint
+npm --prefix ui test        # Vitest unit/component tests
+```
+
+A bare `go build` / `go test` without first building the UI still works — the embed falls back
+to a committed anchor and the portal serves a "not built" placeholder. CI and the Docker image
+build the UI automatically, so released binaries and images always ship the compiled portal.
+

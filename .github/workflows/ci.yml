@@ -21,11 +21,21 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
+      - name: Install UI deps
+        working-directory: ui
+        run: npm ci
+
+      - name: Lint UI
+        working-directory: ui
+        run: npm run lint
+
+      - name: Test UI
+        working-directory: ui
+        run: npm run test
+
       - name: Build portal UI
         working-directory: ui
-        run: |
-          npm ci
-          npm run build
+        run: npm run build
 
       - name: Set up Go
         uses: actions/setup-go@v6
