@@ -1,10 +1,20 @@
-# Example Docker Compose for agl-gateway.
+# Production-ready Docker Compose for agl-gateway: the gateway plus its PostgreSQL (api_keys +
+# request_logs metadata) and ClickHouse (request_logs, including captured payloads) backends.
 #
-#   1. cp config.example.yaml config.yaml   # then edit master_key, providers, pricing
-#   2. docker compose up -d
-#   3. open http://localhost:26016/portal
+#   1. cp config.example.yaml config.yaml   # then edit providers + pricing (leave database/
+#                                           #   logs_database as-is; the env vars below override)
+#   2. export AGL_MASTER_KEY=$(openssl rand -hex 32)   # and the DB passwords if you like
+#   3. docker compose up -d
+#   4. open http://localhost:26016/portal   # log in with AGL_MASTER_KEY
 #
-# config.yaml is mounted read-only; the SQLite database persists in the named volume.
+# config.yaml is mounted read-only. The gateway reads its database/logs_database and master key
+# from the environment (AGL_DATABASE / AGL_LOGS_DATABASE / AGL_MASTER_KEY override config.yaml),
+# so no secrets live in the mounted file. Database data persists in named volumes.
+#
+# Override the defaults below from your shell or a .env file:
+#   AGL_MASTER_KEY      (required in production — the placeholder default is insecure)
+#   POSTGRES_PASSWORD   default "agl"
+#   CLICKHOUSE_PASSWORD default "agl"
 
 services:
   gateway:
@@ -16,8 +26,52 @@ services:
       - "26016:8080"
     volumes:
       - ./config.yaml:/data/config.yaml:ro
-      - agl-data:/data
+    environment:
+      AGL_MASTER_KEY: "${AGL_MASTER_KEY:-mk-change-me-to-a-long-random-secret}"
+      AGL_DATABASE: "postgres://agl:${POSTGRES_PASSWORD:-agl}@postgres:5432/agl_gateway?sslmode=disable"
+      AGL_LOGS_DATABASE: "clickhouse://agl:${CLICKHOUSE_PASSWORD:-agl}@clickhouse:9000/agl_gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: agl
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-agl}"
+      POSTGRES_DB: agl_gateway
+    volumes:
+      # postgres:18 stores data one level down (/var/lib/postgresql/<major>); mount the parent.
+      - agl-postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agl -d agl_gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse:lts
+    environment:
+      CLICKHOUSE_USER: agl
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-agl}"
+      CLICKHOUSE_DB: agl_gateway
+    volumes:
+      - agl-clickhouse:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "agl", "--password", "${CLICKHOUSE_PASSWORD:-agl}", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     restart: unless-stopped
 
 volumes:
-  agl-data:
+  agl-postgres:
+  agl-clickhouse:
