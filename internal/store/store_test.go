@@ -9,60 +9,137 @@ import (
 	"time"
 )
 
-// eachBackend runs fn against an in-memory SQLite store and, when AGL_DATABASE points at a
-// PostgreSQL DSN, also against that store. AGL_DATABASE is the same official override the
-// gateway honors (see config.DatabaseEnv), so the tests exercise PostgreSQL exactly as a
-// real deployment would select it. The portable tests below assert only on relative ids and
-// counts, so both backends must satisfy them identically. Each PostgreSQL run starts from a
-// TRUNCATE ... RESTART IDENTITY so BIGSERIAL ids restart at 1, matching SQLite's fresh
-// in-memory AUTOINCREMENT.
+// eachBackend runs fn against every supported store backend combination available in the
+// environment. SQLite (in-memory) always runs. When AGL_DATABASE is a PostgreSQL DSN the
+// PostgreSQL keys backend is added, and when AGL_CLICKHOUSE is a ClickHouse DSN the ClickHouse
+// request_logs backend is added — yielding up to four combinations:
+//
+//	sqlite               — keys + logs in in-memory SQLite
+//	postgres             — keys + logs in PostgreSQL
+//	sqlite+clickhouse    — keys in SQLite, logs in ClickHouse
+//	postgres+clickhouse  — keys in PostgreSQL, logs in ClickHouse
+//
+// AGL_DATABASE/AGL_CLICKHOUSE are the same overrides the gateway honors at runtime, so the
+// tests select backends exactly as a real deployment would. The portable cases below assert
+// only on relative ids and counts, so every combination must satisfy them identically; each
+// run starts from a clean slate (TRUNCATE … RESTART IDENTITY on PostgreSQL so BIGSERIAL ids
+// restart at 1, matching SQLite's fresh in-memory AUTOINCREMENT; TRUNCATE on ClickHouse).
 func eachBackend(t *testing.T, fn func(t *testing.T, s *Store)) {
 	t.Helper()
-	t.Run("sqlite", func(t *testing.T) {
-		s, err := Open(":memory:")
-		if err != nil {
-			t.Fatalf("Open sqlite: %v", err)
+
+	pgDSN := os.Getenv("AGL_DATABASE")
+	if !strings.HasPrefix(pgDSN, "postgres://") && !strings.HasPrefix(pgDSN, "postgresql://") {
+		if pgDSN != "" {
+			t.Logf("AGL_DATABASE=%q is not a postgres DSN; skipping postgres backends", pgDSN)
+		} else {
+			t.Log("AGL_DATABASE is unset; skipping postgres backends")
 		}
-		t.Cleanup(func() { s.Close() })
-		fn(t, s)
-	})
-	dsn := os.Getenv("AGL_DATABASE")
-	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
-		t.Run("postgres", func(t *testing.T) {
-			s, err := Open(dsn)
+		pgDSN = ""
+	}
+	chDSN := os.Getenv("AGL_CLICKHOUSE")
+	if !strings.HasPrefix(chDSN, "clickhouse://") && !strings.HasPrefix(chDSN, "clickhouses://") {
+		if chDSN != "" {
+			t.Logf("AGL_CLICKHOUSE=%q is not a clickhouse DSN; skipping clickhouse backends", chDSN)
+		} else {
+			t.Log("AGL_CLICKHOUSE is unset; skipping clickhouse backends")
+		}
+		chDSN = ""
+	}
+
+	run := func(name, database, logsDatabase string) {
+		t.Run(name, func(t *testing.T) {
+			s, err := OpenWithLogs(database, logsDatabase)
 			if err != nil {
-				t.Fatalf("Open postgres: %v", err)
+				t.Fatalf("OpenWithLogs(%q, %q): %v", database, logsDatabase, err)
 			}
 			t.Cleanup(func() { s.Close() })
-			if _, err := s.db.Exec(`TRUNCATE request_logs, api_keys RESTART IDENTITY`); err != nil {
-				t.Fatalf("truncate: %v", err)
+			// Clean the keys/logs tables so the relative-count assertions start from empty. The
+			// keys backend (s.db) is PostgreSQL only when database is a postgres DSN; the logs
+			// backend (s.logs) is ClickHouse when logsDatabase is set.
+			if strings.HasPrefix(database, "postgres://") || strings.HasPrefix(database, "postgresql://") {
+				if _, err := s.db.Exec(`TRUNCATE request_logs, api_keys RESTART IDENTITY`); err != nil {
+					t.Fatalf("truncate postgres: %v", err)
+				}
+			}
+			if s.logs != nil {
+				if _, err := s.logs.db.Exec(`TRUNCATE TABLE IF EXISTS request_logs`); err != nil {
+					t.Fatalf("truncate clickhouse: %v", err)
+				}
 			}
 			fn(t, s)
 		})
-	} else {
-		t.Log("AGL_DATABASE is not a postgres DSN; skipping postgres backend")
 	}
 
-	// When AGL_CLICKHOUSE points at a ClickHouse DSN, also run the hybrid backend: api_keys in
-	// an in-memory SQLite (the keys store), request_logs in ClickHouse. This exercises the
-	// separate-logs routing (InsertLog/QueryLogs/Stats) and the best-effort cascade in
-	// DeleteKey. request_logs is truncated first so the relative-count assertions hold.
-	chDSN := os.Getenv("AGL_CLICKHOUSE")
-	if !strings.HasPrefix(chDSN, "clickhouse://") && !strings.HasPrefix(chDSN, "clickhouses://") {
-		t.Log("AGL_CLICKHOUSE is not a clickhouse DSN; skipping clickhouse logs backend")
-		return
+	run("sqlite", ":memory:", "")
+	if pgDSN != "" {
+		run("postgres", pgDSN, "")
 	}
-	t.Run("clickhouse", func(t *testing.T) {
-		s, err := OpenWithLogs(":memory:", chDSN)
+	if chDSN != "" {
+		run("sqlite+clickhouse", ":memory:", chDSN)
+	}
+	if pgDSN != "" && chDSN != "" {
+		run("postgres+clickhouse", pgDSN, chDSN)
+	}
+}
+
+// TestLogsBackendSelectable confirms logs_database may be set explicitly to SQLite or
+// PostgreSQL — not only ClickHouse. OpenWithLogs routes request_logs to whatever backend the
+// primary accepts (here keys live in in-memory SQLite, logs in a separate backend), so a log
+// written through the Store lands in, and reads back from, that separate logs backend. The
+// PostgreSQL case runs only when AGL_DATABASE points at one.
+func TestLogsBackendSelectable(t *testing.T) {
+	const sentinel = 778899 // a distinctive api_key_id so a shared logs table isn't ambiguous
+	check := func(t *testing.T, logsDatabase string) {
+		s, err := OpenWithLogs(":memory:", logsDatabase)
 		if err != nil {
-			t.Fatalf("OpenWithLogs clickhouse: %v", err)
+			t.Fatalf("OpenWithLogs(\":memory:\", %q): %v", logsDatabase, err)
 		}
 		t.Cleanup(func() { s.Close() })
-		if _, err := s.logs.db.Exec(`TRUNCATE TABLE IF EXISTS request_logs`); err != nil {
-			t.Fatalf("truncate: %v", err)
+		if s.logs == nil {
+			t.Fatal("expected a separate logs backend to be attached")
 		}
-		fn(t, s)
+		// A shared logs backend (PostgreSQL) persists across runs, so clear any sentinel rows a
+		// prior run left before asserting an exact count.
+		if err := s.logs.d.deleteLogsByKey(s.logs.db, sentinel); err != nil {
+			t.Fatalf("clear logs: %v", err)
+		}
+		if err := s.InsertLog(&RequestLog{APIKeyID: sentinel, KeyName: "dev", Provider: "openai", Model: "m", StatusCode: 200}); err != nil {
+			t.Fatalf("InsertLog: %v", err)
+		}
+		logs, err := s.QueryLogs(LogFilter{APIKeyID: sentinel})
+		if err != nil {
+			t.Fatalf("QueryLogs: %v", err)
+		}
+		if len(logs) != 1 || logs[0].Provider != "openai" {
+			t.Fatalf("logs = %+v, want one openai row", logs)
+		}
+	}
+
+	t.Run("sqlite", func(t *testing.T) {
+		check(t, filepath.Join(t.TempDir(), "logs.db"))
 	})
+
+	pg := os.Getenv("AGL_DATABASE")
+	if strings.HasPrefix(pg, "postgres://") || strings.HasPrefix(pg, "postgresql://") {
+		t.Run("postgres", func(t *testing.T) { check(t, pg) })
+	}
+}
+
+// TestClickHouseRejectedAsPrimary asserts the store refuses ClickHouse as the keys backend —
+// it has no auto-increment, no enforced UNIQUE, and only async mutations, so it cannot own
+// api_keys. ClickHouse is only valid as a logs backend (logs_database / the second arg to
+// OpenWithLogs). The rejection is a URL-prefix check, so this needs no running server.
+func TestClickHouseRejectedAsPrimary(t *testing.T) {
+	const ch = "clickhouse://localhost:9000/db"
+	if _, err := Open(ch); err == nil {
+		t.Error("Open(clickhouse://) should be rejected as a keys backend")
+	}
+	if _, err := OpenWithLogs(ch, ""); err == nil {
+		t.Error("OpenWithLogs with a clickhouse primary should be rejected")
+	}
+	if _, err := OpenWithLogs(ch, "clickhouse://localhost:9000/logs"); err == nil {
+		t.Error("OpenWithLogs with a clickhouse primary should be rejected even with a logs DSN")
+	}
 }
 
 // TestIDGenMonotonic asserts the ClickHouse client-side id generator yields strictly

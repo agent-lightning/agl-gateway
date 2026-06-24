@@ -59,5 +59,19 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test (race + coverage)
+      # Bring up the ephemeral Postgres + ClickHouse so the single test run below exercises
+      # every store backend combination — sqlite, postgres, sqlite+clickhouse,
+      # postgres+clickhouse (see internal/store eachBackend) — selected by the two env vars.
+      # TestClickHouseRejectedAsPrimary asserts the unsupported combination is rejected.
+      - name: Start PostgreSQL + ClickHouse
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Test (race + coverage, all store backends)
+        env:
+          AGL_DATABASE: postgres://postgres:pw@localhost:65432/postgres?sslmode=disable
+          AGL_CLICKHOUSE: clickhouse://default:@localhost:59000/default
         run: go test -race -count=1 -coverprofile=coverage.out ./...
+
+      - name: Stop services
+        if: always()
+        run: docker compose -f docker-compose.test.yml down

@@ -141,24 +141,28 @@ the Go build, so a fresh checkout needs no manual step to ship. A bare `go build
 without a prior UI build still works — `go:embed` falls back to the committed `.gitkeep` anchor
 and the portal serves a "not built" placeholder; the portal tests skip rather than fail.
 
-The `internal/store` tests run against in-memory SQLite by default. To also exercise the
-PostgreSQL backend, point `AGL_DATABASE` at a throwaway database (the same env var the
-gateway honors at runtime); the store tests then run every portable case against both
-backends, and skip PostgreSQL when it is unset:
+The `internal/store` tests run against in-memory SQLite by default and select additional
+backends from two env vars — the same overrides the gateway honors at runtime: `AGL_DATABASE`
+(a `postgres://` DSN) adds the PostgreSQL keys backend, and `AGL_CLICKHOUSE` (a `clickhouse://`
+DSN) adds the ClickHouse `request_logs` backend. With both set, a single run fans out into one
+subtest per supported combination — `sqlite`, `postgres`, `sqlite+clickhouse`,
+`postgres+clickhouse` (see `eachBackend`) — and `TestClickHouseRejectedAsPrimary` asserts the
+unsupported combination (ClickHouse as the primary keys backend) is rejected. Each backend is
+skipped when its env var is unset.
+
+[`docker-compose.test.yml`](docker-compose.test.yml) brings up a throwaway PostgreSQL 18 +
+ClickHouse (uncommon ports, no volumes). Start it, then run the store tests against both:
 
 ```sh
-docker run -d -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:18-alpine
-AGL_DATABASE='postgres://postgres:pw@localhost:5432/postgres?sslmode=disable' go test ./internal/store/...
+docker compose -f docker-compose.test.yml up -d --wait
+AGL_DATABASE='postgres://postgres:pw@localhost:65432/postgres?sslmode=disable' \
+AGL_CLICKHOUSE='clickhouse://default:@localhost:59000/default' \
+  go test ./internal/store/...
+docker compose -f docker-compose.test.yml down
 ```
 
-To exercise the ClickHouse logs backend, point `AGL_CLICKHOUSE` at a throwaway ClickHouse. The
-store tests then add a `clickhouse` sub-run (SQLite keys + ClickHouse `request_logs`, built via
-`OpenWithLogs`) to every portable log case, and skip it when unset:
-
-```sh
-docker run -d -p 9000:9000 -p 8123:8123 clickhouse/clickhouse-server
-AGL_CLICKHOUSE='clickhouse://default:@localhost:9000/default' go test ./internal/store/...
-```
+CI runs exactly this as part of the `test` job (`.github/workflows/ci.yml`): it brings the
+stack up, runs the whole suite with both env vars set, and tears it down.
 
 Build the binaries from source:
 
