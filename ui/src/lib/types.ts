@@ -18,7 +18,9 @@ export interface CreatedKey extends APIKey {
 }
 
 export interface RequestLog {
-  id: number
+  // Serialized by the gateway as a string: ClickHouse log ids exceed JS's safe-integer range
+  // and would round if parsed as a number.
+  id: string
   api_key_id: number
   key_name: string
   provider: string

@@ -36,7 +36,11 @@ type APIKey struct {
 
 // RequestLog is the recorded metadata for a single proxied request.
 type RequestLog struct {
-	ID       int64 `json:"id"`
+	// ID is serialized as a JSON string: the ClickHouse backend mints client-side ids of
+	// time.Now().UnixMilli()<<20 (~1e18), which overflow a JSON number's exact range in
+	// JavaScript (Number.MAX_SAFE_INTEGER ≈ 9e15) and would round, so the portal could no
+	// longer fetch a log by its id. A string round-trips the int64 losslessly.
+	ID       int64 `json:"id,string"`
 	APIKeyID int64 `json:"api_key_id"`
 	// KeyName is the owning key's name captured at log-creation time — a snapshot, not a live
 	// reference. The key may later be renamed or deleted (a key with keep_logs_on_delete set

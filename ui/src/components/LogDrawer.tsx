@@ -31,7 +31,7 @@ import { CopyButton } from '@/components/CopyButton'
 import { cn } from '@/lib/utils'
 
 interface Props {
-  logId: number | null
+  logId: string | null
   /** Row data already loaded in the table; shown immediately while payloads load. */
   preview: RequestLog | null
   open: boolean

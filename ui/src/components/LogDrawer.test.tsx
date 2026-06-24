@@ -15,7 +15,7 @@ const longLine = 'the quick brown fox '.repeat(80)
 
 function makeLog(): RequestLog {
   return {
-    id: 7,
+    id: '7',
     api_key_id: 1,
     key_name: 'app',
     provider: 'mock',
@@ -53,7 +53,7 @@ function renderDrawer() {
   const auth = { masterKey: 'mk', connect: vi.fn(), forget: vi.fn() }
   return render(
     <AuthContext.Provider value={auth}>
-      <LogDrawer logId={7} preview={makeLog()} open onClose={vi.fn()} />
+      <LogDrawer logId="7" preview={makeLog()} open onClose={vi.fn()} />
     </AuthContext.Provider>,
   )
 }
