@@ -3,6 +3,10 @@
 
 server:
   addr: ":8080"
+  # Maximum proxied request body the gateway will buffer in memory (it is held so it can be
+  # replayed across provider failover). Over-limit requests are rejected with 413 before any
+  # upstream call. 0 applies the 100 MiB default; a negative value disables the limit.
+  max_request_bytes: 104857600
 
 # The single master key authenticates the /admin API and the web portal.
 # Generate something long and random, e.g. `openssl rand -hex 32`.
