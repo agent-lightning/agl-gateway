@@ -27,21 +27,58 @@ func eachBackend(t *testing.T, fn func(t *testing.T, s *Store)) {
 		fn(t, s)
 	})
 	dsn := os.Getenv("AGL_DATABASE")
-	if !strings.HasPrefix(dsn, "postgres://") && !strings.HasPrefix(dsn, "postgresql://") {
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		t.Run("postgres", func(t *testing.T) {
+			s, err := Open(dsn)
+			if err != nil {
+				t.Fatalf("Open postgres: %v", err)
+			}
+			t.Cleanup(func() { s.Close() })
+			if _, err := s.db.Exec(`TRUNCATE request_logs, api_keys RESTART IDENTITY`); err != nil {
+				t.Fatalf("truncate: %v", err)
+			}
+			fn(t, s)
+		})
+	} else {
 		t.Log("AGL_DATABASE is not a postgres DSN; skipping postgres backend")
+	}
+
+	// When AGL_CLICKHOUSE points at a ClickHouse DSN, also run the hybrid backend: api_keys in
+	// an in-memory SQLite (the keys store), request_logs in ClickHouse. This exercises the
+	// separate-logs routing (InsertLog/QueryLogs/Stats) and the best-effort cascade in
+	// DeleteKey. request_logs is truncated first so the relative-count assertions hold.
+	chDSN := os.Getenv("AGL_CLICKHOUSE")
+	if !strings.HasPrefix(chDSN, "clickhouse://") && !strings.HasPrefix(chDSN, "clickhouses://") {
+		t.Log("AGL_CLICKHOUSE is not a clickhouse DSN; skipping clickhouse logs backend")
 		return
 	}
-	t.Run("postgres", func(t *testing.T) {
-		s, err := Open(dsn)
+	t.Run("clickhouse", func(t *testing.T) {
+		s, err := OpenWithLogs(":memory:", chDSN)
 		if err != nil {
-			t.Fatalf("Open postgres: %v", err)
+			t.Fatalf("OpenWithLogs clickhouse: %v", err)
 		}
 		t.Cleanup(func() { s.Close() })
-		if _, err := s.db.Exec(`TRUNCATE request_logs, api_keys RESTART IDENTITY`); err != nil {
+		if _, err := s.logs.db.Exec(`TRUNCATE TABLE IF EXISTS request_logs`); err != nil {
 			t.Fatalf("truncate: %v", err)
 		}
 		fn(t, s)
 	})
+}
+
+// TestIDGenMonotonic asserts the ClickHouse client-side id generator yields strictly
+// increasing ids — including when the clock does not advance between calls (the tight loop
+// far outpaces the millisecond tick, so the counter-bump branch dominates). This is what
+// keeps request_logs ORDER BY id DESC newest-first on a backend without auto-increment.
+func TestIDGenMonotonic(t *testing.T) {
+	g := &idGen{}
+	prev := int64(0)
+	for i := 0; i < 100_000; i++ {
+		id := g.next()
+		if id <= prev {
+			t.Fatalf("id not strictly increasing at %d: got %d after %d", i, id, prev)
+		}
+		prev = id
+	}
 }
 
 func TestDeleteKeyCascadesLogs(t *testing.T) {

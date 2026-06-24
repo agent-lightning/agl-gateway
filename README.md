@@ -33,7 +33,9 @@ transparently.
   request and aggregate stats.
 - **Web portal** for managing keys and inspecting logs, stats, and a live model test.
 - **Self-contained.** A single static binary with an embedded SQLite database — no cgo, no
-  external services to run alongside it.
+  external services to run alongside it. Scales out when needed: point `database` at PostgreSQL,
+  and/or send high-volume `request_logs` to ClickHouse via `logs_database` (keys stay in
+  SQLite/PostgreSQL).
 
 ## Quick start
 
@@ -115,6 +117,8 @@ See [`config.example.yaml`](config.example.yaml) for a fully commented example. 
 server: { addr: ":8080" }
 master_key: "mk-…"            # authenticates /admin and the portal
 database: "./gateway.db"      # SQLite path, or a postgres:// URL (override via AGL_DATABASE)
+logs_database: ""             # optional: send request_logs to a separate backend, e.g.
+                              # clickhouse://user:pass@host:9000/db (override via AGL_LOGS_DATABASE)
 defaults:
   retry: { max_retries: 3, base_delay: 200ms, max_delay: 10s }
 payload_capture:

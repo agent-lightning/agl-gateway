@@ -23,6 +23,15 @@ func (sqliteDialect) afterDeleteKey(db *sql.DB) error {
 	return err
 }
 
+// genLogID returns 0: SQLite assigns request_logs ids via AUTOINCREMENT.
+func (sqliteDialect) genLogID() int64 { return 0 }
+
+// deleteLogsByKey removes a key's logs; used only when SQLite is a standalone logs backend.
+func (d sqliteDialect) deleteLogsByKey(db *sql.DB, apiKeyID int64) error {
+	_, err := db.Exec(d.rebind(`DELETE FROM request_logs WHERE api_key_id = ?`), apiKeyID)
+	return err
+}
+
 // openSQLite opens (creating if needed) the SQLite database at path and applies the schema.
 // An empty path or ":memory:" yields an in-memory database (useful for tests).
 func openSQLite(path string) (*Store, error) {

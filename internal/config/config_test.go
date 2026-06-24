@@ -65,6 +65,36 @@ func TestDatabaseEnvOverride(t *testing.T) {
 	}
 }
 
+func TestLogsDatabaseEnvOverride(t *testing.T) {
+	const dsn = "clickhouse://u:p@localhost:9000/db"
+	t.Setenv(LogsDatabaseEnv, dsn)
+	// Env overrides whatever the YAML specifies.
+	c, err := Parse([]byte(minimalYAML + "\nlogs_database: ./yaml-logs.db\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.LogsDatabase != dsn {
+		t.Errorf("env override = %q, want %q", c.LogsDatabase, dsn)
+	}
+	// Unset env leaves logs_database empty by default (logs co-located with keys).
+	t.Setenv(LogsDatabaseEnv, "")
+	c, err = Parse([]byte(minimalYAML))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.LogsDatabase != "" {
+		t.Errorf("default logs_database = %q, want empty", c.LogsDatabase)
+	}
+}
+
+func TestClickHousePrimaryRejected(t *testing.T) {
+	t.Setenv(DatabaseEnv, "")
+	_, err := Parse([]byte(minimalYAML + "\ndatabase: clickhouse://u:p@localhost:9000/db\n"))
+	if err == nil {
+		t.Fatal("expected error for ClickHouse as the primary database")
+	}
+}
+
 func TestParseDurations(t *testing.T) {
 	y := minimalYAML + `
 defaults:

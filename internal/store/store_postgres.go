@@ -38,6 +38,15 @@ func (postgresDialect) sumInt(col string) string { return "(SUM(" + col + "))::b
 // afterDeleteKey is a no-op: PostgreSQL reclaims space via autovacuum.
 func (postgresDialect) afterDeleteKey(db *sql.DB) error { return nil }
 
+// genLogID returns 0: PostgreSQL assigns request_logs ids via BIGSERIAL.
+func (postgresDialect) genLogID() int64 { return 0 }
+
+// deleteLogsByKey removes a key's logs; used only when PostgreSQL is a standalone logs backend.
+func (d postgresDialect) deleteLogsByKey(db *sql.DB, apiKeyID int64) error {
+	_, err := db.Exec(d.rebind(`DELETE FROM request_logs WHERE api_key_id = ?`), apiKeyID)
+	return err
+}
+
 // openPostgres connects to PostgreSQL using the given DSN (a postgres:// or postgresql://
 // URL, or a keyword/value string) and applies the schema.
 func openPostgres(dsn string) (*Store, error) {

@@ -49,7 +49,7 @@ func run(configPath string, logger *slog.Logger) error {
 		return err
 	}
 
-	st, err := store.Open(cfg.Database)
+	st, err := store.OpenWithLogs(cfg.Database, cfg.LogsDatabase)
 	if err != nil {
 		return err
 	}
@@ -72,7 +72,8 @@ func run(configPath string, logger *slog.Logger) error {
 	go func() {
 		logger.Info("agl-gateway listening",
 			"version", version.Version,
-			"addr", cfg.Server.Addr, "providers", len(cfg.Providers), "database", redactDatabase(cfg.Database))
+			"addr", cfg.Server.Addr, "providers", len(cfg.Providers), "database", redactDatabase(cfg.Database),
+			"logs_database", redactDatabase(cfg.LogsDatabase))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -92,14 +93,15 @@ func run(configPath string, logger *slog.Logger) error {
 	}
 }
 
-// redactDatabase masks any password in a postgres:// DSN so it is safe to log. A SQLite
-// file path (no userinfo) is returned unchanged.
+// redactDatabase masks any password in a postgres:// or clickhouse:// DSN so it is safe to
+// log. A SQLite file path (no userinfo) and an empty string are returned unchanged.
 func redactDatabase(database string) string {
-	if strings.HasPrefix(database, "postgres://") || strings.HasPrefix(database, "postgresql://") {
+	if strings.HasPrefix(database, "postgres://") || strings.HasPrefix(database, "postgresql://") ||
+		strings.HasPrefix(database, "clickhouse://") || strings.HasPrefix(database, "clickhouses://") {
 		if u, err := url.Parse(database); err == nil {
 			return u.Redacted()
 		}
-		return "postgres://[redacted]"
+		return "[redacted]"
 	}
 	return database
 }

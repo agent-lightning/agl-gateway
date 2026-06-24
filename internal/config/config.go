@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -17,7 +18,13 @@ type Config struct {
 	// PostgreSQL; anything else is a SQLite file path (default "./gateway.db"). The
 	// AGL_DATABASE environment variable, when set, overrides this field — convenient for
 	// containers and for keeping a PostgreSQL DSN (with its password) out of the YAML file.
-	Database       string         `yaml:"database"`
+	Database string `yaml:"database"`
+	// LogsDatabase, when set, sends request_logs to a separate backend while api_keys stay in
+	// Database. A clickhouse:// (or clickhouses://) URL selects ClickHouse — an append-only
+	// OLAP store suited to high-volume log analytics; a postgres:// URL or a file path are
+	// also accepted. Empty (the default) keeps logs co-located with keys in Database. The
+	// AGL_LOGS_DATABASE environment variable, when set, overrides this field.
+	LogsDatabase   string         `yaml:"logs_database"`
 	Defaults       Defaults       `yaml:"defaults"`
 	PayloadCapture PayloadCapture `yaml:"payload_capture"`
 	Providers      []Provider     `yaml:"providers"`
@@ -146,9 +153,16 @@ func Parse(data []byte) (*Config, error) {
 // database backend (see Config.Database).
 const DatabaseEnv = "AGL_DATABASE"
 
+// LogsDatabaseEnv is the environment variable that, when set, overrides the configured
+// request_logs backend (see Config.LogsDatabase).
+const LogsDatabaseEnv = "AGL_LOGS_DATABASE"
+
 func (c *Config) applyDefaults() {
 	if v := os.Getenv(DatabaseEnv); v != "" {
 		c.Database = v
+	}
+	if v := os.Getenv(LogsDatabaseEnv); v != "" {
+		c.LogsDatabase = v
 	}
 	if c.Server.Addr == "" {
 		c.Server.Addr = ":8080"
@@ -180,6 +194,9 @@ func (c *Config) applyDefaults() {
 func (c *Config) Validate() error {
 	if c.MasterKey == "" {
 		return fmt.Errorf("config: master_key is required")
+	}
+	if strings.HasPrefix(c.Database, "clickhouse://") || strings.HasPrefix(c.Database, "clickhouses://") {
+		return fmt.Errorf("config: database cannot be ClickHouse (it cannot store api_keys); use SQLite/PostgreSQL for database and set logs_database to the ClickHouse URL")
 	}
 	if len(c.Providers) == 0 {
 		return fmt.Errorf("config: at least one provider is required")

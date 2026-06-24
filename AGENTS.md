@@ -17,7 +17,10 @@ OpenAI-compatible `/v1/models` to list models. The data plane stays endpoint-agn
 - **Minimalistic.** Standard library first. The core dependencies are `gopkg.in/yaml.v3` and
   `modernc.org/sqlite` (pure-Go, no cgo). The store can alternatively be backed by
   **PostgreSQL** via `github.com/jackc/pgx/v5/stdlib` (also pure-Go, no cgo) — selected at
-  runtime by the `database` config value, with no other code path changes. `internal/capture`
+  runtime by the `database` config value, with no other code path changes. Request logs can
+  additionally be routed to **ClickHouse** via `github.com/ClickHouse/clickhouse-go/v2` (pure-Go,
+  no cgo) — selected by the separate `logs_database` config value (api_keys stay in
+  SQLite/PostgreSQL). `internal/capture`
   additionally depends on the official
   provider SDKs — `github.com/openai/openai-go/v3` and `github.com/anthropics/anthropic-sdk-go` —
   for their stream-accumulator and usage types, so response assembly and metering track the real
@@ -48,7 +51,7 @@ Packages:
 |-------------------|----------------|
 | `internal/config` | YAML load, defaults, validation. |
 | `internal/pricing`| Normalized `Usage` → dollar cost. |
-| `internal/store`  | SQLite **or** PostgreSQL persistence for `api_keys`/`request_logs`. Backend chosen by the `database` config value (a `postgres://`/`postgresql://` URL selects PostgreSQL via pgx; anything else is a SQLite file path), overridable by the `AGL_DATABASE` env var. Query logic is shared; a small `dialect` (`store_sqlite.go`/`store_postgres.go`) isolates placeholder rebinding, the `SUM` cast, schema/migrate, and post-delete vacuum. |
+| `internal/store`  | SQLite **or** PostgreSQL persistence for `api_keys`/`request_logs`. Backend chosen by the `database` config value (a `postgres://`/`postgresql://` URL selects PostgreSQL via pgx; anything else is a SQLite file path), overridable by the `AGL_DATABASE` env var. Query logic is shared; a small `dialect` (`store_sqlite.go`/`store_postgres.go`/`store_clickhouse.go`) isolates placeholder rebinding, the `SUM` cast, schema/migrate, post-delete vacuum, client-side log ids, and the log-cascade delete. `request_logs` can be split onto a **separate** backend — notably **ClickHouse** — via the `logs_database` config value (`AGL_LOGS_DATABASE`); `OpenWithLogs` attaches it and `api_keys` stay in the primary SQLite/PostgreSQL store. |
 | `internal/usage`  | Generic best-effort fallback for model + usage extraction on *unrecognized* endpoints (JSON + SSE), plus request-side `RequestModel`/`SetModel`. Recognized formats are metered by `internal/capture`. |
 | `internal/capture`| For recognized API formats (chat/responses/messages), wraps the provider SDK accumulators to derive both the assembled non-streaming response and normalized token usage from one pass; records `api_type` and any `assemble_error`. |
 | `internal/keys`   | Mint + SHA-256-hash gateway keys. |
@@ -92,7 +95,13 @@ Packages:
   synthesized. The attempt count and reason are written to the log.
 - **Deleting a key cascades to its logs** in a transaction. On SQLite it then runs
   `incremental_vacuum` to release space (`auto_vacuum=INCREMENTAL` is set at DB creation); on
-  PostgreSQL the post-delete `afterDeleteKey` hook is a no-op (autovacuum reclaims space).
+  PostgreSQL the post-delete `afterDeleteKey` hook is a no-op (autovacuum reclaims space). When
+  `request_logs` live on a **separate** backend (`logs_database`) a cross-database transaction is
+  impossible, so the cascade is best-effort: the logs are deleted first (an orphaned key is
+  recoverable — it stays listed and can be deleted again — whereas orphaned logs are not), then
+  the key row is deleted on the keys backend. On ClickHouse that delete is a synchronous
+  `ALTER TABLE … DELETE … SETTINGS mutations_sync = 2` (no auto-increment, so log ids are
+  generated client-side as monotonic, time-ordered int64s).
 
 ## Conventions
 
@@ -140,6 +149,15 @@ backends, and skip PostgreSQL when it is unset:
 ```sh
 docker run -d -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:18-alpine
 AGL_DATABASE='postgres://postgres:pw@localhost:5432/postgres?sslmode=disable' go test ./internal/store/...
+```
+
+To exercise the ClickHouse logs backend, point `AGL_CLICKHOUSE` at a throwaway ClickHouse. The
+store tests then add a `clickhouse` sub-run (SQLite keys + ClickHouse `request_logs`, built via
+`OpenWithLogs`) to every portable log case, and skip it when unset:
+
+```sh
+docker run -d -p 9000:9000 -p 8123:8123 clickhouse/clickhouse-server
+AGL_CLICKHOUSE='clickhouse://default:@localhost:9000/default' go test ./internal/store/...
 ```
 
 Build the binaries from source:
@@ -214,10 +232,12 @@ hardcoded number, so there is no constant to keep in sync.
 - **Schema change:** add the column to the SQLite `CREATE TABLE` *and* an `ensureColumn` call
   in `store_sqlite.go` so existing databases upgrade in place, **and** add it to the
   `postgresSchema` DDL *and* the matching `ALTER TABLE … ADD COLUMN IF NOT EXISTS` entry in
-  `store_postgres.go` so existing PostgreSQL databases upgrade too (keep the two additive
-  lists in sync, and the types in sync — SQLite `INTEGER`/`BLOB`/`REAL` map to PostgreSQL
-  `BIGINT`/`BYTEA`/`DOUBLE PRECISION`); extend `RequestLog`, the `INSERT`, and the
-  `QueryLogs` `SELECT`/scan together.
+  `store_postgres.go` so existing PostgreSQL databases upgrade too. For a `request_logs` column,
+  also add it to the ClickHouse `CREATE TABLE` *and* its `ALTER TABLE … ADD COLUMN IF NOT EXISTS`
+  list in `store_clickhouse.go`. Keep the three additive lists in sync, and the types in sync —
+  SQLite `INTEGER`/`BLOB`/`REAL` map to PostgreSQL `BIGINT`/`BYTEA`/`DOUBLE PRECISION` and to
+  ClickHouse `Int64`/`String`/`Float64` (bool-as-int flags are ClickHouse `UInt8`); extend
+  `RequestLog`, the `INSERT`, and the `QueryLogs` `SELECT`/scan together.
 - **New usage shape:** for a *recognized* format, prefer bumping the provider SDK version in
   `internal/capture` (the SDK accumulator/usage types own these shapes). For an *unrecognized*
   endpoint, extend the generic fallback in `internal/usage` (`rawUsage`/`usageEnvelope`/`normalize`).

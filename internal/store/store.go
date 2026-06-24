@@ -1,7 +1,10 @@
-// Package store is the SQLite-or-PostgreSQL persistence layer for API keys and request
-// logs. The backend is chosen at Open time by the database string: a postgres://
-// (or postgresql://) URL selects PostgreSQL, anything else is treated as a SQLite file
-// path. The query logic is shared; a small dialect isolates the few real SQL differences.
+// Package store is the persistence layer for API keys and request logs. The keys backend is
+// chosen at Open time by the database string: a postgres:// (or postgresql://) URL selects
+// PostgreSQL, anything else is treated as a SQLite file path. Request logs default to that
+// same backend, but OpenWithLogs can point them at a separate backend — notably ClickHouse,
+// an append-only OLAP store well suited to high-volume log analytics (the small, mutable
+// api_keys table stays in SQLite/PostgreSQL). The query logic is shared; a small dialect
+// isolates the few real SQL differences.
 package store
 
 import (
@@ -101,40 +104,123 @@ type Stat struct {
 
 // Store wraps the database, delegating the handful of backend-specific SQL details to a
 // dialect. Query bodies are written once with neutral '?' placeholders and rebound per
-// driver.
+// driver. The api_keys table always lives in (db, d); request_logs live there too unless a
+// separate logs backend is attached (see OpenWithLogs), in which case they live in logs.
 type Store struct {
+	db *sql.DB
+	d  dialect
+	// logs is an optional separate backend for request_logs. When nil, logs are co-located
+	// with the keys in (db, d). When set (e.g. ClickHouse), every request_logs read and write
+	// is routed here instead — see logTarget.
+	logs *logsBackend
+}
+
+// logsBackend is a request_logs-only database, distinct from the keys backend.
+type logsBackend struct {
 	db *sql.DB
 	d  dialect
 }
 
-// dialect captures the SQL differences between the SQLite and PostgreSQL backends. The
-// CRUD query bodies and row scanning live in store.go and are shared by both.
+// logTarget returns the (db, dialect) that owns request_logs: the separate logs backend when
+// one is attached, otherwise the keys backend.
+func (s *Store) logTarget() (*sql.DB, dialect) {
+	if s.logs != nil {
+		return s.logs.db, s.logs.d
+	}
+	return s.db, s.d
+}
+
+// dialect captures the SQL differences between the backends. The CRUD query bodies and row
+// scanning live in store.go and are shared by all of them.
 type dialect interface {
 	// rebind rewrites neutral '?' placeholders into the driver's parameter syntax.
-	// SQLite keeps '?'; PostgreSQL rewrites them to $1, $2, … in order.
+	// SQLite/ClickHouse keep '?'; PostgreSQL rewrites them to $1, $2, … in order.
 	rebind(q string) string
 	// sumInt wraps an aggregate over an integer column so the result scans into int64.
-	// SQLite returns SUM(col); PostgreSQL casts because SUM(bigint) is numeric.
+	// SQLite returns SUM(col); PostgreSQL casts because SUM(bigint) is numeric; ClickHouse
+	// casts because sum() widens to a 64-bit unsigned/decimal type.
 	sumInt(col string) string
 	// migrate creates the schema and applies any in-place column upgrades.
 	migrate(db *sql.DB) error
-	// afterDeleteKey reclaims space freed by a cascade delete. No-op on PostgreSQL.
+	// afterDeleteKey reclaims space freed by a cascade delete. No-op on PostgreSQL/ClickHouse.
 	afterDeleteKey(db *sql.DB) error
+	// genLogID returns a client-side id for a new request_logs row, or 0 when the backend
+	// assigns ids itself (SQLite AUTOINCREMENT / PostgreSQL BIGSERIAL). ClickHouse has no
+	// auto-increment, so it returns a monotonic, time-ordered id.
+	genLogID() int64
+	// deleteLogsByKey removes every request_logs row for an api key. Used only when logs live
+	// in a separate backend; the co-located path deletes them inside the key-delete tx.
+	deleteLogsByKey(db *sql.DB, apiKeyID int64) error
 }
 
-// Open opens (creating if needed) the persistence backend and applies the schema. A
+// Open opens (creating if needed) the keys-and-logs backend and applies the schema. A
 // postgres:// or postgresql:// URL selects PostgreSQL; anything else (including an empty
 // string or ":memory:") is a SQLite file path, yielding an in-memory DB when empty or
-// ":memory:" (useful for tests).
+// ":memory:" (useful for tests). A clickhouse:// URL is rejected here — ClickHouse cannot
+// store api_keys and is only valid as a logs backend (see OpenWithLogs).
 func Open(database string) (*Store, error) {
-	if strings.HasPrefix(database, "postgres://") || strings.HasPrefix(database, "postgresql://") {
+	switch {
+	case strings.HasPrefix(database, "clickhouse://") || strings.HasPrefix(database, "clickhouses://"):
+		return nil, fmt.Errorf("store: ClickHouse cannot store api_keys; set database to SQLite/PostgreSQL and use ClickHouse via logs_database")
+	case strings.HasPrefix(database, "postgres://") || strings.HasPrefix(database, "postgresql://"):
 		return openPostgres(database)
+	default:
+		return openSQLite(database)
 	}
-	return openSQLite(database)
 }
 
-// Close closes the underlying database.
-func (s *Store) Close() error { return s.db.Close() }
+// OpenWithLogs opens the keys backend exactly like Open, and — when logsDatabase is non-empty
+// — attaches a separate backend that owns request_logs. logsDatabase is dispatched the same
+// way as Open plus a clickhouse:// (or clickhouses://) prefix selecting ClickHouse. An empty
+// logsDatabase keeps logs co-located with keys, i.e. identical to Open.
+func OpenWithLogs(database, logsDatabase string) (*Store, error) {
+	s, err := Open(database)
+	if err != nil {
+		return nil, err
+	}
+	if logsDatabase == "" {
+		return s, nil
+	}
+	lb, err := openLogsBackend(logsDatabase)
+	if err != nil {
+		s.Close()
+		return nil, err
+	}
+	s.logs = lb
+	return s, nil
+}
+
+// openLogsBackend opens a request_logs-only backend, reusing the keys-backend openers (each
+// returns a *Store whose db+dialect we keep; its empty api_keys table, if any, is unused).
+func openLogsBackend(database string) (*logsBackend, error) {
+	var (
+		s   *Store
+		err error
+	)
+	switch {
+	case strings.HasPrefix(database, "clickhouse://") || strings.HasPrefix(database, "clickhouses://"):
+		s, err = openClickHouse(database)
+	case strings.HasPrefix(database, "postgres://") || strings.HasPrefix(database, "postgresql://"):
+		s, err = openPostgres(database)
+	default:
+		s, err = openSQLite(database)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &logsBackend{db: s.db, d: s.d}, nil
+}
+
+// Close closes the keys backend and, if attached, the separate logs backend.
+func (s *Store) Close() error {
+	err := s.db.Close()
+	if s.logs != nil {
+		if e := s.logs.db.Close(); e != nil && err == nil {
+			err = e
+		}
+	}
+	return err
+}
 
 // CreateKey inserts a new API key and returns the stored row.
 func (s *Store) CreateKey(name, hash, prefix string, providers []string, start, order string) (*APIKey, error) {
@@ -201,7 +287,25 @@ func (s *Store) ListKeys() ([]APIKey, error) {
 
 // DeleteKey removes the key with the given id and cascades to every request log bound to
 // it, then returns freed pages to the OS. It reports whether a key row was deleted.
+//
+// When logs live in a separate backend a cross-database transaction is impossible, so the
+// cascade is best-effort: the logs are deleted first (an orphaned key is recoverable — it
+// stays listed and can be deleted again — whereas orphaned logs are not), then the key row is
+// deleted on the keys backend.
 func (s *Store) DeleteKey(id int64) (bool, error) {
+	if s.logs != nil {
+		_ = s.logs.d.deleteLogsByKey(s.logs.db, id)
+		res, err := s.db.Exec(s.d.rebind(`DELETE FROM api_keys WHERE id = ?`), id)
+		if err != nil {
+			return false, err
+		}
+		n, _ := res.RowsAffected()
+		if n > 0 {
+			_ = s.d.afterDeleteKey(s.db)
+		}
+		return n > 0, nil
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return false, err
@@ -252,29 +356,46 @@ func scanKey(sc scanner) (*APIKey, error) {
 	return &k, nil
 }
 
-// InsertLog records a request log row, stamping CreatedAt if unset.
+// InsertLog records a request log row, stamping CreatedAt if unset. The row goes to the logs
+// backend (the separate one when attached, else the keys backend).
 func (s *Store) InsertLog(l *RequestLog) error {
 	if l.CreatedAt.IsZero() {
 		l.CreatedAt = time.Now()
 	}
-	_, err := s.db.Exec(s.d.rebind(`
-INSERT INTO request_logs
- (api_key_id, key_name, provider, model, mapped_model, method, path, query,
-  client_addr, user_agent, request_content_type, response_content_type,
-  request_bytes, response_bytes, status_code, streaming, attempts,
-  ttft_ms, duration_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-  cost, error, api_type, assemble_error, raw_request, raw_response, assembled_response, raw_request_truncated,
-  raw_response_truncated, assembled_response_truncated, created_at)
- VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+	db, d := s.logTarget()
+
+	// Backends without auto-increment (ClickHouse) return a non-zero client-side id. They also
+	// back the payload columns with a non-nullable String, which expects a Go string — binding
+	// a []byte makes the driver encode it as a numeric array literal — so the captured bodies
+	// are converted to strings (string(nil) is "", satisfying the column) on that path.
+	id := d.genLogID()
+	var rawReq, rawResp, assembled any = l.RawRequest, l.RawResponse, l.AssembledResponse
+	if id != 0 {
+		rawReq, rawResp, assembled = string(l.RawRequest), string(l.RawResponse), string(l.AssembledResponse)
+	}
+
+	cols := `api_key_id, key_name, provider, model, mapped_model, method, path, query,
+	  client_addr, user_agent, request_content_type, response_content_type,
+	  request_bytes, response_bytes, status_code, streaming, attempts,
+	  ttft_ms, duration_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+	  cost, error, api_type, assemble_error, raw_request, raw_response, assembled_response, raw_request_truncated,
+	  raw_response_truncated, assembled_response_truncated, created_at`
+	args := []any{
 		l.APIKeyID, l.KeyName, l.Provider, l.Model, l.MappedModel, l.Method, l.Path, l.Query,
 		l.ClientAddr, l.UserAgent, l.RequestContentType, l.ResponseContentType,
 		l.RequestBytes, l.ResponseBytes, l.StatusCode, b2i(l.Streaming),
 		l.Attempts, l.TTFTMillis, l.DurationMillis, l.InputTokens, l.OutputTokens, l.CacheReadTokens,
-		l.CacheWriteTokens, l.Cost, l.Error, l.APIType, l.AssembleError, l.RawRequest, l.RawResponse, l.AssembledResponse,
+		l.CacheWriteTokens, l.Cost, l.Error, l.APIType, l.AssembleError, rawReq, rawResp, assembled,
 		b2i(l.RawRequestTruncated), b2i(l.RawResponseTruncated), b2i(l.AssembledResponseTruncated),
 		l.CreatedAt.UnixMilli(),
-	)
-	if err != nil {
+	}
+	if id != 0 {
+		cols = "id, " + cols
+		args = append([]any{id}, args...)
+	}
+	placeholders := "(" + strings.TrimSuffix(strings.Repeat("?,", len(args)), ",") + ")"
+	q := "INSERT INTO request_logs (" + cols + ") VALUES " + placeholders
+	if _, err := db.Exec(d.rebind(q), args...); err != nil {
 		return fmt.Errorf("insert log: %w", err)
 	}
 	return nil
@@ -326,7 +447,8 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 		q += " OFFSET ?"
 		args = append(args, f.Offset)
 	}
-	rows, err := s.db.Query(s.d.rebind(q), args...)
+	db, d := s.logTarget()
+	rows, err := db.Query(d.rebind(q), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -366,9 +488,10 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 
 // Stats returns aggregate usage grouped by (api_key_id, model), highest cost first.
 func (s *Store) Stats(f LogFilter) ([]Stat, error) {
+	db, d := s.logTarget()
 	q := `SELECT api_key_id, key_name, model, COUNT(*),
-	             ` + s.d.sumInt("input_tokens") + `, ` + s.d.sumInt("output_tokens") + `, ` +
-		s.d.sumInt("cache_read_tokens") + `, ` + s.d.sumInt("cache_write_tokens") + `, SUM(cost)
+	             ` + d.sumInt("input_tokens") + `, ` + d.sumInt("output_tokens") + `, ` +
+		d.sumInt("cache_read_tokens") + `, ` + d.sumInt("cache_write_tokens") + `, SUM(cost)
 	      FROM request_logs WHERE 1=1`
 	var args []any
 	if f.APIKeyID > 0 {
@@ -384,7 +507,7 @@ func (s *Store) Stats(f LogFilter) ([]Stat, error) {
 		args = append(args, f.Until.UnixMilli())
 	}
 	q += " GROUP BY api_key_id, key_name, model ORDER BY SUM(cost) DESC"
-	rows, err := s.db.Query(s.d.rebind(q), args...)
+	rows, err := db.Query(d.rebind(q), args...)
 	if err != nil {
 		return nil, err
 	}

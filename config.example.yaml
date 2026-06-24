@@ -14,6 +14,14 @@ master_key: "mk-change-me-to-a-long-random-secret"
 # password out of this file, e.g. AGL_DATABASE=postgres://user:pass@host:5432/agl
 database: "./gateway.db"
 
+# Optional separate backend for request_logs, while api_keys stay in `database`. A
+# clickhouse:// (or clickhouses://) URL sends logs to ClickHouse — an append-only OLAP store
+# suited to high-volume log analytics; a postgres:// URL or a file path are also accepted.
+# Empty (the default) keeps logs co-located with keys in `database`. The AGL_LOGS_DATABASE
+# environment variable overrides this — handy for keeping a ClickHouse password out of this
+# file, e.g. AGL_LOGS_DATABASE=clickhouse://user:pass@host:9000/agl
+logs_database: ""
+
 # Default retry policy. Each upstream attempt that fails with a network error or an
 # HTTP 429/5xx is retried up to max_retries times, waiting an exponential backoff
 # (base_delay * 2^attempt, capped at max_delay) with full jitter between attempts.
