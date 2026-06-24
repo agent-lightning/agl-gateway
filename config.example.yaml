@@ -9,7 +9,8 @@ server:
   max_request_bytes: 104857600
 
 # The single master key authenticates the /admin API and the web portal.
-# Generate something long and random, e.g. `openssl rand -hex 32`.
+# Generate something long and random, e.g. `openssl rand -hex 32`. The AGL_MASTER_KEY
+# environment variable overrides this — handy for keeping the secret out of this file.
 master_key: "mk-change-me-to-a-long-random-secret"
 
 # Persistence backend. A SQLite file path (WAL files are created alongside it), or a

@@ -87,7 +87,7 @@ config needs a master key, at least one provider, and (for cost) pricing:
 server:
   addr: ":8080"
 
-master_key: "mk-change-me"            # authenticates /admin and the portal; use `openssl rand -hex 32`
+master_key: "mk-change-me"            # authenticates /admin and the portal (override: AGL_MASTER_KEY); use `openssl rand -hex 32`
 
 database: "./gateway.db"              # SQLite file path (or a postgres:// URL)
 

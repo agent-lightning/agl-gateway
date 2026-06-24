@@ -12,7 +12,10 @@ import (
 
 // Config is the top-level gateway configuration.
 type Config struct {
-	Server    Server `yaml:"server"`
+	Server Server `yaml:"server"`
+	// MasterKey authenticates the control plane (/admin/*). The AGL_MASTER_KEY environment
+	// variable, when set, overrides this field — convenient for containers and for keeping the
+	// secret out of the YAML file.
 	MasterKey string `yaml:"master_key"`
 	// Database selects the persistence backend: a postgres:// or postgresql:// URL uses
 	// PostgreSQL; anything else is a SQLite file path (default "./gateway.db"). The
@@ -168,7 +171,14 @@ const DatabaseEnv = "AGL_DATABASE"
 // request_logs backend (see Config.LogsDatabase).
 const LogsDatabaseEnv = "AGL_LOGS_DATABASE"
 
+// MasterKeyEnv is the environment variable that, when set, overrides the configured
+// master key (see Config.MasterKey).
+const MasterKeyEnv = "AGL_MASTER_KEY"
+
 func (c *Config) applyDefaults() {
+	if v := os.Getenv(MasterKeyEnv); v != "" {
+		c.MasterKey = v
+	}
 	if v := os.Getenv(DatabaseEnv); v != "" {
 		c.Database = v
 	}

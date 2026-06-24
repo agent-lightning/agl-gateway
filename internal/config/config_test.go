@@ -109,6 +109,32 @@ func TestLogsDatabaseEnvOverride(t *testing.T) {
 	}
 }
 
+func TestMasterKeyEnvOverride(t *testing.T) {
+	const key = "mk-from-env"
+	t.Setenv(MasterKeyEnv, key)
+	// Env overrides whatever the YAML specifies.
+	c, err := Parse([]byte(minimalYAML))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.MasterKey != key {
+		t.Errorf("env override = %q, want %q", c.MasterKey, key)
+	}
+	// Env also satisfies validation when the YAML omits master_key entirely.
+	noKeyYAML := `
+providers:
+  - name: openai
+    base_url: http://x
+`
+	c, err = Parse([]byte(noKeyYAML))
+	if err != nil {
+		t.Fatalf("Parse (no yaml master_key): %v", err)
+	}
+	if c.MasterKey != key {
+		t.Errorf("env override (no yaml) = %q, want %q", c.MasterKey, key)
+	}
+}
+
 func TestClickHousePrimaryRejected(t *testing.T) {
 	t.Setenv(DatabaseEnv, "")
 	_, err := Parse([]byte(minimalYAML + "\ndatabase: clickhouse://u:p@localhost:9000/db\n"))
@@ -138,6 +164,7 @@ defaults:
 }
 
 func TestValidateErrors(t *testing.T) {
+	t.Setenv(MasterKeyEnv, "") // ensure the env override does not mask the missing-key case
 	cases := map[string]string{
 		"missing master key": `
 providers:
