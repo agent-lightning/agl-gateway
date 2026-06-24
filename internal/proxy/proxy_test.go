@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -16,6 +17,7 @@ import (
 	"github.com/agent-lightning/agl-gateway/internal/keys"
 	"github.com/agent-lightning/agl-gateway/internal/pricing"
 	"github.com/agent-lightning/agl-gateway/internal/store"
+	"github.com/agent-lightning/agl-gateway/internal/usage"
 )
 
 func testPricing() *pricing.Table {
@@ -894,5 +896,128 @@ func TestFailoverToNextProvider(t *testing.T) {
 	logs, _ := st.QueryLogs(store.LogFilter{})
 	if len(logs) != 1 || logs[0].Provider != "b" || logs[0].Attempts != 2 {
 		t.Fatalf("log = %+v, want provider=b attempts=2", logs[0])
+	}
+}
+
+// panicWriter panics on every Write, standing in for a metering accumulator that blows up on
+// adversarial upstream bytes.
+type panicWriter struct{}
+
+func (panicWriter) Write(p []byte) (int, error) { panic("metering boom") }
+
+// TestStreamBodyMeteringPanicDoesNotBreakStream proves the proxy-first guarantee: a panic in
+// best-effort metering is contained by the meterPump's recover wall and never reaches the
+// proxy goroutine, so the client still receives the full upstream body.
+func TestStreamBodyMeteringPanicDoesNotBreakStream(t *testing.T) {
+	const payload = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	pump := newMeterPump(panicWriter{}, nil, 0, slog.New(slog.DiscardHandler))
+
+	_, gotByte, written := streamBody(rec, strings.NewReader(payload), pump, time.Now())
+	pump.finish() // must not panic
+
+	if !gotByte || written != int64(len(payload)) {
+		t.Fatalf("written = %d, gotByte = %v; want %d/true", written, gotByte, len(payload))
+	}
+	if rec.Body.String() != payload {
+		t.Fatalf("client body = %q, want full payload despite metering panic", rec.Body.String())
+	}
+}
+
+// TestStreamBodyManyChunksNoLoss feeds far more chunks than meterQueueDepth and confirms the
+// decoupled metering goroutine drains every one before finish() returns (blocking hand-off
+// provides backpressure without dropping), so usage and payload capture stay exact.
+func TestStreamBodyManyChunksNoLoss(t *testing.T) {
+	var sb strings.Builder
+	const n = 500 // >> meterQueueDepth
+	for i := 0; i < n; i++ {
+		sb.WriteString("data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
+	}
+	full := sb.String()
+
+	rec := httptest.NewRecorder()
+	acc := usage.NewAccumulator(true)
+	raw := newLimitedRecorder(1 << 30)
+	pump := newMeterPump(acc, raw, 0, slog.New(slog.DiscardHandler))
+
+	// A reader that yields one small chunk per Read, so the proxy hands off many times.
+	_, _, written := streamBody(rec, &chunkReader{data: []byte(full)}, pump, time.Now())
+	_, dropped := pump.finish()
+
+	if dropped {
+		t.Fatal("metering dropped chunks; blocking hand-off should never drop while consumer is alive")
+	}
+	if written != int64(len(full)) {
+		t.Fatalf("written = %d, want %d", written, len(full))
+	}
+	if rec.Body.String() != full {
+		t.Fatal("client body mismatch")
+	}
+	if string(raw.Bytes()) != full {
+		t.Fatalf("metered raw bytes (%d) != full body (%d)", len(raw.Bytes()), len(full))
+	}
+}
+
+// chunkReader returns the data in small slices, one per Read, to exercise the per-chunk
+// hand-off path many times.
+type chunkReader struct {
+	data []byte
+	pos  int
+}
+
+func (c *chunkReader) Read(p []byte) (int, error) {
+	if c.pos >= len(c.data) {
+		return 0, io.EOF
+	}
+	end := c.pos + 8
+	if end > len(c.data) {
+		end = len(c.data)
+	}
+	n := copy(p, c.data[c.pos:end])
+	c.pos += n
+	return n, nil
+}
+
+// TestRequestBodyExceedsLimitReturns413 confirms an over-limit body is rejected before any
+// upstream call, with no log row written.
+func TestRequestBodyExceedsLimitReturns413(t *testing.T) {
+	var hits int32
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{}`)
+	})
+	p, st, key := harness(t, up)
+	p.cfg.Server.MaxRequestBytes = 16
+
+	rec := do(t, p, key, "/v1/chat/completions", `{"model":"gpt-5.4","pad":"xxxxxxxxxxxxxxxxxxxxxxxx"}`)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&hits); got != 0 {
+		t.Fatalf("upstream hit %d times, want 0 (rejected before forward)", got)
+	}
+	if src := rec.Header().Get(headerErrorSource); src != sourceGateway {
+		t.Errorf("error source = %q, want %q", src, sourceGateway)
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 0 {
+		t.Errorf("expected no log rows for a pre-forward rejection, got %d", len(logs))
+	}
+}
+
+// TestRequestBodyAtLimitPasses confirms a body within the configured cap forwards normally.
+func TestRequestBodyAtLimitPasses(t *testing.T) {
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	})
+	p, _, key := harness(t, up)
+	body := `{"model":"gpt-5.4"}`
+	p.cfg.Server.MaxRequestBytes = int64(len(body)) // exactly the body size is allowed
+
+	rec := do(t, p, key, "/v1/chat/completions", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 }

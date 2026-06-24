@@ -22,6 +22,9 @@ func TestParseAppliesDefaults(t *testing.T) {
 	if c.Server.Addr != ":8080" {
 		t.Errorf("default addr = %q, want :8080", c.Server.Addr)
 	}
+	if c.Server.MaxRequestBytes != DefaultMaxRequestBytes {
+		t.Errorf("default max_request_bytes = %d, want %d", c.Server.MaxRequestBytes, DefaultMaxRequestBytes)
+	}
 	if c.Database != "./gateway.db" {
 		t.Errorf("default database = %q", c.Database)
 	}
@@ -41,6 +44,25 @@ func TestParseAppliesDefaults(t *testing.T) {
 		c.PayloadCapture.MaxResponseBytes != DefaultPayloadCaptureBytes ||
 		c.PayloadCapture.MaxAssembledBytes != DefaultPayloadCaptureBytes {
 		t.Errorf("payload capture defaults = %+v", c.PayloadCapture)
+	}
+}
+
+func TestMaxRequestBytesExplicitValuesPreserved(t *testing.T) {
+	// A positive value is kept as-is.
+	c, err := Parse([]byte(minimalYAML + "\nserver:\n  max_request_bytes: 4096\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Server.MaxRequestBytes != 4096 {
+		t.Errorf("max_request_bytes = %d, want 4096", c.Server.MaxRequestBytes)
+	}
+	// A negative value (unlimited opt-out) survives defaulting rather than being reset.
+	c, err = Parse([]byte(minimalYAML + "\nserver:\n  max_request_bytes: -1\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Server.MaxRequestBytes != -1 {
+		t.Errorf("max_request_bytes = %d, want -1 (unlimited)", c.Server.MaxRequestBytes)
 	}
 }
 

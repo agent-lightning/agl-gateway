@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -152,8 +153,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bound the in-memory request body so one large/malicious request cannot OOM the gateway.
+	// The body is buffered (not streamed) because failover must replay it; the cap is enforced
+	// before any upstream call. A negative limit disables the cap.
+	if limit := p.cfg.Server.MaxRequestBytes; limit > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
+	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			gatewayError(w, http.StatusRequestEntityTooLarge, sourceGateway, "",
+				fmt.Sprintf("agl-gateway: request body exceeds the %d-byte limit", maxErr.Limit), 0)
+			return
+		}
 		gatewayError(w, http.StatusBadRequest, sourceGateway, "", "agl-gateway: could not read request body", 0)
 		return
 	}
@@ -384,7 +397,9 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	if payloads != nil {
 		payloadWriter = payloads
 	}
-	ttft, gotByte, respBytes, head := streamBody(w, resp.Body, meter, start, captureLimit, payloadWriter)
+	pump := newMeterPump(meter, payloadWriter, captureLimit, p.logger)
+	ttft, gotByte, respBytes := streamBody(w, resp.Body, pump, start)
+	head, _ := pump.finish()
 
 	var u pricing.Usage
 	if capAcc != nil {
@@ -508,11 +523,94 @@ func payloadLimit(limit int) int {
 	return limit
 }
 
-// streamBody copies upstream->client, flushing each chunk (for SSE liveness), tees bytes
-// into the usage accumulator, and reports time-to-first-byte measured from reqStart and the
-// total number of body bytes read from upstream. When captureLimit > 0 it also returns up to
-// that many leading bytes of the body (used to log the upstream's error payload).
-func streamBody(w http.ResponseWriter, body io.Reader, acc io.Writer, reqStart time.Time, captureLimit int, payloads io.Writer) (ttft time.Duration, gotByte bool, written int64, head []byte) {
+// meterQueueDepth is how many chunks the metering goroutine may fall behind before the proxy
+// goroutine would block handing one off. Metering (JSON parsing) is far faster than network
+// delivery, so this slack is effectively never exhausted; it only absorbs transient jitter
+// (e.g. a GC pause) without coupling the proxy's read pace to per-chunk parsing.
+const meterQueueDepth = 64
+
+// meterPump runs all best-effort metering — usage accumulation, payload capture, and
+// error-body head capture — on its own goroutine, off the proxy's critical path. The proxy
+// goroutine only ever does read->write->flush->hand-off; it never parses, and a panic in
+// third-party SDK parsing of adversarial upstream bytes is contained here (recover wall) and
+// can never break or stall the proxied stream. This keeps the gateway proxy-first: faithful
+// forwarding is never hostage to logging/analytics.
+type meterPump struct {
+	ch       chan []byte
+	done     chan struct{}
+	acc      io.Writer // usage accumulator (capture or generic); may be nil
+	payloads io.Writer // raw payload capture sink; may be nil
+	capLimit int       // bytes of error-body head to retain; 0 disables
+	logger   *slog.Logger
+
+	head    []byte // written only by run(); read only after done is closed
+	dropped bool   // written only by feed(); set if metering died mid-stream
+}
+
+func newMeterPump(acc, payloads io.Writer, capLimit int, logger *slog.Logger) *meterPump {
+	m := &meterPump{
+		ch:       make(chan []byte, meterQueueDepth),
+		done:     make(chan struct{}),
+		acc:      acc,
+		payloads: payloads,
+		capLimit: capLimit,
+		logger:   logger,
+	}
+	go m.run()
+	return m
+}
+
+// run drains chunks until the queue is closed. The recover wall is the key proxy-first
+// guarantee: a panic in best-effort parsing stops metering for this request and nothing more —
+// the proxy goroutine is on the other side of the channel and is never affected.
+func (m *meterPump) run() {
+	defer close(m.done)
+	defer func() {
+		if r := recover(); r != nil {
+			m.logger.Error("metering panic recovered; usage for this request may be incomplete", "panic", r)
+		}
+	}()
+	for chunk := range m.ch {
+		if m.acc != nil {
+			_, _ = m.acc.Write(chunk)
+		}
+		if m.payloads != nil {
+			_, _ = m.payloads.Write(chunk)
+		}
+		if m.capLimit > 0 && len(m.head) < m.capLimit {
+			room := m.capLimit - len(m.head)
+			if room > len(chunk) {
+				room = len(chunk)
+			}
+			m.head = append(m.head, chunk[:room]...)
+		}
+	}
+}
+
+// feed copies a chunk (the caller reuses its read buffer) and hands it to the metering
+// goroutine. It must never block the proxy: if metering has already exited (a recovered
+// panic), the send falls through to the done case and the chunk is dropped.
+func (m *meterPump) feed(chunk []byte) {
+	cp := append([]byte(nil), chunk...)
+	select {
+	case m.ch <- cp:
+	case <-m.done:
+		m.dropped = true
+	}
+}
+
+// finish closes the queue and waits for the goroutine to drain, establishing the
+// happens-before needed to read head and to call Usage()/Finalize() on the accumulator.
+func (m *meterPump) finish() (head []byte, dropped bool) {
+	close(m.ch)
+	<-m.done
+	return m.head, m.dropped
+}
+
+// streamBody copies upstream->client, flushing each chunk (for SSE liveness) and handing each
+// flushed chunk to the metering pump (off the critical path). It reports time-to-first-byte
+// measured from reqStart and the total number of body bytes read from upstream.
+func streamBody(w http.ResponseWriter, body io.Reader, m *meterPump, reqStart time.Time) (ttft time.Duration, gotByte bool, written int64) {
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {
@@ -524,26 +622,18 @@ func streamBody(w http.ResponseWriter, body io.Reader, acc io.Writer, reqStart t
 				gotByte = true
 			}
 			chunk := buf[:n]
+			// Client gone: stop forwarding. We deliberately do not meter a chunk the client
+			// never received, matching what was actually delivered.
 			if _, werr := w.Write(chunk); werr != nil {
-				return ttft, gotByte, written, head
+				return ttft, gotByte, written
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
-			_, _ = acc.Write(chunk)
-			if payloads != nil {
-				_, _ = payloads.Write(chunk)
-			}
-			if captureLimit > 0 && len(head) < captureLimit {
-				room := captureLimit - len(head)
-				if room > n {
-					room = n
-				}
-				head = append(head, chunk[:room]...)
-			}
+			m.feed(chunk)
 		}
 		if err != nil {
-			return ttft, gotByte, written, head
+			return ttft, gotByte, written
 		}
 	}
 }

@@ -34,7 +34,18 @@ type Config struct {
 // Server holds HTTP listener settings.
 type Server struct {
 	Addr string `yaml:"addr"`
+	// MaxRequestBytes caps the size of a proxied request body the gateway will buffer (the
+	// body is held in memory so it can be replayed across provider failover). 0 applies
+	// DefaultMaxRequestBytes; a negative value disables the limit (unbounded). Over-limit
+	// requests are rejected with 413 before any upstream call, so a single large or malicious
+	// request cannot exhaust gateway memory.
+	MaxRequestBytes int64 `yaml:"max_request_bytes"`
 }
+
+// DefaultMaxRequestBytes bounds the in-memory request body when no explicit limit is set. It
+// is generous enough for multimodal payloads (base64 images/audio) while still preventing an
+// unbounded body from OOMing the gateway.
+const DefaultMaxRequestBytes = 100 << 20 // 100 MiB
 
 // Defaults provides fallback settings applied to every provider.
 type Defaults struct {
@@ -166,6 +177,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Server.Addr == "" {
 		c.Server.Addr = ":8080"
+	}
+	if c.Server.MaxRequestBytes == 0 {
+		c.Server.MaxRequestBytes = DefaultMaxRequestBytes
 	}
 	if c.Database == "" {
 		c.Database = "./gateway.db"

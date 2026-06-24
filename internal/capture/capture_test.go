@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -806,5 +807,73 @@ func TestAssembleOpenAIResponsesFailedTerminal(t *testing.T) {
 	}
 	if got.ID != "resp_fail" || got.Status != "failed" || got.Error.Code != "server_error" {
 		t.Errorf("failed terminal not used: %+v\n%s", got, out)
+	}
+}
+
+// TestSSEParserBoundsUnterminatedLine proves a malformed upstream that streams a single line
+// without a newline cannot grow the parser's line buffer without limit, and that the parser
+// resynchronizes on the next newline so well-formed events after the garbage still parse.
+func TestSSEParserBoundsUnterminatedLine(t *testing.T) {
+	var p sseParser
+	var events []string
+	emit := func(_ string, data []byte) { events = append(events, string(data)) }
+
+	chunk := bytes.Repeat([]byte("x"), 64<<10)
+	for written := 0; written < maxSSELineBytes+(2<<20); written += len(chunk) {
+		p.write(chunk, emit)
+		if len(p.lineBuf) > maxSSELineBytes {
+			t.Fatalf("lineBuf = %d bytes, exceeds cap %d", len(p.lineBuf), maxSSELineBytes)
+		}
+	}
+	if len(events) != 0 {
+		t.Fatalf("garbage produced %d events, want 0", len(events))
+	}
+
+	// A newline terminates the discarded tail; a following valid event must parse.
+	p.write([]byte("\n"), emit)
+	p.write([]byte("data: {\"ok\":1}\n\n"), emit)
+	if len(events) != 1 || events[0] != `{"ok":1}` {
+		t.Fatalf("parser did not resync after over-long line: %v", events)
+	}
+}
+
+// TestSSEParserBoundsEventData proves a stream that never closes an event cannot grow the
+// pending-event buffer without limit; over-cap data is dropped and the event still emits.
+func TestSSEParserBoundsEventData(t *testing.T) {
+	var p sseParser
+	var emitted int
+	emit := func(_ string, _ []byte) { emitted++ }
+
+	line := []byte("data: " + strings.Repeat("y", 64<<10) + "\n")
+	for total := 0; total < maxSSEEventBytes+(4<<20); total += 64 << 10 {
+		p.write(line, emit)
+		if p.dataBytes > maxSSEEventBytes {
+			t.Fatalf("dataBytes = %d, exceeds cap %d", p.dataBytes, maxSSEEventBytes)
+		}
+	}
+	if emitted != 0 {
+		t.Fatalf("emitted %d events before the blank line, want 0", emitted)
+	}
+
+	p.write([]byte("\n"), emit) // close the event
+	if emitted != 1 {
+		t.Fatalf("emitted = %d after closing event, want 1", emitted)
+	}
+	if p.dataBytes != 0 {
+		t.Fatalf("dataBytes = %d after emit, want 0 (reset)", p.dataBytes)
+	}
+}
+
+// TestSSEParserNormalEventStillWorks is a guard that the bounding logic did not alter parsing
+// of ordinary multi-line events.
+func TestSSEParserNormalEventStillWorks(t *testing.T) {
+	var p sseParser
+	var gotEvent string
+	var gotData []byte
+	emit := func(ev string, data []byte) { gotEvent, gotData = ev, data }
+
+	p.write([]byte("event: message\ndata: {\"a\":1}\ndata: {\"b\":2}\n\n"), emit)
+	if gotEvent != "message" || string(gotData) != "{\"a\":1}\n{\"b\":2}" {
+		t.Fatalf("event=%q data=%q", gotEvent, gotData)
 	}
 }

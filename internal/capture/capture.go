@@ -25,7 +25,19 @@ import (
 )
 
 // maxBodyBuffer caps how much of a non-streaming response body is retained for parsing.
-const maxBodyBuffer = 1 << 20 // 1 MiB
+const maxBodyBuffer = 16 << 20 // 16 MiB
+
+// maxSSELineBytes bounds a single unterminated SSE line, and maxSSEEventBytes bounds the
+// data: lines buffered for one pending event. They keep metering memory bounded when an
+// upstream streams without newlines or never closes an event — the proxied bytes themselves
+// have already been forwarded to the client, so only the best-effort metering copy is capped.
+// The caps are generous (modern responses can carry large base64 image/audio payloads in a
+// single event); they exist to stop unbounded growth from a misbehaving upstream, not to be
+// tight.
+const (
+	maxSSELineBytes  = 16 << 20 // 16 MiB
+	maxSSEEventBytes = 64 << 20 // 64 MiB
+)
 
 // StreamFormat is the provider API shape inferred from the request path.
 type StreamFormat int
@@ -658,6 +670,8 @@ type sseParser struct {
 	lineBuf   []byte
 	event     string
 	dataLines [][]byte
+	dataBytes int  // total bytes buffered for the pending event
+	skipLine  bool // true while discarding the tail of an over-long line
 }
 
 func (p *sseParser) write(b []byte, emit func(string, []byte)) {
@@ -665,10 +679,23 @@ func (p *sseParser) write(b []byte, emit func(string, []byte)) {
 	for {
 		i := bytes.IndexByte(p.lineBuf, '\n')
 		if i < 0 {
+			// No complete line yet. Bound the in-progress line so an upstream that streams
+			// without newlines can't grow metering memory without limit: discard it and skip
+			// bytes until the next newline resynchronizes the parser.
+			if len(p.lineBuf) > maxSSELineBytes {
+				p.lineBuf = p.lineBuf[:0]
+				p.skipLine = true
+			}
 			break
 		}
 		line := p.lineBuf[:i]
 		p.lineBuf = p.lineBuf[i+1:]
+		if p.skipLine {
+			// This line is the tail of an over-long line we already discarded; drop it and
+			// resume normal parsing on the next line.
+			p.skipLine = false
+			continue
+		}
 		p.handleLine(line, emit)
 	}
 }
@@ -696,8 +723,15 @@ func (p *sseParser) handleLine(line []byte, emit func(string, []byte)) {
 		if len(data) > 0 && data[0] == ' ' {
 			data = data[1:]
 		}
+		// Bound the data buffered for one pending event; a stream that never closes an event
+		// must not grow metering memory without limit. Over-cap data is dropped (the partial
+		// JSON simply won't parse — best-effort).
+		if p.dataBytes+len(data) > maxSSEEventBytes {
+			return
+		}
 		cp := append([]byte(nil), data...)
 		p.dataLines = append(p.dataLines, cp)
+		p.dataBytes += len(data)
 	}
 }
 
@@ -710,4 +744,5 @@ func (p *sseParser) emit(emit func(string, []byte)) {
 	emit(p.event, data)
 	p.event = ""
 	p.dataLines = nil
+	p.dataBytes = 0
 }
