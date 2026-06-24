@@ -82,6 +82,9 @@ type createKeyRequest struct {
 	// provider via X-AGL-Provider. Empty values fall back to the package defaults.
 	Start string `json:"provider_start"`
 	Order string `json:"provider_order"`
+	// KeepLogsOnDelete overrides the key's log-retention policy. When nil it falls back to
+	// defaults.keep_logs_on_key_delete; when set it is stored on the key verbatim.
+	KeepLogsOnDelete *bool `json:"keep_logs_on_delete"`
 }
 
 type createKeyResponse struct {
@@ -125,13 +128,18 @@ func (a *Admin) createKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	keepLogs := a.cfg.Defaults.KeepLogsOnKeyDelete
+	if req.KeepLogsOnDelete != nil {
+		keepLogs = *req.KeepLogsOnDelete
+	}
+
 	plain, display, err := keys.Generate()
 	if err != nil {
 		a.logger.Error("key generation failed", "err", err)
 		writeJSON(w, http.StatusInternalServerError, errBody("could not generate key"))
 		return
 	}
-	k, err := a.store.CreateKey(req.Name, keys.Hash(plain), display, req.Providers, req.Start, req.Order)
+	k, err := a.store.CreateKey(req.Name, keys.Hash(plain), display, req.Providers, req.Start, req.Order, keepLogs)
 	if err != nil {
 		a.logger.Error("create key failed", "err", err)
 		writeJSON(w, http.StatusInternalServerError, errBody("could not store key"))
@@ -456,7 +464,7 @@ func (a *Admin) test(w http.ResponseWriter, r *http.Request) {
 		emit(testEvent{Type: "error", Message: "could not generate test key"})
 		return
 	}
-	k, err := a.store.CreateKey("modeltest-"+time.Now().UTC().Format("20060102-150405"), keys.Hash(plain), display, names, config.DefaultStart, config.DefaultOrder)
+	k, err := a.store.CreateKey("modeltest-"+time.Now().UTC().Format("20060102-150405"), keys.Hash(plain), display, names, config.DefaultStart, config.DefaultOrder, false)
 	if err != nil {
 		a.logger.Error("model-test key creation failed", "err", err)
 		emit(testEvent{Type: "error", Message: "could not create test key"})

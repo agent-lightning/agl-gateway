@@ -13,19 +13,20 @@ server:
 # environment variable overrides this — handy for keeping the secret out of this file.
 master_key: "mk-change-me-to-a-long-random-secret"
 
-# Persistence backend. A SQLite file path (WAL files are created alongside it), or a
-# postgres:// (or postgresql://) URL to use PostgreSQL instead. The AGL_DATABASE
-# environment variable overrides this — handy for containers and for keeping a PostgreSQL
-# password out of this file, e.g. AGL_DATABASE=postgres://user:pass@host:5432/agl
-database: "./gateway.db"
+# Persistence backend for api_keys (and, unless logs_database is set, request_logs too).
+# A SQLite file path works for a single node, but this production example uses PostgreSQL:
+# a postgres:// (or postgresql://) URL. The AGL_DATABASE environment variable overrides this
+# — the bundled compose.yaml sets it to the postgres service so the password stays out of
+# this file. Leave the placeholder here; supply the real DSN via AGL_DATABASE in production.
+database: "postgres://agl:agl@localhost:5432/agl_gateway?sslmode=disable"
 
-# Optional separate backend for request_logs, while api_keys stay in `database`. A
-# clickhouse:// (or clickhouses://) URL sends logs to ClickHouse — an append-only OLAP store
-# suited to high-volume log analytics; a postgres:// URL or a file path are also accepted.
-# Empty (the default) keeps logs co-located with keys in `database`. The AGL_LOGS_DATABASE
-# environment variable overrides this — handy for keeping a ClickHouse password out of this
-# file, e.g. AGL_LOGS_DATABASE=clickhouse://user:pass@host:9000/agl
-logs_database: ""
+# Separate backend for request_logs, while api_keys stay in `database`. A clickhouse://
+# (or clickhouses://) URL sends logs to ClickHouse — an append-only OLAP store suited to the
+# high-volume, payload-heavy log analytics this example enables below. (A postgres:// URL or
+# a file path are also accepted; empty co-locates logs with keys in `database`.) The
+# AGL_LOGS_DATABASE environment variable overrides this — the bundled compose.yaml sets it to
+# the clickhouse service so the password stays out of this file.
+logs_database: "clickhouse://agl:agl@localhost:9000/agl_gateway"
 
 # Default retry policy. Each upstream attempt that fails with a network error or an
 # HTTP 429/5xx is retried up to max_retries times, waiting an exponential backoff
@@ -35,17 +36,23 @@ defaults:
     max_retries: 3
     base_delay: 200ms
     max_delay: 10s
+  # Default log-retention policy for newly created keys (each key stores its own resolved
+  # value, overridable per key via the create-key request / portal). false (the default)
+  # cascade-deletes a key's request logs when the key is deleted; true retains them so usage
+  # history outlives the key (the logs keep the key name captured at request time).
+  keep_logs_on_key_delete: false
 
-# Optional payload capture. Disabled by default because request/response bodies can contain
-# secrets and can grow the SQLite database quickly. When enabled, the gateway stores the
-# original inbound request body and the final upstream response body in request_logs. SSE
-# streams can also be best-effort assembled for /v1/chat/completions, /v1/responses, and
-# /v1/messages; unknown stream paths still store the raw response stream.
+# Payload capture. Enabled in this production example so request_logs carry the original
+# inbound request body and the final upstream response body, with SSE streams best-effort
+# assembled for /v1/chat/completions, /v1/responses, and /v1/messages (unknown stream paths
+# store the raw response stream). Bodies can contain secrets and grow the logs store quickly,
+# so keep them on ClickHouse (logs_database above) and tune the per-body caps to your traffic.
+# Set enabled: false to disable, or lower the byte caps to trim storage.
 payload_capture:
-  enabled: false
+  enabled: true
   max_request_bytes: 1048576
   max_response_bytes: 1048576
-  assemble_streams: false
+  assemble_streams: true
   max_assembled_bytes: 1048576
 
 # Upstream providers. An API key is bound to one or more of these by name; each request

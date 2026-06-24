@@ -97,6 +97,57 @@ func TestCreateListDeleteKey(t *testing.T) {
 	}
 }
 
+// keep_logs_on_delete is resolved from the request when present and from the config default
+// otherwise, stored on the key, and honored when the key is deleted.
+func TestCreateKeyLogRetention(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	cfg := &config.Config{
+		MasterKey: master,
+		Providers: []config.Provider{{Name: "openai", BaseURL: "http://x"}},
+	}
+	cfg.Defaults.KeepLogsOnKeyDelete = true // config default the request can override
+	h := New(cfg, st, nil, nil, nil).Handler()
+
+	create := func(body string) createKeyResponse {
+		t.Helper()
+		rec := req(t, h, "POST", "/admin/keys", master, body)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create status = %d, body=%s", rec.Code, rec.Body.String())
+		}
+		var c createKeyResponse
+		json.Unmarshal(rec.Body.Bytes(), &c)
+		return c
+	}
+
+	// Omitted → inherits the config default (true).
+	def := create(`{"name":"inherit","providers":["openai"]}`)
+	if !def.KeepLogsOnDelete {
+		t.Errorf("omitted keep_logs_on_delete = false, want config default true")
+	}
+	// Explicit false overrides the default.
+	off := create(`{"name":"override","providers":["openai"],"keep_logs_on_delete":false}`)
+	if off.KeepLogsOnDelete {
+		t.Errorf("explicit keep_logs_on_delete:false not honored")
+	}
+
+	// A retained key keeps its logs on delete; a cascading key loses them.
+	st.InsertLog(&store.RequestLog{APIKeyID: def.ID, KeyName: "inherit", Provider: "openai", Model: "m"})
+	st.InsertLog(&store.RequestLog{APIKeyID: off.ID, KeyName: "override", Provider: "openai", Model: "m"})
+	req(t, h, "DELETE", "/admin/keys/"+itoa(def.ID), master, "")
+	req(t, h, "DELETE", "/admin/keys/"+itoa(off.ID), master, "")
+
+	if kept, _ := st.QueryLogs(store.LogFilter{APIKeyID: def.ID}); len(kept) != 1 {
+		t.Errorf("retained key: logs = %d, want 1", len(kept))
+	}
+	if gone, _ := st.QueryLogs(store.LogFilter{APIKeyID: off.ID}); len(gone) != 0 {
+		t.Errorf("cascading key: logs = %d, want 0", len(gone))
+	}
+}
+
 func TestCreateKeyValidation(t *testing.T) {
 	h, _ := newAdmin(t)
 	cases := map[string]string{
@@ -143,11 +194,11 @@ func TestLogsAndStats(t *testing.T) {
 
 func TestLogsPaginateByKey(t *testing.T) {
 	h, st := newAdmin(t)
-	k, err := st.CreateKey("dev", "hash-dev", "sk-gw-dev", []string{"openai"}, "first", "round_robin")
+	k, err := st.CreateKey("dev", "hash-dev", "sk-gw-dev", []string{"openai"}, "first", "round_robin", false)
 	if err != nil {
 		t.Fatalf("CreateKey: %v", err)
 	}
-	other, err := st.CreateKey("ops", "hash-ops", "sk-gw-ops", []string{"anthropic"}, "first", "round_robin")
+	other, err := st.CreateKey("ops", "hash-ops", "sk-gw-ops", []string{"anthropic"}, "first", "round_robin", false)
 	if err != nil {
 		t.Fatalf("CreateKey: %v", err)
 	}
@@ -199,7 +250,7 @@ func TestLogsPaginateByKey(t *testing.T) {
 
 func TestLogsPayloadsOptIn(t *testing.T) {
 	h, st := newAdmin(t)
-	k, err := st.CreateKey("dev", "hash-dev", "sk-gw-dev", []string{"openai"}, "first", "round_robin")
+	k, err := st.CreateKey("dev", "hash-dev", "sk-gw-dev", []string{"openai"}, "first", "round_robin", false)
 	if err != nil {
 		t.Fatalf("CreateKey: %v", err)
 	}

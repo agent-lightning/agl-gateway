@@ -160,7 +160,7 @@ func TestIDGenMonotonic(t *testing.T) {
 
 func TestDeleteKeyCascadesLogs(t *testing.T) {
 	eachBackend(t, func(t *testing.T, s *Store) {
-		k, err := s.CreateKey("dev", "h", "p", []string{"openai"}, "first", "round_robin")
+		k, err := s.CreateKey("dev", "h", "p", []string{"openai"}, "first", "round_robin", false)
 		if err != nil {
 			t.Fatalf("CreateKey: %v", err)
 		}
@@ -182,6 +182,48 @@ func TestDeleteKeyCascadesLogs(t *testing.T) {
 		remaining, _ := s.QueryLogs(LogFilter{})
 		if len(remaining) != 1 {
 			t.Errorf("unrelated logs affected: %d remaining, want 1", len(remaining))
+		}
+	})
+}
+
+// A key created with keepLogsOnDelete=true is removed without touching its logs, which stay
+// queryable (orphaned) under their captured key name.
+func TestDeleteKeyKeepsLogsWhenConfigured(t *testing.T) {
+	eachBackend(t, func(t *testing.T, s *Store) {
+		k, err := s.CreateKey("keep", "h", "p", []string{"openai"}, "first", "round_robin", true)
+		if err != nil {
+			t.Fatalf("CreateKey: %v", err)
+		}
+		if !k.KeepLogsOnDelete {
+			t.Fatalf("KeepLogsOnDelete not set on returned key")
+		}
+		if got, _ := s.KeyByID(k.ID); got == nil || !got.KeepLogsOnDelete {
+			t.Fatalf("KeepLogsOnDelete not round-tripped via KeyByID: %+v", got)
+		}
+		for i := 0; i < 3; i++ {
+			if err := s.InsertLog(&RequestLog{APIKeyID: k.ID, KeyName: "keep", Provider: "openai", Model: "m"}); err != nil {
+				t.Fatalf("InsertLog: %v", err)
+			}
+		}
+		deleted, err := s.DeleteKey(k.ID)
+		if err != nil {
+			t.Fatalf("DeleteKey: %v", err)
+		}
+		if !deleted {
+			t.Fatalf("DeleteKey reported no row deleted")
+		}
+		// The key is gone but its logs are retained, still carrying the captured key name.
+		if got, _ := s.KeyByID(k.ID); got != nil {
+			t.Errorf("key not deleted: %+v", got)
+		}
+		kept, _ := s.QueryLogs(LogFilter{APIKeyID: k.ID})
+		if len(kept) != 3 {
+			t.Errorf("expected 3 retained logs, got %d", len(kept))
+		}
+		for _, l := range kept {
+			if l.KeyName != "keep" {
+				t.Errorf("retained log lost its key-name snapshot: %q", l.KeyName)
+			}
 		}
 	})
 }
@@ -270,7 +312,7 @@ func TestLogPayloadBytesRoundTrip(t *testing.T) {
 
 func TestKeyLifecycle(t *testing.T) {
 	eachBackend(t, func(t *testing.T, s *Store) {
-		k, err := s.CreateKey("dev", "hash-abc", "sk-gw-ab", []string{"openai", "anthropic"}, "first", "round_robin")
+		k, err := s.CreateKey("dev", "hash-abc", "sk-gw-ab", []string{"openai", "anthropic"}, "first", "round_robin", false)
 		if err != nil {
 			t.Fatalf("CreateKey: %v", err)
 		}
@@ -335,10 +377,10 @@ func TestKeyLifecycle(t *testing.T) {
 
 func TestDuplicateHashRejected(t *testing.T) {
 	eachBackend(t, func(t *testing.T, s *Store) {
-		if _, err := s.CreateKey("a", "dup", "p", []string{"x"}, "first", "round_robin"); err != nil {
+		if _, err := s.CreateKey("a", "dup", "p", []string{"x"}, "first", "round_robin", false); err != nil {
 			t.Fatalf("CreateKey: %v", err)
 		}
-		if _, err := s.CreateKey("b", "dup", "p", []string{"x"}, "first", "round_robin"); err == nil {
+		if _, err := s.CreateKey("b", "dup", "p", []string{"x"}, "first", "round_robin", false); err == nil {
 			t.Error("expected error inserting duplicate hash")
 		}
 	})
@@ -426,7 +468,7 @@ func TestStats(t *testing.T) {
 
 func TestCreateKeyPersistsPolicy(t *testing.T) {
 	eachBackend(t, func(t *testing.T, s *Store) {
-		k, err := s.CreateKey("dev", "h1", "p", []string{"a", "b"}, "random", "random")
+		k, err := s.CreateKey("dev", "h1", "p", []string{"a", "b"}, "random", "random", false)
 		if err != nil {
 			t.Fatalf("CreateKey: %v", err)
 		}

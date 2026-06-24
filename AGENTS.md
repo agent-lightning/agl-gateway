@@ -93,15 +93,24 @@ Packages:
   `gateway` fault, with the attempt count, via both the JSON body and `X-AGL-*` headers.
   Provider responses (incl. surviving 4xx/5xx) pass through; only gateway-side problems are
   synthesized. The attempt count and reason are written to the log.
-- **Deleting a key cascades to its logs** in a transaction. On SQLite it then runs
-  `incremental_vacuum` to release space (`auto_vacuum=INCREMENTAL` is set at DB creation); on
-  PostgreSQL the post-delete `afterDeleteKey` hook is a no-op (autovacuum reclaims space). When
-  `request_logs` live on a **separate** backend (`logs_database`) a cross-database transaction is
-  impossible, so the cascade is best-effort: the logs are deleted first (an orphaned key is
-  recoverable — it stays listed and can be deleted again — whereas orphaned logs are not), then
-  the key row is deleted on the keys backend. On ClickHouse that delete is a synchronous
+- **Deleting a key cascades to its logs by default, but the cascade is per-key.** Each key
+  carries a `keep_logs_on_delete` flag (resolved at creation from `defaults.keep_logs_on_key_delete`,
+  or from the create request when it sets `keep_logs_on_delete`). When false (the default) deleting
+  the key also deletes its `request_logs`; when true the key row is deleted but its logs are
+  retained as orphaned rows so usage history outlives the key. The cascade runs in a transaction.
+  On SQLite it then runs `incremental_vacuum` to release space (`auto_vacuum=INCREMENTAL` is set at
+  DB creation); on PostgreSQL the post-delete `afterDeleteKey` hook is a no-op (autovacuum reclaims
+  space). When `request_logs` live on a **separate** backend (`logs_database`) a cross-database
+  transaction is impossible, so the cascade is best-effort: the logs are deleted first (an orphaned
+  key is recoverable — it stays listed and can be deleted again — whereas orphaned logs are not),
+  then the key row is deleted on the keys backend. On ClickHouse that delete is a synchronous
   `ALTER TABLE … DELETE … SETTINGS mutations_sync = 2` (no auto-increment, so log ids are
-  generated client-side as monotonic, time-ordered int64s).
+  generated client-side as monotonic, time-ordered int64s). `afterDeleteKey`/vacuum and the log
+  delete are both skipped when the key keeps its logs.
+- **`request_logs.key_name` is a snapshot, not a foreign-key reference.** It is the owning key's
+  name captured at log-creation time; the key may later be renamed or deleted (with
+  `keep_logs_on_delete`, deletion orphans the logs), and the stored `key_name` is never refreshed.
+  It is the durable record of which key served a request.
 
 ## Conventions
 

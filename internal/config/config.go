@@ -53,6 +53,12 @@ const DefaultMaxRequestBytes = 100 << 20 // 100 MiB
 // Defaults provides fallback settings applied to every provider.
 type Defaults struct {
 	Retry Retry `yaml:"retry"`
+	// KeepLogsOnKeyDelete is the fallback log-retention policy applied to a new key when the
+	// create request does not specify one: when false (the default) deleting the key also
+	// cascade-deletes its request logs; when true the logs are retained (orphaned) so usage
+	// history survives the key. A key stores its own resolved value, so changing this default
+	// only affects keys created afterward.
+	KeepLogsOnKeyDelete bool `yaml:"keep_logs_on_key_delete"`
 }
 
 // DefaultPayloadCaptureBytes caps each stored payload field when capture is enabled and no

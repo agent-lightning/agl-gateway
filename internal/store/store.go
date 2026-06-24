@@ -27,12 +27,21 @@ type APIKey struct {
 	ProviderOrder string    `json:"provider_order"`
 	CreatedAt     time.Time `json:"created_at"`
 	Disabled      bool      `json:"disabled"`
+	// KeepLogsOnDelete governs what happens to this key's request logs when the key is
+	// deleted: false (the default) cascade-deletes them; true retains them as orphaned rows
+	// so usage history outlives the key. Resolved from defaults.keep_logs_on_key_delete at
+	// creation time unless the create request overrides it.
+	KeepLogsOnDelete bool `json:"keep_logs_on_delete"`
 }
 
 // RequestLog is the recorded metadata for a single proxied request.
 type RequestLog struct {
-	ID                         int64     `json:"id"`
-	APIKeyID                   int64     `json:"api_key_id"`
+	ID       int64 `json:"id"`
+	APIKeyID int64 `json:"api_key_id"`
+	// KeyName is the owning key's name captured at log-creation time — a snapshot, not a live
+	// reference. The key may later be renamed or deleted (a key with keep_logs_on_delete set
+	// leaves these logs orphaned on deletion), so this is the only durable record of which key
+	// served the request; it is never refreshed if the key changes.
 	KeyName                    string    `json:"key_name"`
 	Provider                   string    `json:"provider"`
 	Model                      string    `json:"model"`
@@ -222,31 +231,37 @@ func (s *Store) Close() error {
 	return err
 }
 
-// CreateKey inserts a new API key and returns the stored row.
-func (s *Store) CreateKey(name, hash, prefix string, providers []string, start, order string) (*APIKey, error) {
+// CreateKey inserts a new API key and returns the stored row. keepLogsOnDelete records the
+// key's log-retention policy (see APIKey.KeepLogsOnDelete).
+func (s *Store) CreateKey(name, hash, prefix string, providers []string, start, order string, keepLogsOnDelete bool) (*APIKey, error) {
 	provJSON, err := json.Marshal(providers)
 	if err != nil {
 		return nil, err
 	}
+	keep := 0
+	if keepLogsOnDelete {
+		keep = 1
+	}
 	now := time.Now()
 	var id int64
 	err = s.db.QueryRow(s.d.rebind(
-		`INSERT INTO api_keys (name, hash, prefix, providers, provider_start, provider_order, created_at, disabled)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, 0) RETURNING id`),
-		name, hash, prefix, string(provJSON), start, order, now.UnixMilli(),
+		`INSERT INTO api_keys (name, hash, prefix, providers, provider_start, provider_order, created_at, disabled, keep_logs_on_delete)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?) RETURNING id`),
+		name, hash, prefix, string(provJSON), start, order, now.UnixMilli(), keep,
 	).Scan(&id)
 	if err != nil {
 		return nil, fmt.Errorf("create key: %w", err)
 	}
 	return &APIKey{
-		ID:            id,
-		Name:          name,
-		Hash:          hash,
-		Prefix:        prefix,
-		Providers:     providers,
-		ProviderStart: start,
-		ProviderOrder: order,
-		CreatedAt:     time.UnixMilli(now.UnixMilli()),
+		ID:               id,
+		Name:             name,
+		Hash:             hash,
+		Prefix:           prefix,
+		Providers:        providers,
+		ProviderStart:    start,
+		ProviderOrder:    order,
+		CreatedAt:        time.UnixMilli(now.UnixMilli()),
+		KeepLogsOnDelete: keepLogsOnDelete,
 	}, nil
 }
 
@@ -254,7 +269,7 @@ func (s *Store) CreateKey(name, hash, prefix string, providers []string, start, 
 // matching key exists.
 func (s *Store) KeyByHash(hash string) (*APIKey, error) {
 	row := s.db.QueryRow(s.d.rebind(
-		`SELECT id, name, hash, prefix, providers, provider_start, provider_order, created_at, disabled FROM api_keys WHERE hash = ?`), hash)
+		`SELECT id, name, hash, prefix, providers, provider_start, provider_order, created_at, disabled, keep_logs_on_delete FROM api_keys WHERE hash = ?`), hash)
 	return scanKey(row)
 }
 
@@ -262,14 +277,14 @@ func (s *Store) KeyByHash(hash string) (*APIKey, error) {
 // exists.
 func (s *Store) KeyByID(id int64) (*APIKey, error) {
 	row := s.db.QueryRow(s.d.rebind(
-		`SELECT id, name, hash, prefix, providers, provider_start, provider_order, created_at, disabled FROM api_keys WHERE id = ?`), id)
+		`SELECT id, name, hash, prefix, providers, provider_start, provider_order, created_at, disabled, keep_logs_on_delete FROM api_keys WHERE id = ?`), id)
 	return scanKey(row)
 }
 
 // ListKeys returns all API keys, newest first.
 func (s *Store) ListKeys() ([]APIKey, error) {
 	rows, err := s.db.Query(s.d.rebind(
-		`SELECT id, name, hash, prefix, providers, provider_start, provider_order, created_at, disabled FROM api_keys ORDER BY id DESC`))
+		`SELECT id, name, hash, prefix, providers, provider_start, provider_order, created_at, disabled, keep_logs_on_delete FROM api_keys ORDER BY id DESC`))
 	if err != nil {
 		return nil, err
 	}
@@ -285,22 +300,39 @@ func (s *Store) ListKeys() ([]APIKey, error) {
 	return keys, rows.Err()
 }
 
-// DeleteKey removes the key with the given id and cascades to every request log bound to
-// it, then returns freed pages to the OS. It reports whether a key row was deleted.
+// DeleteKey removes the key with the given id. By default it cascades to every request log
+// bound to the key and returns freed pages to the OS; if the key was created with
+// keep_logs_on_delete the logs are retained as orphaned rows instead (they keep the KeyName
+// captured at request time). It reports whether a key row was deleted.
 //
 // When logs live in a separate backend a cross-database transaction is impossible, so the
 // cascade is best-effort: the logs are deleted first (an orphaned key is recoverable — it
 // stays listed and can be deleted again — whereas orphaned logs are not), then the key row is
 // deleted on the keys backend.
 func (s *Store) DeleteKey(id int64) (bool, error) {
+	// The key's own policy decides whether its logs are cascaded; read it first. A missing
+	// row means there is nothing to delete.
+	var keep int
+	switch err := s.db.QueryRow(s.d.rebind(`SELECT keep_logs_on_delete FROM api_keys WHERE id = ?`), id).Scan(&keep); err {
+	case sql.ErrNoRows:
+		return false, nil
+	case nil:
+		// continue
+	default:
+		return false, err
+	}
+	cascade := keep == 0
+
 	if s.logs != nil {
-		_ = s.logs.d.deleteLogsByKey(s.logs.db, id)
+		if cascade {
+			_ = s.logs.d.deleteLogsByKey(s.logs.db, id)
+		}
 		res, err := s.db.Exec(s.d.rebind(`DELETE FROM api_keys WHERE id = ?`), id)
 		if err != nil {
 			return false, err
 		}
 		n, _ := res.RowsAffected()
-		if n > 0 {
+		if n > 0 && cascade {
 			_ = s.d.afterDeleteKey(s.db)
 		}
 		return n > 0, nil
@@ -312,8 +344,10 @@ func (s *Store) DeleteKey(id int64) (bool, error) {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.Exec(s.d.rebind(`DELETE FROM request_logs WHERE api_key_id = ?`), id); err != nil {
-		return false, err
+	if cascade {
+		if _, err := tx.Exec(s.d.rebind(`DELETE FROM request_logs WHERE api_key_id = ?`), id); err != nil {
+			return false, err
+		}
 	}
 	res, err := tx.Exec(s.d.rebind(`DELETE FROM api_keys WHERE id = ?`), id)
 	if err != nil {
@@ -323,7 +357,7 @@ func (s *Store) DeleteKey(id int64) (bool, error) {
 		return false, err
 	}
 	n, _ := res.RowsAffected()
-	if n > 0 {
+	if n > 0 && cascade {
 		// Best-effort: reclaim the space freed by the deleted logs (SQLite only).
 		_ = s.d.afterDeleteKey(s.db)
 	}
@@ -340,8 +374,9 @@ func scanKey(sc scanner) (*APIKey, error) {
 		provJSON  string
 		createdMs int64
 		disabled  int
+		keepLogs  int
 	)
-	err := sc.Scan(&k.ID, &k.Name, &k.Hash, &k.Prefix, &provJSON, &k.ProviderStart, &k.ProviderOrder, &createdMs, &disabled)
+	err := sc.Scan(&k.ID, &k.Name, &k.Hash, &k.Prefix, &provJSON, &k.ProviderStart, &k.ProviderOrder, &createdMs, &disabled, &keepLogs)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -353,6 +388,7 @@ func scanKey(sc scanner) (*APIKey, error) {
 	}
 	k.CreatedAt = time.UnixMilli(createdMs)
 	k.Disabled = disabled != 0
+	k.KeepLogsOnDelete = keepLogs != 0
 	return &k, nil
 }
 

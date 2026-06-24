@@ -67,6 +67,7 @@ export function KeysTab() {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [start, setStart] = useState<ProviderStart>('first')
   const [order, setOrder] = useState<ProviderOrder>('round_robin')
+  const [keepLogs, setKeepLogs] = useState(false)
   const [creating, setCreating] = useState(false)
   const [created, setCreated] = useState<CreatedKey | null>(null)
   const [copied, setCopied] = useState(false)
@@ -107,6 +108,7 @@ export function KeysTab() {
         providers: [...selected],
         provider_start: start,
         provider_order: order,
+        keep_logs_on_delete: keepLogs,
       })
       setCreated(key)
       setCopied(false)
@@ -266,6 +268,20 @@ export function KeysTab() {
             )}
           </div>
 
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox
+              checked={keepLogs}
+              onCheckedChange={(v) => setKeepLogs(v === true)}
+            />
+            <span>
+              Keep this key’s request logs if the key is deleted
+              <span className="text-muted-foreground">
+                {' '}
+                — otherwise they are deleted with the key
+              </span>
+            </span>
+          </label>
+
           <div>
             <Button onClick={create} disabled={creating}>
               {creating ? (
@@ -359,6 +375,12 @@ export function KeysTab() {
                     </TableCell>
                     <TableCell className="text-muted-foreground text-xs">
                       {k.provider_start} · {k.provider_order}
+                      {k.keep_logs_on_delete && (
+                        <>
+                          {' · '}
+                          <span className="text-foreground/70">logs kept</span>
+                        </>
+                      )}
                     </TableCell>
                     <TableCell
                       className="text-muted-foreground text-xs"
@@ -392,8 +414,11 @@ export function KeysTab() {
           <DialogHeader>
             <DialogTitle>Delete key “{pendingDelete?.name}”?</DialogTitle>
             <DialogDescription>
-              Requests using this key will stop working immediately. All of its request
-              logs are deleted too. This cannot be undone.
+              Requests using this key will stop working immediately.{' '}
+              {pendingDelete?.keep_logs_on_delete
+                ? 'Its request logs will be retained (kept as orphaned records).'
+                : 'All of its request logs are deleted too.'}{' '}
+              This cannot be undone.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

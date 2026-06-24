@@ -92,7 +92,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
     provider_start TEXT NOT NULL DEFAULT 'first',
     provider_order TEXT NOT NULL DEFAULT 'round_robin',
     created_at     BIGINT NOT NULL,
-    disabled       BIGINT NOT NULL DEFAULT 0
+    disabled       BIGINT NOT NULL DEFAULT 0,
+    keep_logs_on_delete BIGINT NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS request_logs (
     id                 BIGSERIAL PRIMARY KEY,
@@ -163,6 +164,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_api_key_id ON request_logs(api_key_id);
 		{"request_logs", "assembled_response_truncated", "BIGINT NOT NULL DEFAULT 0"},
 		{"api_keys", "provider_start", "TEXT NOT NULL DEFAULT 'first'"},
 		{"api_keys", "provider_order", "TEXT NOT NULL DEFAULT 'round_robin'"},
+		{"api_keys", "keep_logs_on_delete", "BIGINT NOT NULL DEFAULT 0"},
 	}
 	for _, c := range alters {
 		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s", c.table, c.column, c.decl)

@@ -46,7 +46,7 @@ func harness(t *testing.T, upstream http.Handler) (*Proxy, *store.Store, string)
 	p := New(cfg, st, testPricing(), srv.Client(), nil)
 
 	plain, display, _ := keys.Generate()
-	if _, err := st.CreateKey("dev", keys.Hash(plain), display, []string{"up"}, config.StartFirst, config.OrderRoundRobin); err != nil {
+	if _, err := st.CreateKey("dev", keys.Hash(plain), display, []string{"up"}, config.StartFirst, config.OrderRoundRobin, false); err != nil {
 		t.Fatalf("create key: %v", err)
 	}
 	return p, st, plain
@@ -498,7 +498,7 @@ func TestNetworkErrorReturns502(t *testing.T) {
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 	p := New(cfg, st, testPricing(), client, nil)
 	plain, display, _ := keys.Generate()
-	st.CreateKey("dev", keys.Hash(plain), display, []string{"dead"}, config.StartFirst, config.OrderRoundRobin)
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"dead"}, config.StartFirst, config.OrderRoundRobin, false)
 
 	rec := do(t, p, plain, "/v1/x", `{"model":"gpt-5.4"}`)
 	if rec.Code != http.StatusBadGateway {
@@ -532,7 +532,7 @@ func TestUnknownProviderNamesIgnored(t *testing.T) {
 	p, st, _ := harness(t, up)
 	// Key bound to one bogus and one real provider -> must route to the real one.
 	plain, display, _ := keys.Generate()
-	st.CreateKey("mix", keys.Hash(plain), display, []string{"ghost", "up"}, config.StartFirst, config.OrderRoundRobin)
+	st.CreateKey("mix", keys.Hash(plain), display, []string{"ghost", "up"}, config.StartFirst, config.OrderRoundRobin, false)
 
 	if rec := do(t, p, plain, "/v1/x", `{"model":"gpt-5.4"}`); rec.Code != 200 {
 		t.Errorf("status = %d, want 200", rec.Code)
@@ -564,7 +564,7 @@ func TestModelMappingRewritesAndLogs(t *testing.T) {
 	}
 	p := New(cfg, st, testPricing(), srv.Client(), nil)
 	plain, display, _ := keys.Generate()
-	st.CreateKey("dev", keys.Hash(plain), display, []string{"up"}, config.StartFirst, config.OrderRoundRobin)
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"up"}, config.StartFirst, config.OrderRoundRobin, false)
 
 	rec := do(t, p, plain, "/v1/chat/completions", `{"model":"alias","messages":[]}`)
 	if rec.Code != 200 {
@@ -605,7 +605,7 @@ func TestPricingPrefersRequestedAlias(t *testing.T) {
 	}
 	p := New(cfg, st, prices, srv.Client(), nil)
 	plain, display, _ := keys.Generate()
-	st.CreateKey("dev", keys.Hash(plain), display, []string{"up"}, config.StartFirst, config.OrderRoundRobin)
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"up"}, config.StartFirst, config.OrderRoundRobin, false)
 
 	do(t, p, plain, "/v1/x", `{"model":"alias","messages":[]}`)
 	logs, _ := st.QueryLogs(store.LogFilter{})
@@ -653,7 +653,7 @@ func TestProviderFailureErrorIsClear(t *testing.T) {
 	}
 	p := New(cfg, st, testPricing(), &http.Client{Timeout: 500 * time.Millisecond}, nil)
 	plain, display, _ := keys.Generate()
-	st.CreateKey("dev", keys.Hash(plain), display, []string{"dead"}, config.StartFirst, config.OrderRoundRobin)
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"dead"}, config.StartFirst, config.OrderRoundRobin, false)
 
 	rec := do(t, p, plain, "/v1/x", `{"model":"gpt-5.4"}`)
 	if rec.Code != http.StatusBadGateway {
@@ -746,7 +746,7 @@ func TestProviderSelectionHeader(t *testing.T) {
 	}
 	p := New(cfg, st, testPricing(), srvA.Client(), nil)
 	plain, display, _ := keys.Generate()
-	st.CreateKey("dev", keys.Hash(plain), display, []string{"a", "b"}, config.StartFirst, config.OrderRoundRobin)
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"a", "b"}, config.StartFirst, config.OrderRoundRobin, false)
 
 	send := func(provider string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/v1/x", strings.NewReader(`{"model":"gpt-5.4"}`))
@@ -881,7 +881,7 @@ func TestFailoverToNextProvider(t *testing.T) {
 	}
 	p := New(cfg, st, testPricing(), srvA.Client(), nil)
 	plain, display, _ := keys.Generate()
-	st.CreateKey("dev", keys.Hash(plain), display, []string{"a", "b"}, config.StartFirst, config.OrderRoundRobin)
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"a", "b"}, config.StartFirst, config.OrderRoundRobin, false)
 
 	rec := do(t, p, plain, "/v1/x", `{"model":"gpt-5.4"}`)
 	if rec.Code != 200 {

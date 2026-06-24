@@ -10,6 +10,7 @@ export interface APIKey {
   provider_order: string
   created_at: string
   disabled: boolean
+  keep_logs_on_delete: boolean
 }
 
 export interface CreatedKey extends APIKey {

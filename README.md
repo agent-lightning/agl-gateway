@@ -187,6 +187,20 @@ Each retry fails over to the next provider in the sequence. The retry budget com
 `max_retries >= providers-1`. The provider that served (or was last tried) is logged and
 reported in `X-AGL-Provider`.
 
+## Log retention on key deletion
+
+Deleting a key removes its `request_logs` by default. To preserve a key's usage history past
+its deletion, create the key with `keep_logs_on_delete: true` — the key row is removed but its
+logs are kept as orphaned records (they retain the `key_name` captured at request time). The
+default for keys that don't specify it comes from `defaults.keep_logs_on_key_delete` (itself
+`false` unless set). It is a per-key setting fixed at creation:
+
+```sh
+curl -X POST localhost:8080/admin/keys \
+  -H "Authorization: Bearer $MASTER_KEY" \
+  -d '{"name":"audited","providers":["openai"],"keep_logs_on_delete":true}'
+```
+
 ## Pinning a provider per request
 
 To bypass the policy, send `X-AGL-Provider: <name>`. It must name one of the key's bound
@@ -308,9 +322,9 @@ The control plane is authenticated by the **master key** (`Authorization: Bearer
 
 | Method | Path                | Body / query |
 |--------|---------------------|--------------|
-| POST   | `/admin/keys`       | `{"name","providers":[...],"provider_start","provider_order"}` → returns the plaintext key once |
+| POST   | `/admin/keys`       | `{"name","providers":[...],"provider_start","provider_order","keep_logs_on_delete"}` → returns the plaintext key once |
 | GET    | `/admin/keys`       | list keys (no secret) |
-| DELETE | `/admin/keys/{id}`  | delete a key (cascades to its logs, reclaiming space) |
+| DELETE | `/admin/keys/{id}`  | delete a key (cascades to its logs and reclaims space, unless the key was created with `keep_logs_on_delete`, which retains them) |
 | GET    | `/admin/logs`       | `?limit&offset&api_key_id&provider&since&include_payloads` — returns `{logs, limit, offset, has_more, next_offset}`; payload columns omitted unless `include_payloads=true` |
 | GET    | `/admin/logs/{id}`  | one log with its captured request/response payloads |
 | GET    | `/admin/stats`      | `?api_key_id&since` — aggregates grouped by key + model |
