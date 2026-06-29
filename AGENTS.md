@@ -93,6 +93,15 @@ Packages:
   `gateway` fault, with the attempt count, via both the JSON body and `X-AGL-*` headers.
   Provider responses (incl. surviving 4xx/5xx) pass through; only gateway-side problems are
   synthesized. The attempt count and reason are written to the log.
+- **A client disconnect is its own classification, not a provider fault.** When the request
+  context is cancelled (client hung up), the row is logged with `source=client` and status
+  `499` (`statusClientClosed`, a log-only marker — the client is already gone). Two cases: a
+  disconnect *before* any upstream response replaces the would-be provider `502` (so abandoned
+  requests don't inflate provider error rates); a disconnect *mid-stream* keeps the genuine
+  upstream status (e.g. `200`) but appends a `client disconnected mid-stream after N body bytes`
+  note to the log `error`, since the captured body/usage is truncated to what was delivered.
+  Undelivered bytes are never metered, so logged cost under-reports provider billing for aborted
+  streams — that gap is intentional (the gateway never drains an abandoned response).
 - **Every attempt is logged as its own `request_logs` row.** A logical request emits one row per
   failover attempt, all sharing a `trace_id`, ordered by 1-based `attempt_seq`, with
   `final_attempt` marking the served/last row. Only the final row carries cost/tokens/payloads;
