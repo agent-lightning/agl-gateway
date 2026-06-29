@@ -947,7 +947,10 @@ func policyHarness(t *testing.T, retry config.Retry, start, order string, names 
 
 // fail503 records hits and always returns a retryable 503. ok records hits and returns a usable body.
 func fail503(hits *atomic.Int32) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) { hits.Add(1); w.WriteHeader(http.StatusServiceUnavailable) }
+	return func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
 }
 func okJSON(hits *atomic.Int32) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
