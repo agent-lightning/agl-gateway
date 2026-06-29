@@ -120,6 +120,12 @@ Packages:
   inner object also carries `source`/`attempts`/`provider`). Upstream provider errors pass
   through verbatim.
 - Timestamps stored as unix millis; exposed as RFC3339 in JSON.
+- **Admin input is fail-loud, not fail-silent.** On `/admin/*`, scope-changing input rejects
+  with 400 when present-but-invalid rather than silently degrading to a 200 with a dropped
+  filter: unknown JSON fields are rejected (`DisallowUnknownFields`), and a malformed
+  *filter* (`api_key_id`, `since`, `until`, `provider`) or an unknown `provider` is a 400.
+  Filters absent → default; only present-but-garbage rejects. Paging hints (`limit`, `offset`)
+  stay lenient — bad values fall back to defaults. Keep the split: filters strict, paging lenient.
 - `gofmt` everything. Match the existing comment density and naming.
 
 ## Working in this repo

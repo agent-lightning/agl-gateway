@@ -516,3 +516,52 @@ func TestModelTestUnavailableWithoutDataPlane(t *testing.T) {
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
+
+// TestStrictInputValidation pins down that malformed admin input is a 400 rather than a
+// silent 200 with a quietly dropped filter or an ignored field. Absent stays default; only
+// present-but-garbage rejects.
+func TestStrictInputValidation(t *testing.T) {
+	h, _ := newAdmin(t)
+
+	// Filter params that, garbled, would otherwise silently un-scope the query.
+	bad := []string{
+		"/admin/logs?api_key_id=abc",
+		"/admin/logs?since=notadate",
+		"/admin/logs?until=notadate",
+		"/admin/logs?provider=nosuch",
+		"/admin/logs?include_payloads=maybe",
+		"/admin/stats?api_key_id=abc",
+		"/admin/stats?since=notadate",
+	}
+	for _, p := range bad {
+		if rec := req(t, h, "GET", p, master, ""); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s status = %d, want 400", p, rec.Code)
+		}
+	}
+
+	// Paging hints stay lenient: garbage falls back to defaults, still 200.
+	for _, p := range []string{"/admin/logs?limit=foo", "/admin/logs?offset=foo"} {
+		if rec := req(t, h, "GET", p, master, ""); rec.Code != http.StatusOK {
+			t.Errorf("%s status = %d, want 200", p, rec.Code)
+		}
+	}
+	// Absent filters are fine.
+	if rec := req(t, h, "GET", "/admin/logs", master, ""); rec.Code != http.StatusOK {
+		t.Errorf("no params status = %d, want 200", rec.Code)
+	}
+
+	// Unknown JSON fields are rejected instead of silently ignored.
+	if rec := req(t, h, "POST", "/admin/keys", master, `{"name":"x","providers":["openai"],"keeplogs":true}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("unknown field status = %d, want 400", rec.Code)
+	}
+
+	// An unknown provider filter on /admin/test fails loudly rather than testing nothing.
+	noop := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+	cfg := &config.Config{MasterKey: master, Providers: []config.Provider{{Name: "openai", BaseURL: "http://x"}}}
+	st, _ := store.Open(":memory:")
+	t.Cleanup(func() { st.Close() })
+	th := New(cfg, st, nil, noop, nil).Handler()
+	if rec := req(t, th, "POST", "/admin/test", master, `{"provider":"nosuch"}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("unknown test provider status = %d, want 400", rec.Code)
+	}
+}

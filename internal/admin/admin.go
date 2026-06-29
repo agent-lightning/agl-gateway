@@ -94,7 +94,9 @@ type createKeyResponse struct {
 
 func (a *Admin) createKey(w http.ResponseWriter, r *http.Request) {
 	var req createKeyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid JSON body"))
 		return
 	}
@@ -197,15 +199,39 @@ type logsResponse struct {
 
 func (a *Admin) listLogs(w http.ResponseWriter, r *http.Request) {
 	limit, offset := logPage(r)
-	apiKeyID := queryInt64(r, "api_key_id")
+	apiKeyID, err := queryInt64(r, "api_key_id")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errBody(err.Error()))
+		return
+	}
+	since, err := queryTime(r, "since")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errBody(err.Error()))
+		return
+	}
+	until, err := queryTime(r, "until")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errBody(err.Error()))
+		return
+	}
+	provider := r.URL.Query().Get("provider")
+	if provider != "" && a.cfg.Provider(provider) == nil {
+		writeJSON(w, http.StatusBadRequest, errBody("unknown provider: "+provider))
+		return
+	}
+	includePayloads, err := queryBool(r, "include_payloads")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errBody(err.Error()))
+		return
+	}
 	logs, err := a.store.QueryLogs(store.LogFilter{
 		APIKeyID:        apiKeyID,
-		Provider:        r.URL.Query().Get("provider"),
-		Since:           querySince(r),
-		Until:           queryTime(r, "until"),
+		Provider:        provider,
+		Since:           since,
+		Until:           until,
 		Limit:           limit + 1, // fetch one extra to detect a further page
 		Offset:          offset,
-		IncludePayloads: queryBool(r, "include_payloads"),
+		IncludePayloads: includePayloads,
 	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errBody("could not query logs"))
@@ -252,7 +278,22 @@ func (a *Admin) getLog(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *Admin) stats(w http.ResponseWriter, r *http.Request) {
-	f := store.LogFilter{APIKeyID: queryInt64(r, "api_key_id"), Since: querySince(r), Until: queryTime(r, "until")}
+	apiKeyID, err := queryInt64(r, "api_key_id")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errBody(err.Error()))
+		return
+	}
+	since, err := queryTime(r, "since")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errBody(err.Error()))
+		return
+	}
+	until, err := queryTime(r, "until")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errBody(err.Error()))
+		return
+	}
+	f := store.LogFilter{APIKeyID: apiKeyID, Since: since, Until: until}
 	st, err := a.store.Stats(f)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errBody("could not query stats"))
@@ -397,10 +438,16 @@ func (a *Admin) test(w http.ResponseWriter, r *http.Request) {
 	req := testRequest{MaxTokens: 16, Concurrency: 8}
 	if r.Body != nil {
 		// An empty body is fine; defaults apply. Only a malformed body is an error.
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err != io.EOF {
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil && err != io.EOF {
 			writeJSON(w, http.StatusBadRequest, errBody("invalid JSON body"))
 			return
 		}
+	}
+	if req.Provider != "" && a.cfg.Provider(req.Provider) == nil {
+		writeJSON(w, http.StatusBadRequest, errBody("unknown provider: "+req.Provider))
+		return
 	}
 	if req.MaxTokens <= 0 {
 		req.MaxTokens = 16
@@ -525,54 +572,71 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func errBody(msg string) any { return map[string]any{"error": map[string]string{"message": msg}} }
 
-func queryInt64(r *http.Request, key string) int64 {
-	n, _ := strconv.ParseInt(r.URL.Query().Get(key), 10, 64)
-	return n
+// queryInt64 parses the named query parameter as an int64. Absent → 0, no error; present but
+// non-numeric → error, so a typo'd filter is a 400 rather than a silently dropped scope.
+func queryInt64(r *http.Request, key string) (int64, error) {
+	v := strings.TrimSpace(r.URL.Query().Get(key))
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s", key)
+	}
+	return n, nil
 }
 
 func logPage(r *http.Request) (limit, offset int) {
-	limit = int(queryInt64(r, "limit"))
+	// Paging hints stay lenient: garbage falls back to defaults rather than 400ing.
+	limit = int(parseInt64(r, "limit"))
 	if limit <= 0 {
 		limit = defaultLogLimit
 	}
 	if limit > maxLogLimit {
 		limit = maxLogLimit
 	}
-	offset = max(int(queryInt64(r, "offset")), 0)
+	offset = max(int(parseInt64(r, "offset")), 0)
 	return limit, offset
 }
 
+// parseInt64 is the lenient counterpart used for paging hints: any error yields 0.
+func parseInt64(r *http.Request, key string) int64 {
+	n, _ := strconv.ParseInt(r.URL.Query().Get(key), 10, 64)
+	return n
+}
+
 // queryBool reports whether a query parameter is present and truthy ("1", "true", "yes",
-// "on"; case-insensitive).
-func queryBool(r *http.Request, key string) bool {
+// "on"; case-insensitive). Absent → false; present but unrecognized → error.
+func queryBool(r *http.Request, key string) (bool, error) {
 	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get(key))) {
+	case "":
+		return false, nil
 	case "1", "true", "yes", "on":
-		return true
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
 	default:
-		return false
+		return false, fmt.Errorf("invalid %s", key)
 	}
 }
 
-// querySince accepts an RFC3339 timestamp, a Go duration window (e.g. "24h"), or unix
-// milliseconds. It returns the zero time when absent or unparseable.
-func querySince(r *http.Request) time.Time { return queryTime(r, "since") }
-
 // queryTime parses the named query parameter as an RFC3339 timestamp, a Go duration window
-// relative to now (e.g. "24h" → 24 hours ago), or unix milliseconds. It returns the zero
-// time when the parameter is absent or unparseable.
-func queryTime(r *http.Request, key string) time.Time {
+// relative to now (e.g. "24h" → 24 hours ago), or unix milliseconds. Absent → zero time, no
+// error; present but unparseable → error, so a bad window is a 400 rather than silently
+// returning unfiltered results.
+func queryTime(r *http.Request, key string) (time.Time, error) {
 	v := strings.TrimSpace(r.URL.Query().Get(key))
 	if v == "" {
-		return time.Time{}
+		return time.Time{}, nil
 	}
 	if t, err := time.Parse(time.RFC3339, v); err == nil {
-		return t
+		return t, nil
 	}
 	if d, err := time.ParseDuration(v); err == nil {
-		return time.Now().Add(-d)
+		return time.Now().Add(-d), nil
 	}
 	if ms, err := strconv.ParseInt(v, 10, 64); err == nil {
-		return time.UnixMilli(ms)
+		return time.UnixMilli(ms), nil
 	}
-	return time.Time{}
+	return time.Time{}, fmt.Errorf("invalid %s", key)
 }
