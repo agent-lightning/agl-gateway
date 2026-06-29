@@ -311,6 +311,44 @@ func TestGetLogByID(t *testing.T) {
 	}
 }
 
+// A multi-attempt trace: the served log is returned with its earlier failover attempts inlined,
+// and the default list still shows just the one (final) row.
+func TestGetLogWithAttempts(t *testing.T) {
+	h, st := newAdmin(t)
+	trace := st.NewTraceID()
+	if err := st.InsertLog(&store.RequestLog{
+		APIKeyID: 1, KeyName: "dev", Provider: "a", Model: "m", StatusCode: 503,
+		TraceID: trace, AttemptSeq: 1, FinalAttempt: false, Error: `provider "a" returned HTTP 503`,
+	}); err != nil {
+		t.Fatalf("InsertLog: %v", err)
+	}
+	if err := st.InsertLog(&store.RequestLog{
+		APIKeyID: 1, KeyName: "dev", Provider: "b", Model: "m", StatusCode: 200,
+		TraceID: trace, AttemptSeq: 2, FinalAttempt: true,
+	}); err != nil {
+		t.Fatalf("InsertLog: %v", err)
+	}
+
+	rec := req(t, h, "GET", "/admin/logs", master, "")
+	var page logsResponse
+	json.Unmarshal(rec.Body.Bytes(), &page)
+	if len(page.Logs) != 1 || page.Logs[0].Provider != "b" {
+		t.Fatalf("list = %+v, want 1 final row (b)", page.Logs)
+	}
+
+	rec = req(t, h, "GET", "/admin/logs/"+itoa(page.Logs[0].ID), master, "")
+	var full struct {
+		store.RequestLog
+		Attempts []store.RequestLog `json:"attempts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &full); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(full.Attempts) != 1 || full.Attempts[0].Provider != "a" || full.Attempts[0].StatusCode != 503 {
+		t.Fatalf("attempts = %+v, want one a/503", full.Attempts)
+	}
+}
+
 func TestLogsTimeWindow(t *testing.T) {
 	h, st := newAdmin(t)
 	base := time.Now().UTC()

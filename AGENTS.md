@@ -93,6 +93,14 @@ Packages:
   `gateway` fault, with the attempt count, via both the JSON body and `X-AGL-*` headers.
   Provider responses (incl. surviving 4xx/5xx) pass through; only gateway-side problems are
   synthesized. The attempt count and reason are written to the log.
+- **Every attempt is logged as its own `request_logs` row.** A logical request emits one row per
+  failover attempt, all sharing a `trace_id`, ordered by 1-based `attempt_seq`, with
+  `final_attempt` marking the served/last row. Only the final row carries cost/tokens/payloads;
+  earlier rows hold just provider+status+error. Stats and the default log list filter
+  `final_attempt = 1` (siblings never inflate counts/cost); a `TraceID` filter fetches the whole
+  trace, and the inspector inlines the earlier attempts. `InsertLog` defaults a seq-0 row to a
+  single final attempt, so non-proxy callers stay visible. There is no `attempts` count column —
+  the count is the max `attempt_seq`; old rows backfill `trace_id = id`, `attempt_seq = attempts`.
 - **Deleting a key cascades to its logs by default, but the cascade is per-key.** Each key
   carries a `keep_logs_on_delete` flag (resolved at creation from `defaults.keep_logs_on_key_delete`,
   or from the create request when it sets `keep_logs_on_delete`). When false (the default) deleting

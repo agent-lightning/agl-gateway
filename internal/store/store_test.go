@@ -232,7 +232,7 @@ func TestLogMappedModelAndAttempts(t *testing.T) {
 	eachBackend(t, func(t *testing.T, s *Store) {
 		if err := s.InsertLog(&RequestLog{
 			APIKeyID: 1, KeyName: "dev", Provider: "openai",
-			Model: "alias", MappedModel: "gpt-5.4", Attempts: 3, StatusCode: 200,
+			Model: "alias", MappedModel: "gpt-5.4", AttemptSeq: 3, FinalAttempt: true, StatusCode: 200,
 			APIType: "openai_chat", AssembleError: "anthropic accumulate: boom",
 			RequestContentType: "application/json", ResponseContentType: "text/event-stream",
 			Method: "POST", Path: "/v1/chat/completions", Query: "beta=true",
@@ -245,7 +245,7 @@ func TestLogMappedModelAndAttempts(t *testing.T) {
 		if len(logs) != 1 {
 			t.Fatalf("logs = %d", len(logs))
 		}
-		if logs[0].MappedModel != "gpt-5.4" || logs[0].Attempts != 3 {
+		if logs[0].MappedModel != "gpt-5.4" || logs[0].AttemptSeq != 3 {
 			t.Errorf("round-trip mismatch: %+v", logs[0])
 		}
 		// api_type and assemble_error are returned without IncludePayloads.
@@ -265,6 +265,35 @@ func TestLogMappedModelAndAttempts(t *testing.T) {
 		}
 		if got.RequestBytes != 42 || got.ResponseBytes != 1024 {
 			t.Errorf("byte counts = %d / %d", got.RequestBytes, got.ResponseBytes)
+		}
+	})
+}
+
+// A multi-attempt trace: earlier failover rows share the served row's trace_id; the default list
+// collapses to the final row, a trace fetch returns every attempt in order, and Stats counts only
+// the final row so failover siblings never inflate request/cost totals.
+func TestTraceAttempts(t *testing.T) {
+	eachBackend(t, func(t *testing.T, s *Store) {
+		trace := s.NewTraceID()
+		if err := s.InsertLog(&RequestLog{APIKeyID: 1, KeyName: "dev", Provider: "a", Model: "m",
+			StatusCode: 503, TraceID: trace, AttemptSeq: 1, FinalAttempt: false}); err != nil {
+			t.Fatalf("InsertLog sibling: %v", err)
+		}
+		if err := s.InsertLog(&RequestLog{APIKeyID: 1, KeyName: "dev", Provider: "b", Model: "m",
+			StatusCode: 200, Cost: 0.5, TraceID: trace, AttemptSeq: 2, FinalAttempt: true}); err != nil {
+			t.Fatalf("InsertLog final: %v", err)
+		}
+		final, _ := s.QueryLogs(LogFilter{})
+		if len(final) != 1 || final[0].Provider != "b" || final[0].AttemptSeq != 2 || !final[0].FinalAttempt {
+			t.Fatalf("default list = %+v, want one final b", final)
+		}
+		trips, _ := s.QueryLogs(LogFilter{TraceID: trace})
+		if len(trips) != 2 || trips[0].Provider != "a" || trips[1].Provider != "b" {
+			t.Fatalf("trace fetch = %+v, want a then b", trips)
+		}
+		stats, _ := s.Stats(LogFilter{})
+		if len(stats) != 1 || stats[0].Requests != 1 || stats[0].Cost != 0.5 {
+			t.Fatalf("stats = %+v, want 1 request, 0.5 cost (siblings excluded)", stats)
 		}
 	})
 }

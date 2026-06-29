@@ -113,7 +113,9 @@ CREATE TABLE IF NOT EXISTS request_logs (
     response_bytes     BIGINT NOT NULL DEFAULT 0,
     status_code        BIGINT NOT NULL,
     streaming          BIGINT NOT NULL,
-    attempts           BIGINT NOT NULL DEFAULT 0,
+    trace_id           BIGINT NOT NULL DEFAULT 0,
+    attempt_seq        BIGINT NOT NULL DEFAULT 1,
+    final_attempt      BIGINT NOT NULL DEFAULT 1,
     ttft_ms            BIGINT NOT NULL,
     duration_ms        BIGINT NOT NULL,
     input_tokens       BIGINT NOT NULL,
@@ -149,7 +151,9 @@ CREATE INDEX IF NOT EXISTS idx_logs_api_key_id ON request_logs(api_key_id);
 		{"request_logs", "query", "TEXT NOT NULL DEFAULT ''"},
 		{"request_logs", "client_addr", "TEXT NOT NULL DEFAULT ''"},
 		{"request_logs", "user_agent", "TEXT NOT NULL DEFAULT ''"},
-		{"request_logs", "attempts", "BIGINT NOT NULL DEFAULT 0"},
+		{"request_logs", "trace_id", "BIGINT NOT NULL DEFAULT 0"},
+		{"request_logs", "attempt_seq", "BIGINT NOT NULL DEFAULT 1"},
+		{"request_logs", "final_attempt", "BIGINT NOT NULL DEFAULT 1"},
 		{"request_logs", "request_content_type", "TEXT NOT NULL DEFAULT ''"},
 		{"request_logs", "response_content_type", "TEXT NOT NULL DEFAULT ''"},
 		{"request_logs", "request_bytes", "BIGINT NOT NULL DEFAULT 0"},
@@ -171,6 +175,19 @@ CREATE INDEX IF NOT EXISTS idx_logs_api_key_id ON request_logs(api_key_id);
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("add column %s.%s: %w", c.table, c.column, err)
 		}
+	}
+	// Backfill pre-trace rows: each becomes its own single-attempt trace (trace_id = id) and its
+	// 1-based seq is the legacy attempts count. attempt_seq is migrated only when the old column
+	// exists; the column-presence guard keeps the migration on a fresh DB clean. WHERE trace_id = 0
+	// hits only pre-migration rows, so this is a one-time no-op afterward.
+	backfill := `UPDATE request_logs SET trace_id = id WHERE trace_id = 0`
+	var hasAttempts bool
+	_ = db.QueryRow(`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='request_logs' AND column_name='attempts')`).Scan(&hasAttempts)
+	if hasAttempts {
+		backfill = `UPDATE request_logs SET trace_id = id, attempt_seq = GREATEST(attempts, 1) WHERE trace_id = 0`
+	}
+	if _, err := db.Exec(backfill); err != nil {
+		return fmt.Errorf("backfill trace_id: %w", err)
 	}
 	return nil
 }

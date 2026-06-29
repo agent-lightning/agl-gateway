@@ -259,7 +259,7 @@ export function LogsTab() {
                       </span>
                     </TableCell>
                     <TableCell className="tabular text-right">
-                      {l.attempts}
+                      {l.attempt_seq}
                     </TableCell>
                     <TableCell className="tabular text-muted-foreground text-right text-xs">
                       {l.ttft_ms ? formatDuration(l.ttft_ms) : '—'}

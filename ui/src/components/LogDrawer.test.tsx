@@ -32,7 +32,9 @@ function makeLog(): RequestLog {
     response_bytes: 128,
     status_code: 200,
     streaming: false,
-    attempts: 1,
+    trace_id: '7',
+    attempt_seq: 1,
+    final_attempt: true,
     ttft_ms: 0,
     duration_ms: 12,
     input_tokens: 1,
@@ -103,5 +105,21 @@ describe('LogDrawer payload wrapping', () => {
     // Request/response byte sizes are formatted.
     expect(screen.getByText('42 B')).toBeInTheDocument()
     expect(screen.getByText('128 B')).toBeInTheDocument()
+  })
+
+  it('lists earlier failover attempts when the trace has more than one', async () => {
+    const final = makeLog()
+    final.attempt_seq = 2
+    final.attempts = [
+      { ...makeLog(), provider: 'flaky', status_code: 503, attempt_seq: 1, final_attempt: false, error: 'busy' },
+    ]
+    apiMock.mockReset().mockResolvedValue(final)
+    renderDrawer()
+
+    expect(await screen.findByText('Attempts')).toBeInTheDocument()
+    expect(screen.getByText('flaky')).toBeInTheDocument()
+    expect(screen.getByText('503')).toBeInTheDocument()
+    expect(screen.getByText('busy')).toBeInTheDocument()
+    expect(screen.getByText('served')).toBeInTheDocument()
   })
 })

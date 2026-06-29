@@ -97,6 +97,10 @@ export function LogDrawer({ logId, preview, open, onClose }: Props) {
 
                 <RequestInfo log={log} />
 
+                {full?.attempts && full.attempts.length > 0 && (
+                  <AttemptsPanel attempts={full.attempts} final={log} />
+                )}
+
                 {(log.error || log.assemble_error) && (
                   <ErrorPanel log={log} />
                 )}
@@ -155,7 +159,7 @@ function MetaGrid({ log }: { log: RequestLog }) {
   return (
     <div className="bg-muted/40 grid grid-cols-2 gap-4 rounded-lg border p-4 sm:grid-cols-3">
       <MetaItem label="Key" value={log.key_name || '—'} className="font-sans" />
-      <MetaItem label="Attempts" value={log.attempts} />
+      <MetaItem label="Attempts" value={log.attempt_seq} />
       <MetaItem label="Cost" value={formatCost(log.cost)} />
       <MetaItem
         label="TTFT"
@@ -197,6 +201,46 @@ function RequestInfo({ log }: { log: RequestLog }) {
           <span className="font-medium">User-Agent:</span> {log.user_agent}
         </div>
       )}
+    </div>
+  )
+}
+
+function AttemptsPanel({
+  attempts,
+  final,
+}: {
+  attempts: RequestLog[]
+  final: RequestLog
+}) {
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border p-4">
+      <h3 className="text-sm font-semibold">Attempts</h3>
+      <ol className="flex flex-col gap-1.5">
+        {attempts.map((a, i) => (
+          <li key={i} className="flex items-baseline gap-2 text-sm">
+            <span className="text-muted-foreground tabular w-4 text-xs">
+              {a.attempt_seq}.
+            </span>
+            <span className="font-mono">{a.provider || '—'}</span>
+            <span className={cn('font-mono', statusClass(a.status_code))}>
+              {a.status_code || 'net err'}
+            </span>
+            {a.error && (
+              <span className="text-muted-foreground truncate text-xs" title={a.error}>
+                {a.error}
+              </span>
+            )}
+          </li>
+        ))}
+        <li className="flex items-baseline gap-2 text-sm">
+          <span className="text-muted-foreground tabular w-4 text-xs">→</span>
+          <span className="font-medium">served</span>
+          <span className="font-mono">{final.provider || '—'}</span>
+          <span className={cn('font-mono', statusClass(final.status_code))}>
+            {final.status_code || '—'}
+          </span>
+        </li>
+      </ol>
     </div>
   )
 }

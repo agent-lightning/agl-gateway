@@ -110,7 +110,9 @@ CREATE TABLE IF NOT EXISTS request_logs (
     response_bytes     Int64 DEFAULT 0,
     status_code        Int64,
     streaming          UInt8,
-    attempts           Int64 DEFAULT 0,
+    trace_id           Int64 DEFAULT 0,
+    attempt_seq        Int64 DEFAULT 1,
+    final_attempt      UInt8 DEFAULT 1,
     ttft_ms            Int64,
     duration_ms        Int64,
     input_tokens       Int64,
@@ -144,7 +146,9 @@ CREATE TABLE IF NOT EXISTS request_logs (
 		{"query", "String DEFAULT ''"},
 		{"client_addr", "String DEFAULT ''"},
 		{"user_agent", "String DEFAULT ''"},
-		{"attempts", "Int64 DEFAULT 0"},
+		{"trace_id", "Int64 DEFAULT 0"},
+		{"attempt_seq", "Int64 DEFAULT 1"},
+		{"final_attempt", "UInt8 DEFAULT 1"},
 		{"request_content_type", "String DEFAULT ''"},
 		{"response_content_type", "String DEFAULT ''"},
 		{"request_bytes", "Int64 DEFAULT 0"},
@@ -163,6 +167,19 @@ CREATE TABLE IF NOT EXISTS request_logs (
 		if _, err := db.Exec(stmt); err != nil {
 			return fmt.Errorf("add column request_logs.%s: %w", c.column, err)
 		}
+	}
+	// Backfill pre-trace rows as single-attempt traces (trace_id = id, seq = legacy attempts).
+	// ClickHouse rewrites via a synchronous ALTER…UPDATE mutation; trace_id = 0 selects only the
+	// old rows. attempt_seq is migrated only when the legacy column still exists (fresh tables
+	// never created it). Empty/new tables match nothing, so this is a one-time no-op afterward.
+	backfill := `ALTER TABLE request_logs UPDATE trace_id = id WHERE trace_id = 0 SETTINGS mutations_sync = 2`
+	var hasAttempts uint8
+	_ = db.QueryRow(`SELECT count() FROM system.columns WHERE table = 'request_logs' AND name = 'attempts'`).Scan(&hasAttempts)
+	if hasAttempts > 0 {
+		backfill = `ALTER TABLE request_logs UPDATE trace_id = id, attempt_seq = greatest(attempts, 1) WHERE trace_id = 0 SETTINGS mutations_sync = 2`
+	}
+	if _, err := db.Exec(backfill); err != nil {
+		return fmt.Errorf("backfill trace_id: %w", err)
 	}
 	return nil
 }

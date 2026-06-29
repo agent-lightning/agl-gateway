@@ -40,29 +40,39 @@ type RequestLog struct {
 	// time.Now().UnixMilli()<<20 (~1e18), which overflow a JSON number's exact range in
 	// JavaScript (Number.MAX_SAFE_INTEGER ≈ 9e15) and would round, so the portal could no
 	// longer fetch a log by its id. A string round-trips the int64 losslessly.
-	ID       int64 `json:"id,string"`
+	ID int64 `json:"id,string"`
+	// TraceID links every attempt of one logical client request. The final/served attempt and
+	// any earlier failover attempts share it. For rows predating the column it equals ID (a
+	// migration backfills trace_id = id), so every old log is a self-contained single-attempt
+	// trace. Serialized as a string for the same JS-precision reason as ID.
+	TraceID  int64 `json:"trace_id,string"`
 	APIKeyID int64 `json:"api_key_id"`
 	// KeyName is the owning key's name captured at log-creation time — a snapshot, not a live
 	// reference. The key may later be renamed or deleted (a key with keep_logs_on_delete set
 	// leaves these logs orphaned on deletion), so this is the only durable record of which key
 	// served the request; it is never refreshed if the key changes.
-	KeyName                    string    `json:"key_name"`
-	Provider                   string    `json:"provider"`
-	Model                      string    `json:"model"`
-	MappedModel                string    `json:"mapped_model"`
-	Method                     string    `json:"method"`
-	Path                       string    `json:"path"`
-	Query                      string    `json:"query"`
-	ClientAddr                 string    `json:"client_addr"`
-	UserAgent                  string    `json:"user_agent"`
-	RequestContentType         string    `json:"request_content_type"`
-	ResponseContentType        string    `json:"response_content_type"`
-	RequestBytes               int64     `json:"request_bytes"`
-	ResponseBytes              int64     `json:"response_bytes"`
-	StatusCode                 int       `json:"status_code"`
-	Streaming                  bool      `json:"streaming"`
-	APIType                    string    `json:"api_type,omitempty"`
-	Attempts                   int       `json:"attempts"`
+	KeyName             string `json:"key_name"`
+	Provider            string `json:"provider"`
+	Model               string `json:"model"`
+	MappedModel         string `json:"mapped_model"`
+	Method              string `json:"method"`
+	Path                string `json:"path"`
+	Query               string `json:"query"`
+	ClientAddr          string `json:"client_addr"`
+	UserAgent           string `json:"user_agent"`
+	RequestContentType  string `json:"request_content_type"`
+	ResponseContentType string `json:"response_content_type"`
+	RequestBytes        int64  `json:"request_bytes"`
+	ResponseBytes       int64  `json:"response_bytes"`
+	StatusCode          int    `json:"status_code"`
+	Streaming           bool   `json:"streaming"`
+	APIType             string `json:"api_type,omitempty"`
+	// AttemptSeq is this row's 1-based position in its trace (1 = first attempt). FinalAttempt
+	// marks the row that served the client (or the last one tried). Together they replace the
+	// old single attempts count: a trace's attempt count is its max AttemptSeq, and only the
+	// final row carries cost/tokens/payloads.
+	AttemptSeq                 int       `json:"attempt_seq"`
+	FinalAttempt               bool      `json:"final_attempt"`
 	TTFTMillis                 int64     `json:"ttft_ms"`
 	DurationMillis             int64     `json:"duration_ms"`
 	InputTokens                int       `json:"input_tokens"`
@@ -89,6 +99,9 @@ type LogFilter struct {
 	ID       int64
 	APIKeyID int64
 	Provider string
+	// TraceID fetches every attempt of one logical request (the served row plus earlier
+	// failovers), ordered by AttemptSeq ascending. When set, the final-only default is lifted.
+	TraceID int64
 	// Since and Until bound the created_at window: created_at >= Since and created_at <
 	// Until. Either may be zero to leave that side unbounded, so a fixed period is expressed
 	// by setting both.
@@ -396,11 +409,26 @@ func scanKey(sc scanner) (*APIKey, error) {
 	return &k, nil
 }
 
+// traceGen mints trace ids for whole-request attempt grouping, shared across backends. Same
+// scheme as the ClickHouse log-id generator: a time-ordered int64 that stays above any
+// backfilled trace_id (= a small auto-increment id), so old and new traces never collide.
+var traceGen idGen
+
+// NewTraceID returns a fresh trace id linking the attempt rows of one logical request.
+func (s *Store) NewTraceID() int64 { return traceGen.next() }
+
 // InsertLog records a request log row, stamping CreatedAt if unset. The row goes to the logs
 // backend (the separate one when attached, else the keys backend).
 func (s *Store) InsertLog(l *RequestLog) error {
 	if l.CreatedAt.IsZero() {
 		l.CreatedAt = time.Now()
+	}
+	// A row with no attempt position is a standalone request: its own single, final attempt.
+	// Failover siblings always set a 1-based AttemptSeq, so this only defaults plain inserts and
+	// keeps them visible in the final-only default listing.
+	if l.AttemptSeq == 0 {
+		l.AttemptSeq = 1
+		l.FinalAttempt = true
 	}
 	db, d := s.logTarget()
 
@@ -416,7 +444,7 @@ func (s *Store) InsertLog(l *RequestLog) error {
 
 	cols := `api_key_id, key_name, provider, model, mapped_model, method, path, query,
 	  client_addr, user_agent, request_content_type, response_content_type,
-	  request_bytes, response_bytes, status_code, streaming, attempts,
+	  request_bytes, response_bytes, status_code, streaming, trace_id, attempt_seq, final_attempt,
 	  ttft_ms, duration_ms, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
 	  cost, error, api_type, assemble_error, raw_request, raw_response, assembled_response, raw_request_truncated,
 	  raw_response_truncated, assembled_response_truncated, created_at`
@@ -424,7 +452,7 @@ func (s *Store) InsertLog(l *RequestLog) error {
 		l.APIKeyID, l.KeyName, l.Provider, l.Model, l.MappedModel, l.Method, l.Path, l.Query,
 		l.ClientAddr, l.UserAgent, l.RequestContentType, l.ResponseContentType,
 		l.RequestBytes, l.ResponseBytes, l.StatusCode, b2i(l.Streaming),
-		l.Attempts, l.TTFTMillis, l.DurationMillis, l.InputTokens, l.OutputTokens, l.CacheReadTokens,
+		l.TraceID, l.AttemptSeq, b2i(l.FinalAttempt), l.TTFTMillis, l.DurationMillis, l.InputTokens, l.OutputTokens, l.CacheReadTokens,
 		l.CacheWriteTokens, l.Cost, l.Error, l.APIType, l.AssembleError, rawReq, rawResp, assembled,
 		b2i(l.RawRequestTruncated), b2i(l.RawResponseTruncated), b2i(l.AssembledResponseTruncated),
 		l.CreatedAt.UnixMilli(),
@@ -447,7 +475,7 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 	cols := `id, api_key_id, key_name, provider, model, mapped_model, method, path, query,
 	             client_addr, user_agent, status_code, streaming,
 	             request_content_type, response_content_type, request_bytes, response_bytes,
-	             attempts, ttft_ms, duration_ms,
+	             trace_id, attempt_seq, final_attempt, ttft_ms, duration_ms,
 	             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost, error,
 	             api_type, assemble_error,`
 	if f.IncludePayloads {
@@ -468,6 +496,15 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 		q += " AND provider = ?"
 		args = append(args, f.Provider)
 	}
+	if f.TraceID > 0 {
+		q += " AND trace_id = ?"
+		args = append(args, f.TraceID)
+	} else if f.ID == 0 {
+		// Default listing collapses each trace to its served/last row; earlier failover attempts
+		// are reached only by id or by a trace_id fetch (the inspector). A by-id lookup keeps
+		// every row addressable.
+		q += " AND final_attempt = 1"
+	}
 	if !f.Since.IsZero() {
 		q += " AND created_at >= ?"
 		args = append(args, f.Since.UnixMilli())
@@ -476,7 +513,12 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 		q += " AND created_at < ?"
 		args = append(args, f.Until.UnixMilli())
 	}
-	q += " ORDER BY id DESC"
+	// A trace fetch reads in attempt order; everything else is newest-first.
+	if f.TraceID > 0 {
+		q += " ORDER BY attempt_seq ASC"
+	} else {
+		q += " ORDER BY id DESC"
+	}
 	limit := f.Limit
 	if limit <= 0 {
 		limit = 100
@@ -498,6 +540,7 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 		var (
 			l                  RequestLog
 			streaming          int
+			finalAttempt       int
 			rawReqTruncated    int
 			rawRespTruncated   int
 			assembledTruncated int
@@ -507,7 +550,7 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 			&l.Method, &l.Path, &l.Query, &l.ClientAddr, &l.UserAgent,
 			&l.StatusCode, &streaming, &l.RequestContentType, &l.ResponseContentType,
 			&l.RequestBytes, &l.ResponseBytes,
-			&l.Attempts, &l.TTFTMillis, &l.DurationMillis, &l.InputTokens, &l.OutputTokens,
+			&l.TraceID, &l.AttemptSeq, &finalAttempt, &l.TTFTMillis, &l.DurationMillis, &l.InputTokens, &l.OutputTokens,
 			&l.CacheReadTokens, &l.CacheWriteTokens, &l.Cost, &l.Error, &l.APIType, &l.AssembleError}
 		if f.IncludePayloads {
 			dest = append(dest, &l.RawRequest, &l.RawResponse, &l.AssembledResponse)
@@ -517,6 +560,7 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 			return nil, err
 		}
 		l.Streaming = streaming != 0
+		l.FinalAttempt = finalAttempt != 0
 		l.RawRequestTruncated = rawReqTruncated != 0
 		l.RawResponseTruncated = rawRespTruncated != 0
 		l.AssembledResponseTruncated = assembledTruncated != 0
@@ -532,7 +576,7 @@ func (s *Store) Stats(f LogFilter) ([]Stat, error) {
 	q := `SELECT api_key_id, key_name, model, COUNT(*),
 	             ` + d.sumInt("input_tokens") + `, ` + d.sumInt("output_tokens") + `, ` +
 		d.sumInt("cache_read_tokens") + `, ` + d.sumInt("cache_write_tokens") + `, SUM(cost)
-	      FROM request_logs WHERE 1=1`
+	      FROM request_logs WHERE final_attempt = 1`
 	var args []any
 	if f.APIKeyID > 0 {
 		q += " AND api_key_id = ?"

@@ -38,7 +38,9 @@ export interface RequestLog {
   status_code: number
   streaming: boolean
   api_type?: string
-  attempts: number
+  trace_id: string
+  attempt_seq: number
+  final_attempt: boolean
   ttft_ms: number
   duration_ms: number
   input_tokens: number
@@ -55,6 +57,9 @@ export interface RequestLog {
   raw_response_truncated: boolean
   assembled_response_truncated: boolean
   created_at: string
+  // Only on the single-log fetch (GET /admin/logs/{id}): the earlier failover attempts of this
+  // trace, oldest first. Each carries provider/status/error but no cost/tokens/payloads.
+  attempts?: RequestLog[]
 }
 
 export interface LogsResponse {

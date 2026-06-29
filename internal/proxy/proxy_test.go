@@ -334,7 +334,7 @@ func TestRetryOnLiteLLMTagBug401(t *testing.T) {
 		t.Errorf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 	logs, _ := st.QueryLogs(store.LogFilter{})
-	if len(logs) != 1 || logs[0].StatusCode != http.StatusOK || logs[0].Attempts != 2 {
+	if len(logs) != 1 || logs[0].StatusCode != http.StatusOK || logs[0].AttemptSeq != 2 {
 		t.Errorf("expected one 200 log with 2 attempts, got %+v", logs)
 	}
 }
@@ -361,7 +361,7 @@ func TestNoRetryOnGeneric401(t *testing.T) {
 		t.Errorf("body = %q, want %q (must pass through unchanged)", rec.Body.String(), body)
 	}
 	logs, _ := st.QueryLogs(store.LogFilter{})
-	if len(logs) != 1 || logs[0].StatusCode != http.StatusUnauthorized || logs[0].Attempts != 1 {
+	if len(logs) != 1 || logs[0].StatusCode != http.StatusUnauthorized || logs[0].AttemptSeq != 1 {
 		t.Errorf("expected one 401 log with 1 attempt, got %+v", logs)
 	}
 }
@@ -389,7 +389,7 @@ func TestRetryOnAzureUnsupported400(t *testing.T) {
 		t.Errorf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 	logs, _ := st.QueryLogs(store.LogFilter{})
-	if len(logs) != 1 || logs[0].StatusCode != http.StatusOK || logs[0].Attempts != 2 {
+	if len(logs) != 1 || logs[0].StatusCode != http.StatusOK || logs[0].AttemptSeq != 2 {
 		t.Errorf("expected one 200 log with 2 attempts, got %+v", logs)
 	}
 }
@@ -417,7 +417,7 @@ func TestNoRetryOnGeneric400(t *testing.T) {
 		t.Errorf("body = %q, want %q (must pass through unchanged)", rec.Body.String(), body)
 	}
 	logs, _ := st.QueryLogs(store.LogFilter{})
-	if len(logs) != 1 || logs[0].StatusCode != http.StatusBadRequest || logs[0].Attempts != 1 {
+	if len(logs) != 1 || logs[0].StatusCode != http.StatusBadRequest || logs[0].AttemptSeq != 1 {
 		t.Errorf("expected one 400 log with 1 attempt, got %+v", logs)
 	}
 }
@@ -443,7 +443,7 @@ func TestRetryOn408(t *testing.T) {
 		t.Errorf("status = %d, want 200", rec.Code)
 	}
 	logs, _ := st.QueryLogs(store.LogFilter{})
-	if len(logs) != 1 || logs[0].StatusCode != http.StatusOK || logs[0].Attempts != 2 {
+	if len(logs) != 1 || logs[0].StatusCode != http.StatusOK || logs[0].AttemptSeq != 2 {
 		t.Errorf("expected one 200 log with 2 attempts, got %+v", logs)
 	}
 }
@@ -638,8 +638,8 @@ func TestAttemptsLoggedAndHeaders(t *testing.T) {
 		t.Errorf("X-AGL-Provider = %q, want up", got)
 	}
 	logs, _ := st.QueryLogs(store.LogFilter{})
-	if logs[0].Attempts != 3 {
-		t.Errorf("logged attempts = %d, want 3", logs[0].Attempts)
+	if logs[0].AttemptSeq != 3 {
+		t.Errorf("logged attempts = %d, want 3", logs[0].AttemptSeq)
 	}
 }
 
@@ -682,7 +682,7 @@ func TestProviderFailureErrorIsClear(t *testing.T) {
 	}
 	// Logged with the failure reason and attempt count.
 	logs, _ := st.QueryLogs(store.LogFilter{})
-	if len(logs) != 1 || logs[0].Attempts != 3 || logs[0].Error == "" {
+	if len(logs) != 1 || logs[0].AttemptSeq != 3 || logs[0].Error == "" {
 		t.Errorf("failure log = %+v", logs)
 	}
 }
@@ -919,8 +919,26 @@ func TestFailoverToNextProvider(t *testing.T) {
 		t.Errorf("served provider header = %q, want b", got)
 	}
 	logs, _ := st.QueryLogs(store.LogFilter{})
-	if len(logs) != 1 || logs[0].Provider != "b" || logs[0].Attempts != 2 {
+	if len(logs) != 1 || logs[0].Provider != "b" || logs[0].AttemptSeq != 2 {
 		t.Fatalf("log = %+v, want provider=b attempts=2", logs[0])
+	}
+	// The earlier failover is a sibling row sharing the served log's trace: same trace_id,
+	// final_attempt=false, recording provider a's 503. The default (final-only) list hides it;
+	// a trace fetch returns both attempts in order.
+	final := logs[0]
+	if !final.FinalAttempt {
+		t.Errorf("served log final_attempt = false, want true")
+	}
+	trace, _ := st.QueryLogs(store.LogFilter{TraceID: final.TraceID})
+	if len(trace) != 2 {
+		t.Fatalf("trace has %d rows, want 2 (a then b)", len(trace))
+	}
+	if trace[0].Provider != "a" || trace[0].StatusCode != http.StatusServiceUnavailable ||
+		trace[0].FinalAttempt || trace[0].AttemptSeq != 1 {
+		t.Errorf("attempt 1 = %+v, want provider=a 503 non-final seq=1", trace[0])
+	}
+	if trace[0].Cost != 0 || trace[0].InputTokens != 0 {
+		t.Errorf("failover attempt should carry no cost/tokens, got %+v", trace[0])
 	}
 }
 
@@ -981,7 +999,7 @@ func TestFailoverWalksFullSequence(t *testing.T) {
 		t.Errorf("source = %q, want provider", rec.Header().Get(headerErrorSource))
 	}
 	logs, _ := st.QueryLogs(store.LogFilter{})
-	if len(logs) != 1 || logs[0].Provider != "c" || logs[0].Attempts != 3 {
+	if len(logs) != 1 || logs[0].Provider != "c" || logs[0].AttemptSeq != 3 {
 		t.Fatalf("log = %+v, want provider=c attempts=3", logs[0])
 	}
 }

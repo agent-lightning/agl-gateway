@@ -88,7 +88,9 @@ CREATE TABLE IF NOT EXISTS request_logs (
     response_bytes     INTEGER NOT NULL DEFAULT 0,
     status_code        INTEGER NOT NULL,
     streaming          INTEGER NOT NULL,
-    attempts           INTEGER NOT NULL DEFAULT 0,
+    trace_id           INTEGER NOT NULL DEFAULT 0,
+    attempt_seq        INTEGER NOT NULL DEFAULT 1,
+    final_attempt      INTEGER NOT NULL DEFAULT 1,
     ttft_ms            INTEGER NOT NULL,
     duration_ms        INTEGER NOT NULL,
     input_tokens       INTEGER NOT NULL,
@@ -122,7 +124,9 @@ CREATE INDEX IF NOT EXISTS idx_logs_api_key_id ON request_logs(api_key_id);
 		{"request_logs", "query", "TEXT NOT NULL DEFAULT ''"},
 		{"request_logs", "client_addr", "TEXT NOT NULL DEFAULT ''"},
 		{"request_logs", "user_agent", "TEXT NOT NULL DEFAULT ''"},
-		{"request_logs", "attempts", "INTEGER NOT NULL DEFAULT 0"},
+		{"request_logs", "trace_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"request_logs", "attempt_seq", "INTEGER NOT NULL DEFAULT 1"},
+		{"request_logs", "final_attempt", "INTEGER NOT NULL DEFAULT 1"},
 		{"request_logs", "request_content_type", "TEXT NOT NULL DEFAULT ''"},
 		{"request_logs", "response_content_type", "TEXT NOT NULL DEFAULT ''"},
 		{"request_logs", "request_bytes", "INTEGER NOT NULL DEFAULT 0"},
@@ -144,7 +148,36 @@ CREATE INDEX IF NOT EXISTS idx_logs_api_key_id ON request_logs(api_key_id);
 			return err
 		}
 	}
+	// Backfill rows written before the trace columns: each old log is its own single-attempt
+	// trace (trace_id = id), and its 1-based seq is the old attempts count. WHERE trace_id = 0
+	// touches only pre-migration rows; new inserts always set a real trace_id, so this is a
+	// one-time, idempotent no-op thereafter. The legacy attempts column only exists on upgraded
+	// databases (fresh ones never created it), so migrate its count into attempt_seq only there;
+	// elsewhere just stamp trace_id. attempt_seq DEFAULT 1 covers the attempts=0 edge.
+	backfill := `UPDATE request_logs SET trace_id = id WHERE trace_id = 0`
+	if hasColumn(db, "request_logs", "attempts") {
+		backfill = `UPDATE request_logs SET trace_id = id, attempt_seq = MAX(attempts, 1) WHERE trace_id = 0`
+	}
+	if _, err := db.Exec(backfill); err != nil {
+		return fmt.Errorf("backfill trace_id: %w", err)
+	}
 	return nil
+}
+
+// hasColumn reports whether a table currently has a column.
+func hasColumn(db *sql.DB, table, column string) bool {
+	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if rows.Scan(&name) == nil && name == column {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureColumn adds a column to a table if it does not already exist.

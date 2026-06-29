@@ -255,6 +255,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	retry := sequence[0].ResolvedRetry(p.cfg.Defaults.Retry)
 
 	format := capture.FormatForPath(r.URL.Path)
+	traceID := p.store.NewTraceID()
 	logRow := &store.RequestLog{
 		APIKeyID:           key.ID,
 		KeyName:            key.Name,
@@ -267,9 +268,24 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 		UserAgent:          r.UserAgent(),
 		RequestBytes:       int64(len(body)),
 		RequestContentType: strings.TrimSpace(r.Header.Get("Content-Type")),
+		TraceID:            traceID,
+		FinalAttempt:       true,
 	}
 	if p.cfg.PayloadCapture.Enabled {
 		logRow.RawRequest, logRow.RawRequestTruncated = captureBytes(body, payloadLimit(p.cfg.PayloadCapture.MaxRequestBytes))
+	}
+	// saveAttempt persists one earlier, non-final attempt as its own trace row (provider +
+	// status + error only, zero cost/tokens, no payloads). The served/last attempt is logged
+	// as logRow at the end; these are best-effort sidecars so failover history survives.
+	saveAttempt := func(seq int, prov *config.Provider, status int, errMsg string) {
+		p.save(&store.RequestLog{
+			APIKeyID: key.ID, KeyName: key.Name, Model: model, APIType: format.String(),
+			Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery,
+			ClientAddr: r.RemoteAddr, UserAgent: r.UserAgent(), RequestBytes: int64(len(body)),
+			Provider: prov.Name, StatusCode: status, Error: errMsg,
+			TraceID: traceID, AttemptSeq: seq, FinalAttempt: false,
+			DurationMillis: time.Since(start).Milliseconds(),
+		})
 	}
 
 	var (
@@ -312,6 +328,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 		if err != nil {
 			lastErr = err
 			if attempt < retry.MaxRetries && r.Context().Err() == nil {
+				saveAttempt(attempts, prov, http.StatusBadGateway,
+					fmt.Sprintf("agl-gateway: provider %q unreachable: %v", prov.Name, err))
 				if !sleepBackoff(r.Context(), retry, attempt) {
 					lastErr = r.Context().Err()
 					break
@@ -321,7 +339,10 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 			break
 		}
 		if retryable(resp) && attempt < retry.MaxRetries {
+			snippet := strings.Join(strings.Fields(string(peekBody(resp, maxErrorBodyCapture))), " ")
 			drain(resp)
+			saveAttempt(attempts, prov, resp.StatusCode,
+				strings.TrimSpace(fmt.Sprintf("provider %q returned HTTP %d: %s", prov.Name, resp.StatusCode, snippet)))
 			if !sleepBackoff(r.Context(), retry, attempt) {
 				lastErr = r.Context().Err()
 				resp = nil
@@ -337,7 +358,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	// one that served the response (or the last one tried before giving up).
 	logRow.Provider = prov.Name
 	logRow.MappedModel = mappedModel
-	logRow.Attempts = attempts
+	logRow.AttemptSeq = attempts
 
 	// No HTTP response at all: a network/transport failure (or a request we couldn't build).
 	if resp == nil {
@@ -765,4 +786,11 @@ func sleepBackoff(ctx context.Context, r config.Retry, attempt int) bool {
 func drain(resp *http.Response) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	resp.Body.Close()
+}
+
+// peekBody reads up to n bytes from resp.Body for a failover-attempt error snippet. The body is
+// drained separately afterward; this is best-effort, so a read error just yields what we have.
+func peekBody(resp *http.Response, n int) []byte {
+	head, _ := io.ReadAll(io.LimitReader(resp.Body, int64(n)))
+	return head
 }

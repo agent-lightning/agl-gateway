@@ -274,7 +274,26 @@ func (a *Admin) getLog(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errBody("log not found"))
 		return
 	}
-	writeJSON(w, http.StatusOK, logs[0])
+	out := logWithAttempts{RequestLog: logs[0]}
+	// A multi-attempt trace also carries the earlier failover rows; surface them (provider +
+	// status + error, no payloads) so the inspector can show the full attempt history.
+	if logs[0].AttemptSeq > 1 && logs[0].TraceID > 0 {
+		trace, err := a.store.QueryLogs(store.LogFilter{TraceID: logs[0].TraceID, Limit: 100})
+		if err == nil {
+			for _, l := range trace {
+				if !l.FinalAttempt {
+					out.Attempts = append(out.Attempts, l)
+				}
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// logWithAttempts is a single log plus its earlier (non-final) failover attempts, oldest first.
+type logWithAttempts struct {
+	store.RequestLog
+	Attempts []store.RequestLog `json:"attempts,omitempty"`
 }
 
 func (a *Admin) stats(w http.ResponseWriter, r *http.Request) {
