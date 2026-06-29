@@ -13,6 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # The admin tests read testdata/portal-mock.db, which is stored in Git LFS; without
+          # this the checkout leaves a pointer file and those tests fail.
+          lfs: true
 
       - name: Set up Node
         uses: actions/setup-node@v6

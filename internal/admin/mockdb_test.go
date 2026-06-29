@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -27,6 +28,12 @@ func newAdminMock(t *testing.T) (http.Handler, *store.Store) {
 	src, err := os.ReadFile(mockDBPath)
 	if err != nil {
 		t.Fatalf("read fixture %s: %v", mockDBPath, err)
+	}
+	// The fixture lives in Git LFS. A checkout without LFS (e.g. CI missing `lfs: true`, or a
+	// contributor who cloned without git-lfs) leaves a small text pointer in its place rather
+	// than the SQLite file — skip with a clear hint instead of failing on a bogus database.
+	if bytes.HasPrefix(src, []byte("version https://git-lfs.github.com/spec/v1")) {
+		t.Skipf("%s is an unmaterialized Git LFS pointer; run `git lfs pull` to fetch it", mockDBPath)
 	}
 	dst := filepath.Join(t.TempDir(), "mock.db")
 	if err := os.WriteFile(dst, src, 0o644); err != nil {
