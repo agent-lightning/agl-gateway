@@ -102,6 +102,10 @@ type LogFilter struct {
 	// TraceID fetches every attempt of one logical request (the served row plus earlier
 	// failovers), ordered by AttemptSeq ascending. When set, the final-only default is lifted.
 	TraceID int64
+	// AllAttempts lifts the final-only default for a plain listing, returning earlier failover
+	// rows interleaved with the served rows (still newest-first). Ignored when ID/TraceID pin
+	// a row or trace, which already return every attempt.
+	AllAttempts bool
 	// Since and Until bound the created_at window: created_at >= Since and created_at <
 	// Until. Either may be zero to leave that side unbounded, so a fixed period is expressed
 	// by setting both.
@@ -499,10 +503,10 @@ func (s *Store) QueryLogs(f LogFilter) ([]RequestLog, error) {
 	if f.TraceID > 0 {
 		q += " AND trace_id = ?"
 		args = append(args, f.TraceID)
-	} else if f.ID == 0 {
+	} else if f.ID == 0 && !f.AllAttempts {
 		// Default listing collapses each trace to its served/last row; earlier failover attempts
-		// are reached only by id or by a trace_id fetch (the inspector). A by-id lookup keeps
-		// every row addressable.
+		// are reached only by id, by a trace_id fetch (the inspector), or when AllAttempts is set
+		// to browse every row. A by-id lookup keeps every row addressable.
 		q += " AND final_attempt = 1"
 	}
 	if !f.Since.IsZero() {

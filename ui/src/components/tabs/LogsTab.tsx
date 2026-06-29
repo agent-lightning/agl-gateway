@@ -22,6 +22,7 @@ import {
 import type { LogsResponse, RequestLog } from '@/lib/types'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Label } from '@/components/ui/label'
 import {
   Select,
@@ -58,6 +59,7 @@ export function LogsTab() {
   const [provider, setProvider] = useState('all')
   const [limit, setLimit] = useState(100)
   const [offset, setOffset] = useState(0)
+  const [allAttempts, setAllAttempts] = useState(false)
 
   const [data, setData] = useState<LogsResponse | null>(null)
   const [loading, setLoading] = useState(true)
@@ -70,6 +72,7 @@ export function LogsTab() {
       params.set('limit', String(limit))
       if (offset) params.set('offset', String(offset))
       if (provider !== 'all') params.set('provider', provider)
+      if (allAttempts) params.set('all_attempts', 'true')
       applyTimeQuery(params, timeQuery)
       setData(await api<LogsResponse>('GET', `/admin/logs?${params}`))
     } catch (e) {
@@ -77,7 +80,7 @@ export function LogsTab() {
     } finally {
       setLoading(false)
     }
-  }, [limit, offset, provider, timeQuery, forget])
+  }, [limit, offset, provider, allAttempts, timeQuery, forget])
 
   useEffect(() => {
     load()
@@ -95,6 +98,10 @@ export function LogsTab() {
   function changeLimit(n: number) {
     setOffset(0)
     setLimit(n)
+  }
+  function changeAllAttempts(v: boolean) {
+    setOffset(0)
+    setAllAttempts(v)
   }
 
   const logs = data?.logs ?? []
@@ -145,6 +152,13 @@ export function LogsTab() {
           </div>
 
           <div className="flex-1" />
+          <label className="flex h-9 cursor-pointer items-center gap-2 text-sm">
+            <Checkbox
+              checked={allAttempts}
+              onCheckedChange={(v) => changeAllAttempts(v === true)}
+            />
+            <span className="text-muted-foreground">All attempts</span>
+          </label>
           <Button variant="outline" onClick={load} disabled={loading}>
             <RefreshCw className={cn('size-4', loading && 'animate-spin')} />
             Refresh
@@ -196,7 +210,10 @@ export function LogsTab() {
                   <TableRow
                     key={l.id}
                     onClick={() => setSelected(l)}
-                    className="cursor-pointer"
+                    className={cn(
+                      'cursor-pointer',
+                      !l.final_attempt && 'text-muted-foreground/70',
+                    )}
                   >
                     <TableCell
                       className="text-muted-foreground pl-4 text-xs"

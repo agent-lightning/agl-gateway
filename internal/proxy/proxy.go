@@ -328,12 +328,12 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 		if err != nil {
 			lastErr = err
 			if attempt < retry.MaxRetries && r.Context().Err() == nil {
-				saveAttempt(attempts, prov, http.StatusBadGateway,
-					fmt.Sprintf("agl-gateway: provider %q unreachable: %v", prov.Name, err))
 				if !sleepBackoff(r.Context(), retry, attempt) {
 					lastErr = r.Context().Err()
 					break
 				}
+				saveAttempt(attempts, prov, http.StatusBadGateway,
+					fmt.Sprintf("agl-gateway: provider %q unreachable: %v", prov.Name, err))
 				continue
 			}
 			break
@@ -341,13 +341,13 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 		if retryable(resp) && attempt < retry.MaxRetries {
 			snippet := strings.Join(strings.Fields(string(peekBody(resp, maxErrorBodyCapture))), " ")
 			drain(resp)
-			saveAttempt(attempts, prov, resp.StatusCode,
-				strings.TrimSpace(fmt.Sprintf("provider %q returned HTTP %d: %s", prov.Name, resp.StatusCode, snippet)))
 			if !sleepBackoff(r.Context(), retry, attempt) {
 				lastErr = r.Context().Err()
 				resp = nil
 				break
 			}
+			saveAttempt(attempts, prov, resp.StatusCode,
+				strings.TrimSpace(fmt.Sprintf("provider %q returned HTTP %d: %s", prov.Name, resp.StatusCode, snippet)))
 			continue
 		}
 		lastErr = nil

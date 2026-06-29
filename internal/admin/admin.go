@@ -224,6 +224,11 @@ func (a *Admin) listLogs(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errBody(err.Error()))
 		return
 	}
+	allAttempts, err := queryBool(r, "all_attempts")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errBody(err.Error()))
+		return
+	}
 	logs, err := a.store.QueryLogs(store.LogFilter{
 		APIKeyID:        apiKeyID,
 		Provider:        provider,
@@ -232,6 +237,7 @@ func (a *Admin) listLogs(w http.ResponseWriter, r *http.Request) {
 		Limit:           limit + 1, // fetch one extra to detect a further page
 		Offset:          offset,
 		IncludePayloads: includePayloads,
+		AllAttempts:     allAttempts,
 	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, errBody("could not query logs"))
@@ -277,7 +283,7 @@ func (a *Admin) getLog(w http.ResponseWriter, r *http.Request) {
 	out := logWithAttempts{RequestLog: logs[0]}
 	// A multi-attempt trace also carries the earlier failover rows; surface them (provider +
 	// status + error, no payloads) so the inspector can show the full attempt history.
-	if logs[0].AttemptSeq > 1 && logs[0].TraceID > 0 {
+	if logs[0].FinalAttempt && logs[0].AttemptSeq > 1 && logs[0].TraceID > 0 {
 		trace, err := a.store.QueryLogs(store.LogFilter{TraceID: logs[0].TraceID, Limit: 100})
 		if err == nil {
 			for _, l := range trace {

@@ -98,7 +98,9 @@ Packages:
   `final_attempt` marking the served/last row. Only the final row carries cost/tokens/payloads;
   earlier rows hold just provider+status+error. Stats and the default log list filter
   `final_attempt = 1` (siblings never inflate counts/cost); a `TraceID` filter fetches the whole
-  trace, and the inspector inlines the earlier attempts. `InsertLog` defaults a seq-0 row to a
+  trace, and the inspector inlines the earlier attempts. A `LogFilter.AllAttempts` (portal's
+  "All attempts" toggle / `?all_attempts=true`) lifts the final-only default to browse every row.
+  `InsertLog` defaults a seq-0 row to a
   single final attempt, so non-proxy callers stay visible. There is no `attempts` count column —
   the count is the max `attempt_seq`; old rows backfill `trace_id = id`, `attempt_seq = attempts`.
 - **Deleting a key cascades to its logs by default, but the cascade is per-key.** Each key

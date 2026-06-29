@@ -291,6 +291,11 @@ func TestTraceAttempts(t *testing.T) {
 		if len(trips) != 2 || trips[0].Provider != "a" || trips[1].Provider != "b" {
 			t.Fatalf("trace fetch = %+v, want a then b", trips)
 		}
+		// AllAttempts lifts the final-only default so both rows show in a plain listing.
+		all, _ := s.QueryLogs(LogFilter{AllAttempts: true})
+		if len(all) != 2 {
+			t.Fatalf("all-attempts list = %d rows, want 2", len(all))
+		}
 		stats, _ := s.Stats(LogFilter{})
 		if len(stats) != 1 || stats[0].Requests != 1 || stats[0].Cost != 0.5 {
 			t.Fatalf("stats = %+v, want 1 request, 0.5 cost (siblings excluded)", stats)

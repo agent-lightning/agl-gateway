@@ -336,6 +336,13 @@ func TestGetLogWithAttempts(t *testing.T) {
 		t.Fatalf("list = %+v, want 1 final row (b)", page.Logs)
 	}
 
+	// all_attempts=true browses every attempt: both the failover and the served row.
+	rec = req(t, h, "GET", "/admin/logs?all_attempts=true", master, "")
+	json.Unmarshal(rec.Body.Bytes(), &page)
+	if len(page.Logs) != 2 {
+		t.Fatalf("all-attempts list = %d rows, want 2", len(page.Logs))
+	}
+
 	rec = req(t, h, "GET", "/admin/logs/"+itoa(page.Logs[0].ID), master, "")
 	var full struct {
 		store.RequestLog

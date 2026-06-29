@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -445,6 +446,45 @@ func TestRetryOn408(t *testing.T) {
 	logs, _ := st.QueryLogs(store.LogFilter{})
 	if len(logs) != 1 || logs[0].StatusCode != http.StatusOK || logs[0].AttemptSeq != 2 {
 		t.Errorf("expected one 200 log with 2 attempts, got %+v", logs)
+	}
+}
+
+// A request cancelled during retry backoff must not log a phantom failover attempt: the
+// sidecar row is written only once the backoff actually completes, so the cancelled attempt
+// becomes the (single) final row instead of being recorded twice at the same attempt_seq.
+func TestNoSidecarWhenCancelledDuringBackoff(t *testing.T) {
+	hit := make(chan struct{}, 1)
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case hit <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	srv := httptest.NewServer(up)
+	defer srv.Close()
+	st, _ := store.Open(":memory:")
+	defer st.Close()
+	cfg := &config.Config{
+		MasterKey: "mk",
+		// A long backoff guarantees the cancellation lands while we are sleeping between attempts.
+		Defaults:  config.Defaults{Retry: config.Retry{MaxRetries: 3, BaseDelay: 30 * time.Second, MaxDelay: 30 * time.Second}},
+		Providers: []config.Provider{{Name: "up", BaseURL: srv.URL, APIKey: "s"}},
+	}
+	p := New(cfg, st, testPricing(), srv.Client(), nil)
+	plain, display, _ := keys.Generate()
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"up"}, config.StartFirst, config.OrderRoundRobin, false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/x", strings.NewReader(`{"model":"gpt-5.4"}`)).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+plain)
+	// Cancel only after the first 503 is in: the retry check passes, then cancel lands mid-backoff.
+	go func() { <-hit; time.Sleep(20 * time.Millisecond); cancel() }()
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	all, _ := st.QueryLogs(store.LogFilter{AllAttempts: true})
+	if len(all) != 1 || !all[0].FinalAttempt {
+		t.Fatalf("logs = %+v, want exactly one final row (no phantom sidecar)", all)
 	}
 }
 
