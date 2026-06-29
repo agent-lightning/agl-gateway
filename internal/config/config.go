@@ -59,6 +59,27 @@ type Defaults struct {
 	// history survives the key. A key stores its own resolved value, so changing this default
 	// only affects keys created afterward.
 	KeepLogsOnKeyDelete bool `yaml:"keep_logs_on_key_delete"`
+	// Timeout is the fallback upstream-attempt timeout applied to every provider that does not
+	// set its own. Unset (nil fields) means no timeout — the gateway waits indefinitely, as it
+	// always has.
+	Timeout Timeout `yaml:"timeout"`
+}
+
+// Timeout bounds how long the gateway waits on a single upstream attempt. Both fields are
+// opt-in: a nil or zero duration means "no limit". They are resolved per provider (a provider's
+// timeout layers over defaults.timeout — see Resolve), so each provider's own timeouts govern
+// its own attempts during failover.
+type Timeout struct {
+	// Request caps the whole attempt — connect, the wait for a response, and reading/streaming
+	// the body. If it fires before any response the attempt fails over (or returns 504 Gateway
+	// Timeout once retries are exhausted); if it fires mid-stream the client keeps the bytes
+	// already delivered and the stream ends.
+	Request *time.Duration `yaml:"request"`
+	// ResponseHeader caps only the wait for the provider's first response headers (≈ time to
+	// first token). A provider slow to start responding times out and fails over, but a healthy
+	// stream, once it has begun, is never cut short by this. Maps to
+	// http.Transport.ResponseHeaderTimeout.
+	ResponseHeader *time.Duration `yaml:"response_header"`
 }
 
 // DefaultPayloadCaptureBytes caps each stored payload field when capture is enabled and no
@@ -99,6 +120,10 @@ type Provider struct {
 	ModelMap map[string]string `yaml:"model_map"`
 	// Retry overrides Defaults.Retry for this provider. Nil fields fall back to defaults.
 	Retry *Retry `yaml:"retry"`
+	// Timeout overrides Defaults.Timeout for this provider. A nil field inherits the default; a
+	// non-nil field (including an explicit 0, which disables that timeout for this provider only)
+	// wins. See Timeout.Resolve.
+	Timeout Timeout `yaml:"timeout"`
 }
 
 // ModelPricing is the per-token cost for a model, mirroring the new-api schema.
@@ -126,6 +151,43 @@ func (p Provider) ResolvedRetry(def Retry) Retry {
 		}
 	}
 	return r
+}
+
+// Resolve layers a provider's timeout overrides over the supplied defaults. A nil field inherits
+// the default; a non-nil field (including an explicit 0, i.e. "disable for this provider") wins.
+func (t Timeout) Resolve(def Timeout) Timeout {
+	out := def
+	if t.Request != nil {
+		out.Request = t.Request
+	}
+	if t.ResponseHeader != nil {
+		out.ResponseHeader = t.ResponseHeader
+	}
+	return out
+}
+
+// RequestDuration returns the effective total-attempt timeout (0 = no limit).
+func (t Timeout) RequestDuration() time.Duration { return derefDuration(t.Request) }
+
+// ResponseHeaderDuration returns the effective response-header timeout (0 = no limit).
+func (t Timeout) ResponseHeaderDuration() time.Duration { return derefDuration(t.ResponseHeader) }
+
+// validate rejects negative durations; a zero (the "disabled" value) is fine.
+func (t Timeout) validate(scope string) error {
+	if t.Request != nil && *t.Request < 0 {
+		return fmt.Errorf("config: %s timeout.request must be non-negative", scope)
+	}
+	if t.ResponseHeader != nil && *t.ResponseHeader < 0 {
+		return fmt.Errorf("config: %s timeout.response_header must be non-negative", scope)
+	}
+	return nil
+}
+
+func derefDuration(d *time.Duration) time.Duration {
+	if d == nil {
+		return 0
+	}
+	return *d
 }
 
 // Provider-selection policy values for a key. When a request does not pin a provider via
@@ -240,6 +302,9 @@ func (c *Config) Validate() error {
 	if c.PayloadCapture.MaxAssembledBytes < 0 {
 		return fmt.Errorf("config: payload_capture max_assembled_bytes must be non-negative")
 	}
+	if err := c.Defaults.Timeout.validate("defaults"); err != nil {
+		return err
+	}
 	seen := make(map[string]bool, len(c.Providers))
 	for i, p := range c.Providers {
 		if p.Name == "" {
@@ -254,6 +319,9 @@ func (c *Config) Validate() error {
 		}
 		if p.Retry != nil && p.Retry.MaxRetries < 0 {
 			return fmt.Errorf("config: provider %q has negative max_retries", p.Name)
+		}
+		if err := p.Timeout.validate(fmt.Sprintf("provider %q", p.Name)); err != nil {
+			return err
 		}
 	}
 	pricingSeen := make(map[string]bool, len(c.Pricing))

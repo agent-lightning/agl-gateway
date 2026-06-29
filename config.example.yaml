@@ -36,6 +36,22 @@ defaults:
     max_retries: 3
     base_delay: 200ms
     max_delay: 10s
+  # Upstream timeouts, applied per attempt (so each provider's own timeouts govern its attempts
+  # during failover). Both are opt-in: omit a field, or set it to 0s, for no limit. A provider
+  # can override either below; on a provider a nil field inherits these defaults while an
+  # explicit 0s disables that timeout for that provider only.
+  timeout:
+    # Max wait for the provider's first response headers (≈ time-to-first-token). A provider slow
+    # to start responding times out and fails over to the next bound provider; a healthy stream,
+    # once it has begun, is never cut short by this. When retries are exhausted the gateway
+    # returns 504 Gateway Timeout (X-AGL-Error-Source: provider).
+    response_header: 30s
+    # Total budget for the whole attempt, including the streamed body. Left at 0s here because
+    # LLM streams can legitimately run for minutes; set it only if you want a hard cap. If it
+    # fires before any response it returns 504; if it fires mid-stream the client keeps the bytes
+    # already delivered and the stream ends (the upstream status — usually 200 — was already
+    # sent), and the truncation is noted in the request log.
+    request: 0s
   # Default log-retention policy for newly created keys (each key stores its own resolved
   # value, overridable per key via the create-key request / portal). false (the default)
   # cascade-deletes a key's request logs when the key is deleted; true retains them so usage
@@ -77,6 +93,10 @@ providers:
     # Optional per-provider retry override (unset fields fall back to defaults.retry).
     retry:
       max_retries: 5
+    # Optional per-provider timeout override. A nil field inherits defaults.timeout; an explicit
+    # value wins, and 0s disables that timeout for this provider only.
+    timeout:
+      response_header: 10s
 
   - name: anthropic
     base_url: https://api.anthropic.com

@@ -77,7 +77,11 @@ type Proxy struct {
 	store  *store.Store
 	prices *pricing.Table
 	client *http.Client
-	logger *slog.Logger
+	// clients holds a per-provider *http.Client for each provider that sets a positive
+	// response_header timeout; its transport carries that ResponseHeaderTimeout. Providers
+	// without one are absent and fall back to client (see clientFor).
+	clients map[string]*http.Client
+	logger  *slog.Logger
 }
 
 // New constructs a Proxy. A nil client uses a sensible default; a nil logger discards logs.
@@ -88,7 +92,53 @@ func New(cfg *config.Config, st *store.Store, prices *pricing.Table, client *htt
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &Proxy{cfg: cfg, store: st, prices: prices, client: client, logger: logger}
+	return &Proxy{cfg: cfg, store: st, prices: prices, client: client, clients: buildProviderClients(cfg, client, logger), logger: logger}
+}
+
+// buildProviderClients constructs, for each provider whose resolved response_header timeout is
+// positive, a dedicated *http.Client whose transport carries that ResponseHeaderTimeout — the only
+// place Go lets us bound the wait for the first response header without also capping the streamed
+// body. Providers without one share the base client. A base transport that is not *http.Transport
+// cannot be cloned, so its providers' response_header timeout is skipped with a warning rather
+// than failing — best-effort, like the rest of the data plane. Returns nil when no provider needs
+// a dedicated client.
+func buildProviderClients(cfg *config.Config, base *http.Client, logger *slog.Logger) map[string]*http.Client {
+	var clients map[string]*http.Client
+	for i := range cfg.Providers {
+		prov := &cfg.Providers[i]
+		rht := prov.Timeout.Resolve(cfg.Defaults.Timeout).ResponseHeaderDuration()
+		if rht <= 0 {
+			continue
+		}
+		bt := base.Transport
+		if bt == nil {
+			bt = http.DefaultTransport
+		}
+		tr, ok := bt.(*http.Transport)
+		if !ok {
+			logger.Warn("response_header timeout ignored: base HTTP transport is not *http.Transport and cannot be cloned",
+				"provider", prov.Name)
+			continue
+		}
+		clone := tr.Clone()
+		clone.ResponseHeaderTimeout = rht
+		c := *base
+		c.Transport = clone
+		if clients == nil {
+			clients = make(map[string]*http.Client)
+		}
+		clients[prov.Name] = &c
+	}
+	return clients
+}
+
+// clientFor returns the provider's dedicated client (with its response_header timeout) when one
+// was built, else the shared base client.
+func (p *Proxy) clientFor(prov *config.Provider) *http.Client {
+	if c, ok := p.clients[prov.Name]; ok {
+		return c
+	}
+	return p.client
 }
 
 // gatewayError writes a structured JSON error and the X-AGL-* headers describing whether
@@ -107,6 +157,8 @@ func errorType(status int) string {
 	case http.StatusNotFound:
 		return "not_found_error"
 	case http.StatusRequestTimeout:
+		return "timeout_error"
+	case http.StatusGatewayTimeout:
 		return "timeout_error"
 	case http.StatusTooManyRequests:
 		return "rate_limit_error"
@@ -305,9 +357,19 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 		effectiveModel string
 		mappedModel    string
 		attempts       int
+		servedCancel   context.CancelFunc // released after streaming; nil when no request timeout
+		servedCtx      context.Context    // the served attempt's context, for mid-stream timeout detection
 	)
+	// Release the served attempt's request-timeout context once the response has been streamed.
+	defer func() {
+		if servedCancel != nil {
+			servedCancel()
+		}
+	}()
 	for attempt := 0; ; attempt++ {
 		prov = sequence[attempt%len(sequence)]
+		client := p.clientFor(prov)
+		timeout := prov.Timeout.Resolve(p.cfg.Defaults.Timeout)
 
 		// Target and model mapping are provider-scoped, so recompute them each attempt.
 		target := strings.TrimRight(prov.BaseURL, "/") + r.URL.Path
@@ -325,23 +387,38 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 			}
 		}
 
-		req, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(sendBody))
+		// Bound the whole attempt (connect + response + body) with the provider's request
+		// timeout. It is a child of r.Context(), so it never masks a real client disconnect (the
+		// parent context) — that stays classified distinctly below.
+		attemptCtx := r.Context()
+		var cancel context.CancelFunc
+		if d := timeout.RequestDuration(); d > 0 {
+			attemptCtx, cancel = context.WithTimeout(r.Context(), d)
+		}
+
+		req, err := http.NewRequestWithContext(attemptCtx, r.Method, target, bytes.NewReader(sendBody))
 		if err != nil {
+			if cancel != nil {
+				cancel()
+			}
 			lastErr = err
 			break
 		}
 		copyRequestHeaders(req, r, prov)
 
 		attempts++
-		resp, err = p.client.Do(req)
+		resp, err = client.Do(req)
 		if err != nil {
+			if cancel != nil {
+				cancel()
+			}
 			lastErr = err
 			if attempt < retry.MaxRetries && r.Context().Err() == nil {
 				if !sleepBackoff(r.Context(), retry, attempt) {
 					lastErr = r.Context().Err()
 					break
 				}
-				saveAttempt(attempts, prov, http.StatusBadGateway,
+				saveAttempt(attempts, prov, statusForTransportErr(err),
 					fmt.Sprintf("agl-gateway: provider %q unreachable: %v", prov.Name, err))
 				continue
 			}
@@ -350,6 +427,9 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 		if retryable(resp) && attempt < retry.MaxRetries {
 			snippet := strings.Join(strings.Fields(string(peekBody(resp, maxErrorBodyCapture))), " ")
 			drain(resp)
+			if cancel != nil {
+				cancel()
+			}
 			if !sleepBackoff(r.Context(), retry, attempt) {
 				lastErr = r.Context().Err()
 				resp = nil
@@ -359,6 +439,10 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 				strings.TrimSpace(fmt.Sprintf("provider %q returned HTTP %d: %s", prov.Name, resp.StatusCode, snippet)))
 			continue
 		}
+		// Served (or final, non-retryable) response: keep the attempt's request-timeout context
+		// armed through streaming so a mid-stream expiry cancels the upstream read.
+		servedCancel = cancel
+		servedCtx = attemptCtx
 		lastErr = nil
 		break
 	}
@@ -383,7 +467,15 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 			return
 		}
 		source := sourceProvider
-		msg := fmt.Sprintf("agl-gateway: upstream provider %q is unreachable after %d attempt(s)", prov.Name, attempts)
+		// A timeout (response-header or whole-request) reaching here means we did contact the
+		// provider but it did not respond in time: that is a Gateway Timeout (504), distinct from
+		// the Bad Gateway (502) used for a provider we could not reach at all.
+		status := statusForTransportErr(lastErr)
+		verb := "is unreachable"
+		if status == http.StatusGatewayTimeout {
+			verb = "timed out"
+		}
+		msg := fmt.Sprintf("agl-gateway: upstream provider %q %s after %d attempt(s)", prov.Name, verb, attempts)
 		if attempts == 0 {
 			source = sourceGateway
 			msg = "agl-gateway: failed to build upstream request"
@@ -391,11 +483,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 		if lastErr != nil {
 			msg += ": " + lastErr.Error()
 		}
-		logRow.StatusCode = http.StatusBadGateway
+		logRow.StatusCode = status
 		logRow.Error = msg
 		logRow.DurationMillis = time.Since(start).Milliseconds()
 		p.save(logRow)
-		gatewayError(w, http.StatusBadGateway, source, prov.Name, msg, attempts)
+		gatewayError(w, status, source, prov.Name, msg, attempts)
 		return
 	}
 	defer resp.Body.Close()
@@ -475,6 +567,17 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	// 200 is indistinguishable from a complete one.
 	if clientGone {
 		note := fmt.Sprintf("client disconnected mid-stream after %d body bytes", respBytes)
+		if logRow.Error == "" {
+			logRow.Error = note
+		} else {
+			logRow.Error += "; " + note
+		}
+	}
+	// Our own request timeout fired mid-stream: distinct from a client disconnect (the upstream
+	// read was cancelled while the client write kept succeeding). The upstream status stands, but
+	// record that the captured body/usage is truncated by us.
+	if servedCtx != nil && errors.Is(servedCtx.Err(), context.DeadlineExceeded) {
+		note := fmt.Sprintf("stream truncated: request timeout exceeded after %d body bytes", respBytes)
 		if logRow.Error == "" {
 			logRow.Error = note
 		} else {
@@ -748,6 +851,20 @@ const litellmTagBugMarker = "due to tags configuration"
 var azureUnsupportedMarkers = [][]byte{
 	[]byte("litellm"),
 	[]byte("The requested operation is unsupported"),
+}
+
+// statusForTransportErr maps an upstream transport failure to the HTTP status the gateway
+// synthesizes when no response arrived: 504 Gateway Timeout when the failure was a timeout (the
+// provider's response_header timeout or the whole-request timeout), else 502 Bad Gateway (a
+// provider we could not reach — connection refused, DNS failure, reset, …). Both the transport's
+// ResponseHeaderTimeout error and a context deadline report Timeout() == true, including through
+// the *url.Error wrapper client.Do returns.
+func statusForTransportErr(err error) int {
+	var te interface{ Timeout() bool }
+	if errors.As(err, &te) && te.Timeout() {
+		return http.StatusGatewayTimeout
+	}
+	return http.StatusBadGateway
 }
 
 // retryableStatus reports whether a status code is transient and worth retrying on its own:

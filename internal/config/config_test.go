@@ -206,6 +206,23 @@ providers:
   - name: openai
     base_url: http://x
 `,
+		"negative default timeout": `
+master_key: mk
+defaults:
+  timeout:
+    request: -1s
+providers:
+  - name: openai
+    base_url: http://x
+`,
+		"negative provider timeout": `
+master_key: mk
+providers:
+  - name: openai
+    base_url: http://x
+    timeout:
+      response_header: -5s
+`,
 	}
 	for name, y := range cases {
 		if _, err := Parse([]byte(y)); err == nil {
@@ -228,6 +245,85 @@ func TestResolvedRetryOverride(t *testing.T) {
 	none := Provider{}
 	if none.ResolvedRetry(def) != def {
 		t.Errorf("ResolvedRetry without override = %+v, want %+v", none.ResolvedRetry(def), def)
+	}
+}
+
+func ptrDur(d time.Duration) *time.Duration { return &d }
+
+func TestResolvedTimeoutOverride(t *testing.T) {
+	def := Timeout{Request: ptrDur(60 * time.Second), ResponseHeader: ptrDur(30 * time.Second)}
+
+	// No override -> inherit both defaults.
+	got := Timeout{}.Resolve(def)
+	if got.RequestDuration() != 60*time.Second || got.ResponseHeaderDuration() != 30*time.Second {
+		t.Errorf("no override = %v/%v, want 60s/30s", got.RequestDuration(), got.ResponseHeaderDuration())
+	}
+
+	// One field overridden, the other inherited.
+	got = Timeout{ResponseHeader: ptrDur(5 * time.Second)}.Resolve(def)
+	if got.RequestDuration() != 60*time.Second {
+		t.Errorf("request = %v, want inherited 60s", got.RequestDuration())
+	}
+	if got.ResponseHeaderDuration() != 5*time.Second {
+		t.Errorf("response_header = %v, want override 5s", got.ResponseHeaderDuration())
+	}
+
+	// Explicit 0 disables for this provider even though the default is non-zero (the key
+	// distinction a pointer field buys over the retry-style "0 = inherit").
+	got = Timeout{Request: ptrDur(0)}.Resolve(def)
+	if got.RequestDuration() != 0 {
+		t.Errorf("request = %v, want 0 (explicitly disabled)", got.RequestDuration())
+	}
+	if got.ResponseHeaderDuration() != 30*time.Second {
+		t.Errorf("response_header = %v, want inherited 30s", got.ResponseHeaderDuration())
+	}
+
+	// An empty default resolves to "no limit" (0) for both.
+	got = Timeout{}.Resolve(Timeout{})
+	if got.RequestDuration() != 0 || got.ResponseHeaderDuration() != 0 {
+		t.Errorf("empty/empty = %v/%v, want 0/0", got.RequestDuration(), got.ResponseHeaderDuration())
+	}
+}
+
+func TestParseTimeouts(t *testing.T) {
+	y := `
+master_key: mk-test
+defaults:
+  timeout:
+    request: 2m
+    response_header: 30s
+providers:
+  - name: openai
+    base_url: http://localhost:4141
+    api_key: dummy
+  - name: slow
+    base_url: http://localhost:5151
+    timeout:
+      response_header: 5s
+      request: 0s
+`
+	c, err := Parse([]byte(y))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Defaults.Timeout.RequestDuration() != 2*time.Minute {
+		t.Errorf("defaults request = %v, want 2m", c.Defaults.Timeout.RequestDuration())
+	}
+	if c.Defaults.Timeout.ResponseHeaderDuration() != 30*time.Second {
+		t.Errorf("defaults response_header = %v, want 30s", c.Defaults.Timeout.ResponseHeaderDuration())
+	}
+	// The base provider (openai from minimalYAML) sets no timeout -> inherits both defaults.
+	base := c.Provider("openai").Timeout.Resolve(c.Defaults.Timeout)
+	if base.RequestDuration() != 2*time.Minute || base.ResponseHeaderDuration() != 30*time.Second {
+		t.Errorf("openai resolved = %v/%v, want 2m/30s", base.RequestDuration(), base.ResponseHeaderDuration())
+	}
+	// "slow" overrides response_header and explicitly disables request.
+	slow := c.Provider("slow").Timeout.Resolve(c.Defaults.Timeout)
+	if slow.ResponseHeaderDuration() != 5*time.Second {
+		t.Errorf("slow response_header = %v, want 5s", slow.ResponseHeaderDuration())
+	}
+	if slow.RequestDuration() != 0 {
+		t.Errorf("slow request = %v, want 0 (disabled)", slow.RequestDuration())
 	}
 }
 
@@ -278,6 +374,15 @@ func TestExampleConfigParses(t *testing.T) {
 	// Model mapping is parsed.
 	if c.Provider("openai").ModelMap["gpt-fast"] != "gpt-5-mini" {
 		t.Errorf("model_map not parsed: %+v", c.Provider("openai").ModelMap)
+	}
+	// The nested timeout block is parsed: defaults set a response_header timeout with no total
+	// cap, and openai overrides response_header while inheriting the (disabled) request timeout.
+	if c.Defaults.Timeout.ResponseHeaderDuration() != 30*time.Second || c.Defaults.Timeout.RequestDuration() != 0 {
+		t.Errorf("defaults timeout = %v/%v, want 30s/0", c.Defaults.Timeout.ResponseHeaderDuration(), c.Defaults.Timeout.RequestDuration())
+	}
+	openai := c.Provider("openai").Timeout.Resolve(c.Defaults.Timeout)
+	if openai.ResponseHeaderDuration() != 10*time.Second || openai.RequestDuration() != 0 {
+		t.Errorf("openai resolved timeout = %v/%v, want 10s/0", openai.ResponseHeaderDuration(), openai.RequestDuration())
 	}
 	// Base models are priced; context/effort variants are intentionally excluded.
 	priced := make(map[string]bool)

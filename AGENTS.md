@@ -39,6 +39,7 @@ OpenAI-compatible `/v1/models` to list models. The data plane stays endpoint-agn
 ```
 client ──► proxy ──┐ auth (sha256 key lookup) ──► build provider sequence (X-AGL-Provider pins one, else the key's start/order policy)
                    ├─ retry loop (backoff+jitter on net err / 408 / 429 / 5xx / LiteLLM tag-bug 401 / LiteLLM-Azure "unsupported" 400); each retry fails over to the next provider in the sequence
+                   │  each attempt is bounded by the provider's resolved timeout.response_header (TTFT, via the transport) and timeout.request (whole attempt, via a per-attempt context); a timeout that exhausts retries returns 504
                    └─ stream upstream→client (SSE flushed), tee into the metering sink
                       (capture.Accumulator for recognized formats — usage + assembled body;
                        else usage.Accumulator)

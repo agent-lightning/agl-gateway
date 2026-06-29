@@ -1324,3 +1324,291 @@ func TestRequestBodyAtLimitPasses(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+func dur(d time.Duration) *time.Duration { return &d }
+
+// TestResponseHeaderTimeoutReturns504: a provider that never sends response headers within its
+// response_header timeout, with no retries, surfaces as a gateway-synthesized 504 Gateway
+// Timeout (source=provider, error type timeout_error) — distinct from the 502 used for a
+// provider that cannot be reached at all.
+func TestResponseHeaderTimeoutReturns504(t *testing.T) {
+	release := make(chan struct{})
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // never respond; the client's response_header timeout fires first
+	})
+	srv := httptest.NewServer(up)
+	// Close release before the server so the parked handler returns and Close does not block (a
+	// client-side ResponseHeaderTimeout does not promptly cancel the server's request context).
+	defer func() { close(release); srv.Close() }()
+	st, _ := store.Open(":memory:")
+	defer st.Close()
+	cfg := &config.Config{
+		MasterKey: "mk",
+		Defaults:  config.Defaults{Retry: config.Retry{MaxRetries: 0}},
+		Providers: []config.Provider{{
+			Name: "slow", BaseURL: srv.URL, APIKey: "x",
+			Timeout: config.Timeout{ResponseHeader: dur(80 * time.Millisecond)},
+		}},
+	}
+	p := New(cfg, st, testPricing(), &http.Client{}, nil)
+	plain, display, _ := keys.Generate()
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"slow"}, config.StartFirst, config.OrderRoundRobin, false)
+
+	rec := do(t, p, plain, "/v1/chat/completions", `{"model":"gpt-5.4"}`)
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504; body=%s", rec.Code, rec.Body.String())
+	}
+	if src := rec.Header().Get(headerErrorSource); src != sourceProvider {
+		t.Errorf("error source = %q, want provider", src)
+	}
+	var body struct {
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	json.Unmarshal(rec.Body.Bytes(), &body)
+	if body.Error.Type != "timeout_error" {
+		t.Errorf("error.type = %q, want timeout_error", body.Error.Type)
+	}
+	if !strings.Contains(body.Error.Message, "timed out") {
+		t.Errorf("message = %q, want it to say 'timed out'", body.Error.Message)
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 || logs[0].StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("log = %+v, want one 504 row", logs)
+	}
+}
+
+// TestResponseHeaderTimeoutFailsOver: when the first provider blows its response_header timeout
+// and retries remain, the request fails over to a healthy peer (served 200), and the timed-out
+// attempt is recorded as a sibling 504 in the trace.
+func TestResponseHeaderTimeoutFailsOver(t *testing.T) {
+	release := make(chan struct{})
+	var slowHits, fastHits atomic.Int32
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slowHits.Add(1)
+		<-release
+	}))
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fastHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	defer func() { close(release); slow.Close(); fast.Close() }()
+	st, _ := store.Open(":memory:")
+	defer st.Close()
+	cfg := &config.Config{
+		MasterKey: "mk",
+		Defaults:  config.Defaults{Retry: config.Retry{MaxRetries: 3, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}},
+		Providers: []config.Provider{
+			{Name: "slow", BaseURL: slow.URL, APIKey: "x", Timeout: config.Timeout{ResponseHeader: dur(80 * time.Millisecond)}},
+			{Name: "fast", BaseURL: fast.URL, APIKey: "x"},
+		},
+	}
+	p := New(cfg, st, testPricing(), &http.Client{}, nil)
+	plain, display, _ := keys.Generate()
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"slow", "fast"}, config.StartFirst, config.OrderRoundRobin, false)
+
+	rec := do(t, p, plain, "/v1/x", `{"model":"gpt-5.4"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get(headerProvider); got != "fast" {
+		t.Errorf("served provider = %q, want fast", got)
+	}
+	if slowHits.Load() < 1 || fastHits.Load() != 1 {
+		t.Errorf("hits slow=%d fast=%d, want slow>=1 fast=1", slowHits.Load(), fastHits.Load())
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 || logs[0].Provider != "fast" {
+		t.Fatalf("final log = %+v, want provider=fast", logs)
+	}
+	trace, _ := st.QueryLogs(store.LogFilter{TraceID: logs[0].TraceID})
+	if len(trace) != 2 {
+		t.Fatalf("trace has %d rows, want 2 (slow then fast)", len(trace))
+	}
+	if trace[0].Provider != "slow" || trace[0].StatusCode != http.StatusGatewayTimeout {
+		t.Errorf("attempt 1 = %+v, want slow/504", trace[0])
+	}
+}
+
+// TestRequestTimeoutTruncatesStream: the whole-request timeout bounds an attempt even after the
+// first byte. The upstream sends one event then stalls; the client keeps that event, the stream
+// ends without [DONE] (the upstream status 200 was already delivered), and the truncation is
+// recorded in the log. This is exactly the case the response_header timeout would not catch.
+func TestRequestTimeoutTruncatesStream(t *testing.T) {
+	release := make(chan struct{})
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		fl.Flush()
+		<-release // stall past the request timeout; [DONE] is never sent
+	})
+	srv := httptest.NewServer(up)
+	defer func() { close(release); srv.Close() }()
+	st, _ := store.Open(":memory:")
+	defer st.Close()
+	cfg := &config.Config{
+		MasterKey: "mk",
+		Defaults:  config.Defaults{Retry: config.Retry{MaxRetries: 0}},
+		Providers: []config.Provider{{
+			Name: "up", BaseURL: srv.URL, APIKey: "x",
+			Timeout: config.Timeout{Request: dur(100 * time.Millisecond)},
+		}},
+	}
+	p := New(cfg, st, testPricing(), &http.Client{}, nil)
+	plain, display, _ := keys.Generate()
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"up"}, config.StartFirst, config.OrderRoundRobin, false)
+
+	rec := do(t, p, plain, "/v1/chat/completions", `{"model":"gpt-5.4","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (upstream headers already sent)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"content":"hi"`) {
+		t.Errorf("body missing the first event: %q", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "[DONE]") {
+		t.Errorf("body unexpectedly complete; request timeout should have truncated the stream: %q", rec.Body.String())
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 {
+		t.Fatalf("logs = %d, want 1", len(logs))
+	}
+	if logs[0].StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 (the upstream genuinely served what it served)", logs[0].StatusCode)
+	}
+	if !strings.Contains(logs[0].Error, "request timeout exceeded") {
+		t.Errorf("error = %q, want the request-timeout truncation note", logs[0].Error)
+	}
+}
+
+// timeoutHarness wires a proxy with a single provider carrying the given timeouts, pointed at the
+// upstream handler. Returns proxy, store, plaintext key.
+func timeoutHarness(t *testing.T, to config.Timeout, upstream http.Handler) (*Proxy, *store.Store, string) {
+	t.Helper()
+	srv := httptest.NewServer(upstream)
+	t.Cleanup(srv.Close)
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	cfg := &config.Config{
+		MasterKey: "mk",
+		Defaults:  config.Defaults{Retry: config.Retry{MaxRetries: 0}},
+		Providers: []config.Provider{{Name: "up", BaseURL: srv.URL, APIKey: "x", Timeout: to}},
+	}
+	p := New(cfg, st, testPricing(), &http.Client{}, nil)
+	plain, display, _ := keys.Generate()
+	if _, err := st.CreateKey("dev", keys.Hash(plain), display, []string{"up"}, config.StartFirst, config.OrderRoundRobin, false); err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	return p, st, plain
+}
+
+// TestHealthyNonStreamingWithTimeouts: with both timeouts set comfortably high, a normal
+// non-streaming request still completes through the per-provider client (cloned transport) and
+// per-attempt context — the happy path is unchanged and usage/cost are still metered, with no
+// spurious truncation note.
+func TestHealthyNonStreamingWithTimeouts(t *testing.T) {
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1000,"completion_tokens":200,"prompt_tokens_details":{"cached_tokens":400}}}`)
+	})
+	p, st, key := timeoutHarness(t, config.Timeout{ResponseHeader: dur(30 * time.Second), Request: dur(30 * time.Second)}, up)
+
+	rec := do(t, p, key, "/v1/chat/completions", `{"model":"gpt-5.4"}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 {
+		t.Fatalf("logs = %d, want 1", len(logs))
+	}
+	l := logs[0]
+	if l.StatusCode != 200 || l.Error != "" {
+		t.Errorf("status/err = %d/%q, want 200 and no error", l.StatusCode, l.Error)
+	}
+	if l.Streaming {
+		t.Error("expected non-streaming")
+	}
+	if l.InputTokens != 600 || l.OutputTokens != 200 || l.CacheReadTokens != 400 {
+		t.Errorf("usage = %+v, want 600/200/400 (timeouts must not disturb metering)", l)
+	}
+	if l.Cost == 0 {
+		t.Error("cost = 0, want non-zero")
+	}
+}
+
+// TestHealthyStreamingWithTimeouts: the streaming happy path is likewise unaffected — the SSE
+// stream is delivered in full (including [DONE]), usage is metered, and no truncation note is
+// recorded when the request finishes well within the request timeout.
+func TestHealthyStreamingWithTimeouts(t *testing.T) {
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		fl.Flush()
+		fmt.Fprint(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n")
+		fl.Flush()
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		fl.Flush()
+	})
+	p, st, key := timeoutHarness(t, config.Timeout{ResponseHeader: dur(30 * time.Second), Request: dur(30 * time.Second)}, up)
+
+	rec := do(t, p, key, "/v1/chat/completions", `{"model":"gpt-5.4","stream":true}`)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "[DONE]") {
+		t.Errorf("stream not fully delivered: %q", rec.Body.String())
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 || !logs[0].Streaming {
+		t.Fatalf("expected 1 streaming log, got %+v", logs)
+	}
+	if logs[0].InputTokens != 10 || logs[0].OutputTokens != 5 {
+		t.Errorf("usage = %+v, want 10/5", logs[0])
+	}
+	if logs[0].Error != "" {
+		t.Errorf("error = %q, want empty (a healthy stream is not truncated)", logs[0].Error)
+	}
+}
+
+// TestRequestTimeoutNonStreamingReturns504: the whole-request timeout (enforced via the per-
+// attempt context, distinct from the transport's response_header timeout) also yields 504 when it
+// fires before any response on a non-streaming request — the non-streaming sibling of
+// TestRequestTimeoutTruncatesStream.
+func TestRequestTimeoutNonStreamingReturns504(t *testing.T) {
+	release := make(chan struct{})
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // never respond; the request timeout (context deadline) fires first
+	})
+	srv := httptest.NewServer(up)
+	defer func() { close(release); srv.Close() }()
+	st, _ := store.Open(":memory:")
+	defer st.Close()
+	cfg := &config.Config{
+		MasterKey: "mk",
+		Defaults:  config.Defaults{Retry: config.Retry{MaxRetries: 0}},
+		Providers: []config.Provider{{Name: "up", BaseURL: srv.URL, APIKey: "x",
+			Timeout: config.Timeout{Request: dur(80 * time.Millisecond)}}},
+	}
+	p := New(cfg, st, testPricing(), &http.Client{}, nil)
+	plain, display, _ := keys.Generate()
+	st.CreateKey("dev", keys.Hash(plain), display, []string{"up"}, config.StartFirst, config.OrderRoundRobin, false)
+
+	rec := do(t, p, plain, "/v1/chat/completions", `{"model":"gpt-5.4"}`)
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504; body=%s", rec.Code, rec.Body.String())
+	}
+	if src := rec.Header().Get(headerErrorSource); src != sourceProvider {
+		t.Errorf("error source = %q, want provider", src)
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 || logs[0].StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("log = %+v, want one 504 row", logs)
+	}
+}
