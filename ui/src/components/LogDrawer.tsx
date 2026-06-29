@@ -36,9 +36,11 @@ interface Props {
   preview: RequestLog | null
   open: boolean
   onClose: () => void
+  /** Navigate the drawer to another log in the same trace (an earlier attempt). */
+  onNavigate?: (log: RequestLog) => void
 }
 
-export function LogDrawer({ logId, preview, open, onClose }: Props) {
+export function LogDrawer({ logId, preview, open, onClose, onNavigate }: Props) {
   const { forget } = useAuth()
   const [full, setFull] = useState<RequestLog | null>(null)
   const [loading, setLoading] = useState(false)
@@ -69,7 +71,7 @@ export function LogDrawer({ logId, preview, open, onClose }: Props) {
         {log && (
           <>
             <SheetHeader className="pb-4">
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <SheetTitle className="font-mono text-base">
                   #{log.id}
                 </SheetTitle>
@@ -81,6 +83,17 @@ export function LogDrawer({ logId, preview, open, onClose }: Props) {
                 {loading && (
                   <Loader2 className="text-muted-foreground size-4 animate-spin" />
                 )}
+              </div>
+              <div className="text-muted-foreground flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-xs">
+                <span>
+                  <span className="font-sans">Trace</span> {log.trace_id || '—'}
+                </span>
+                <span>
+                  <span className="font-sans">Request</span> {log.id}
+                </span>
+                <span>
+                  <span className="font-sans">Attempt</span> #{log.attempt_seq}
+                </span>
               </div>
               <SheetDescription title={formatTimeFull(log.created_at)}>
                 {log.provider} · {log.model}
@@ -98,7 +111,11 @@ export function LogDrawer({ logId, preview, open, onClose }: Props) {
                 <RequestInfo log={log} />
 
                 {full?.attempts && full.attempts.length > 0 && (
-                  <AttemptsPanel attempts={full.attempts} final={log} />
+                  <AttemptsPanel
+                    attempts={full.attempts}
+                    final={log}
+                    onNavigate={onNavigate}
+                  />
                 )}
 
                 {(log.error || log.assemble_error) && (
@@ -208,31 +225,44 @@ function RequestInfo({ log }: { log: RequestLog }) {
 function AttemptsPanel({
   attempts,
   final,
+  onNavigate,
 }: {
   attempts: RequestLog[]
   final: RequestLog
+  onNavigate?: (log: RequestLog) => void
 }) {
   return (
     <div className="flex flex-col gap-2 rounded-lg border p-4">
       <h3 className="text-sm font-semibold">Attempts</h3>
       <ol className="flex flex-col gap-1.5">
         {attempts.map((a, i) => (
-          <li key={i} className="flex items-baseline gap-2 text-sm">
-            <span className="text-muted-foreground tabular w-4 text-xs">
-              {a.attempt_seq}.
-            </span>
-            <span className="font-mono">{a.provider || '—'}</span>
-            <span className={cn('font-mono', statusClass(a.status_code))}>
-              {a.status_code || 'net err'}
-            </span>
-            {a.error && (
-              <span className="text-muted-foreground truncate text-xs" title={a.error}>
-                {a.error}
+          <li key={i}>
+            <button
+              type="button"
+              disabled={!onNavigate}
+              onClick={() => onNavigate?.(a)}
+              className={cn(
+                'flex w-full items-baseline gap-2 rounded text-left text-sm',
+                onNavigate &&
+                  'hover:bg-muted/60 -mx-1 cursor-pointer px-1 py-0.5',
+              )}
+            >
+              <span className="text-muted-foreground tabular w-4 text-xs">
+                {a.attempt_seq}.
               </span>
-            )}
+              <span className="font-mono">{a.provider || '—'}</span>
+              <span className={cn('font-mono', statusClass(a.status_code))}>
+                {a.status_code || 'net err'}
+              </span>
+              {a.error && (
+                <span className="text-muted-foreground truncate text-xs" title={a.error}>
+                  {a.error}
+                </span>
+              )}
+            </button>
           </li>
         ))}
-        <li className="flex items-baseline gap-2 text-sm">
+        <li className="flex items-baseline gap-2 px-1 text-sm">
           <span className="text-muted-foreground tabular w-4 text-xs">→</span>
           <span className="font-medium">served</span>
           <span className="font-mono">{final.provider || '—'}</span>

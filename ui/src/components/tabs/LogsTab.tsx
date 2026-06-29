@@ -14,8 +14,8 @@ import { applyTimeQuery, presetQuery, type TimeQuery } from '@/lib/timerange'
 import {
   formatCompact,
   formatCost,
+  formatDateTime,
   formatDuration,
-  formatRelative,
   formatTimeFull,
   statusClass,
 } from '@/lib/format'
@@ -172,6 +172,7 @@ export function LogsTab() {
             <TableHeader>
               <TableRow>
                 <TableHead className="pl-4">Time</TableHead>
+                <TableHead>Trace</TableHead>
                 <TableHead>Key</TableHead>
                 <TableHead>Provider</TableHead>
                 <TableHead>Model</TableHead>
@@ -191,7 +192,7 @@ export function LogsTab() {
               {loading ? (
                 Array.from({ length: 8 }).map((_, i) => (
                   <TableRow key={i}>
-                    <TableCell colSpan={14} className="px-4">
+                    <TableCell colSpan={15} className="px-4">
                       <Skeleton className="h-6 w-full" />
                     </TableCell>
                   </TableRow>
@@ -199,7 +200,7 @@ export function LogsTab() {
               ) : logs.length === 0 ? (
                 <TableRow>
                   <TableCell
-                    colSpan={14}
+                    colSpan={15}
                     className="text-muted-foreground py-12 text-center"
                   >
                     No requests logged for this filter.
@@ -216,10 +217,16 @@ export function LogsTab() {
                     )}
                   >
                     <TableCell
-                      className="text-muted-foreground pl-4 text-xs"
+                      className="text-muted-foreground pl-4 text-xs whitespace-nowrap"
                       title={formatTimeFull(l.created_at)}
                     >
-                      {formatRelative(l.created_at)}
+                      {formatDateTime(l.created_at)}
+                    </TableCell>
+                    <TableCell
+                      className="text-muted-foreground max-w-[120px] truncate font-mono text-xs"
+                      title={l.trace_id}
+                    >
+                      {l.trace_id || '—'}
                     </TableCell>
                     <TableCell className="max-w-[140px] truncate font-medium">
                       {l.key_name || '—'}
@@ -339,6 +346,7 @@ export function LogsTab() {
         preview={selected}
         open={!!selected}
         onClose={() => setSelected(null)}
+        onNavigate={setSelected}
       />
     </div>
   )

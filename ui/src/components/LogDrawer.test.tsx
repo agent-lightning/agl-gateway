@@ -122,4 +122,57 @@ describe('LogDrawer payload wrapping', () => {
     expect(screen.getByText('busy')).toBeInTheDocument()
     expect(screen.getByText('served')).toBeInTheDocument()
   })
+
+  it('shows the trace, request, and attempt identifiers in the header', async () => {
+    const final = makeLog()
+    final.id = '42'
+    final.trace_id = '7'
+    final.attempt_seq = 2
+    apiMock.mockReset().mockResolvedValue(final)
+    render(
+      <AuthContext.Provider
+        value={{ masterKey: 'mk', connect: vi.fn(), forget: vi.fn() }}
+      >
+        <LogDrawer logId="42" preview={final} open onClose={vi.fn()} />
+      </AuthContext.Provider>,
+    )
+
+    expect(await screen.findByText('Trace')).toBeInTheDocument()
+    expect(screen.getByText('Request')).toBeInTheDocument()
+    expect(screen.getByText('Attempt')).toBeInTheDocument()
+  })
+
+  it('navigates to an earlier attempt when clicked', async () => {
+    const user = userEvent.setup()
+    const earlier = {
+      ...makeLog(),
+      id: '6',
+      provider: 'flaky',
+      status_code: 503,
+      attempt_seq: 1,
+      final_attempt: false,
+      error: 'busy',
+    }
+    const final = makeLog()
+    final.attempt_seq = 2
+    final.attempts = [earlier]
+    apiMock.mockReset().mockResolvedValue(final)
+    const onNavigate = vi.fn()
+    render(
+      <AuthContext.Provider
+        value={{ masterKey: 'mk', connect: vi.fn(), forget: vi.fn() }}
+      >
+        <LogDrawer
+          logId="7"
+          preview={makeLog()}
+          open
+          onClose={vi.fn()}
+          onNavigate={onNavigate}
+        />
+      </AuthContext.Provider>,
+    )
+
+    await user.click(await screen.findByText('flaky'))
+    expect(onNavigate).toHaveBeenCalledWith(earlier)
+  })
 })
