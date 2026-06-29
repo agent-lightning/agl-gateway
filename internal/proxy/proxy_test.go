@@ -831,6 +831,31 @@ func TestProviderSequence(t *testing.T) {
 		assertPermutation(t, names(providerSequence(valid, config.StartRandom, config.OrderRoundRobin)))
 		assertPermutation(t, names(providerSequence(valid, config.StartRandom, config.OrderRandom)))
 	}
+	// random/round_robin is always a contiguous rotation (cyclic order preserved); its head
+	// covers every provider. random/random eventually breaks cyclic order. This guards against
+	// the two random policies collapsing into the same behavior.
+	rotations := map[string]bool{"abc": true, "bca": true, "cab": true}
+	heads := map[string]bool{}
+	for i := 0; i < 200; i++ {
+		seq := strings.Join(names(providerSequence(valid, config.StartRandom, config.OrderRoundRobin)), "")
+		if !rotations[seq] {
+			t.Errorf("random/round_robin = %q, not a rotation of abc", seq)
+		}
+		heads[seq[:1]] = true
+	}
+	if len(heads) != 3 {
+		t.Errorf("random/round_robin heads = %v, want all of a,b,c", heads)
+	}
+	sawNonRotation := false
+	for i := 0; i < 200; i++ {
+		if seq := strings.Join(names(providerSequence(valid, config.StartRandom, config.OrderRandom)), ""); !rotations[seq] {
+			sawNonRotation = true
+			break
+		}
+	}
+	if !sawNonRotation {
+		t.Error("random/random never broke cyclic order; indistinguishable from round_robin")
+	}
 	// A single provider is returned unchanged regardless of policy.
 	one := []*config.Provider{{Name: "solo"}}
 	if got := names(providerSequence(one, config.StartRandom, config.OrderRandom)); !reflect.DeepEqual(got, []string{"solo"}) {
@@ -896,6 +921,117 @@ func TestFailoverToNextProvider(t *testing.T) {
 	logs, _ := st.QueryLogs(store.LogFilter{})
 	if len(logs) != 1 || logs[0].Provider != "b" || logs[0].Attempts != 2 {
 		t.Fatalf("log = %+v, want provider=b attempts=2", logs[0])
+	}
+}
+
+// policyHarness wires a key bound to several named providers, each backed by its own upstream,
+// under the given start/order policy and shared retry budget. Returns proxy, store, plaintext key.
+func policyHarness(t *testing.T, retry config.Retry, start, order string, names []string, handlers []http.Handler) (*Proxy, *store.Store, string) {
+	t.Helper()
+	st, _ := store.Open(":memory:")
+	t.Cleanup(func() { st.Close() })
+	provs := make([]config.Provider, len(names))
+	for i, n := range names {
+		srv := httptest.NewServer(handlers[i])
+		t.Cleanup(srv.Close)
+		provs[i] = config.Provider{Name: n, BaseURL: srv.URL, APIKey: "x"}
+	}
+	cfg := &config.Config{MasterKey: "mk", Defaults: config.Defaults{Retry: retry}, Providers: provs}
+	p := New(cfg, st, testPricing(), &http.Client{}, nil)
+	plain, display, _ := keys.Generate()
+	if _, err := st.CreateKey("dev", keys.Hash(plain), display, names, start, order, false); err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	return p, st, plain
+}
+
+// fail503 records hits and always returns a retryable 503. ok records hits and returns a usable body.
+func fail503(hits *atomic.Int32) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) { hits.Add(1); w.WriteHeader(http.StatusServiceUnavailable) }
+}
+func okJSON(hits *atomic.Int32) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}
+}
+
+// TestFailoverWalksFullSequence: three providers all fail retryably with a budget of len-1, so
+// the loop tries each exactly once in binding order and surfaces the last provider's 503.
+func TestFailoverWalksFullSequence(t *testing.T) {
+	var a, b, c atomic.Int32
+	retry := config.Retry{MaxRetries: 2, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}
+	p, st, key := policyHarness(t, retry, config.StartFirst, config.OrderRoundRobin,
+		[]string{"a", "b", "c"}, []http.Handler{fail503(&a), fail503(&b), fail503(&c)})
+	rec := do(t, p, key, "/v1/x", `{"model":"gpt-5.4"}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if a.Load() != 1 || b.Load() != 1 || c.Load() != 1 {
+		t.Errorf("hits a=%d b=%d c=%d, want 1/1/1", a.Load(), b.Load(), c.Load())
+	}
+	if got := rec.Header().Get(headerProvider); got != "c" {
+		t.Errorf("served provider = %q, want c (last tried)", got)
+	}
+	if rec.Header().Get(headerErrorSource) != sourceProvider {
+		t.Errorf("source = %q, want provider", rec.Header().Get(headerErrorSource))
+	}
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 || logs[0].Provider != "c" || logs[0].Attempts != 3 {
+		t.Fatalf("log = %+v, want provider=c attempts=3", logs[0])
+	}
+}
+
+// TestFailoverWrapsBeyondProviderCount: budget exceeds the provider count, so the walk wraps and
+// re-tries earlier providers. attempts = MaxRetries+1, spread cyclically across providers.
+func TestFailoverWrapsBeyondProviderCount(t *testing.T) {
+	var a, b atomic.Int32
+	retry := config.Retry{MaxRetries: 3, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}
+	p, _, key := policyHarness(t, retry, config.StartFirst, config.OrderRoundRobin,
+		[]string{"a", "b"}, []http.Handler{fail503(&a), fail503(&b)})
+	rec := do(t, p, key, "/v1/x", `{"model":"gpt-5.4"}`)
+	if a.Load() != 2 || b.Load() != 2 {
+		t.Errorf("hits a=%d b=%d, want 2/2 (4 attempts wrapping)", a.Load(), b.Load())
+	}
+	if got := rec.Header().Get(headerProvider); got != "b" {
+		t.Errorf("served provider = %q, want b", got)
+	}
+}
+
+// TestNoFailoverWhenBudgetZero: a multi-provider key with MaxRetries=0 only ever tries the
+// starting provider — there is no second attempt to fail over into.
+func TestNoFailoverWhenBudgetZero(t *testing.T) {
+	var a, b atomic.Int32
+	retry := config.Retry{MaxRetries: 0}
+	p, _, key := policyHarness(t, retry, config.StartFirst, config.OrderRoundRobin,
+		[]string{"a", "b"}, []http.Handler{fail503(&a), okJSON(&b)})
+	rec := do(t, p, key, "/v1/x", `{"model":"gpt-5.4"}`)
+	if a.Load() != 1 || b.Load() != 0 {
+		t.Errorf("hits a=%d b=%d, want 1/0 (no failover)", a.Load(), b.Load())
+	}
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get(headerProvider) != "a" {
+		t.Errorf("status=%d provider=%q, want 503/a", rec.Code, rec.Header().Get(headerProvider))
+	}
+}
+
+// TestPinnedProviderRetriesSameNoFailover: pinning consumes the full retry budget on the pinned
+// provider and never crosses to a healthy peer, even when one is bound and would succeed.
+func TestPinnedProviderRetriesSameNoFailover(t *testing.T) {
+	var a, b atomic.Int32
+	retry := config.Retry{MaxRetries: 2, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}
+	p, _, key := policyHarness(t, retry, config.StartFirst, config.OrderRoundRobin,
+		[]string{"a", "b"}, []http.Handler{fail503(&a), okJSON(&b)})
+	req := httptest.NewRequest(http.MethodPost, "/v1/x", strings.NewReader(`{"model":"gpt-5.4"}`))
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("X-AGL-Provider", "a")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if a.Load() != 3 || b.Load() != 0 {
+		t.Errorf("hits a=%d b=%d, want 3/0 (pin retries same, no failover)", a.Load(), b.Load())
+	}
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rec.Code)
 	}
 }
 
