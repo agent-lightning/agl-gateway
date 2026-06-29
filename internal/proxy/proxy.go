@@ -41,10 +41,19 @@ const (
 const controlHeaderPrefix = "X-Agl-" // canonicalized form of "X-AGL-"
 
 // Error sources, reported to the client so it can tell a provider failure from a gateway one.
+// sourceClient marks a request the client itself abandoned (disconnected before/while we were
+// serving it); such rows are neither a provider nor a gateway fault and must not pollute either
+// error rate.
 const (
 	sourceGateway  = "gateway"
 	sourceProvider = "provider"
+	sourceClient   = "client"
 )
+
+// statusClientClosed is the (non-standard, nginx-originated) "client closed request" status. It
+// is only ever written to the request log — the client that would receive it is already gone —
+// so it serves purely as a marker that distinguishes a client abort from a real upstream status.
+const statusClientClosed = 499
 
 // maxErrorBodyCapture bounds how much of an upstream error response body is copied into the
 // request log. Provider error payloads (e.g. an OpenAI invalid_request_error JSON) are small.
@@ -362,6 +371,17 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 
 	// No HTTP response at all: a network/transport failure (or a request we couldn't build).
 	if resp == nil {
+		// A cancelled request context here means the client went away before any upstream
+		// response arrived. That is neither a provider nor a gateway fault, so we record it
+		// distinctly (status 499, source=client) to keep provider error rates honest, and we
+		// skip synthesizing a body for a connection that is already gone.
+		if ctxErr := r.Context().Err(); ctxErr != nil {
+			logRow.StatusCode = statusClientClosed
+			logRow.Error = "agl-gateway: client disconnected before upstream responded: " + ctxErr.Error()
+			logRow.DurationMillis = time.Since(start).Milliseconds()
+			p.save(logRow)
+			return
+		}
 		source := sourceProvider
 		msg := fmt.Sprintf("agl-gateway: upstream provider %q is unreachable after %d attempt(s)", prov.Name, attempts)
 		if attempts == 0 {
@@ -419,7 +439,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 		payloadWriter = payloads
 	}
 	pump := newMeterPump(meter, payloadWriter, captureLimit, p.logger)
-	ttft, gotByte, respBytes := streamBody(w, resp.Body, pump, start)
+	ttft, gotByte, respBytes, clientGone := streamBody(w, resp.Body, pump, start)
 	head, _ := pump.finish()
 
 	var u pricing.Usage
@@ -449,6 +469,17 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, body []byte, key
 	}
 	if gotByte {
 		logRow.TTFTMillis = ttft.Milliseconds()
+	}
+	// The client disconnected mid-stream: the upstream status stands (it genuinely served what
+	// it served), but record why the captured body/usage is truncated. Without this a partial
+	// 200 is indistinguishable from a complete one.
+	if clientGone {
+		note := fmt.Sprintf("client disconnected mid-stream after %d body bytes", respBytes)
+		if logRow.Error == "" {
+			logRow.Error = note
+		} else {
+			logRow.Error += "; " + note
+		}
 	}
 	logRow.DurationMillis = time.Since(start).Milliseconds()
 	logRow.InputTokens = u.InputTokens
@@ -630,8 +661,9 @@ func (m *meterPump) finish() (head []byte, dropped bool) {
 
 // streamBody copies upstream->client, flushing each chunk (for SSE liveness) and handing each
 // flushed chunk to the metering pump (off the critical path). It reports time-to-first-byte
-// measured from reqStart and the total number of body bytes read from upstream.
-func streamBody(w http.ResponseWriter, body io.Reader, m *meterPump, reqStart time.Time) (ttft time.Duration, gotByte bool, written int64) {
+// measured from reqStart, the total number of body bytes read from upstream, and whether the
+// client disconnected mid-stream (a failed write) so the caller can annotate the log.
+func streamBody(w http.ResponseWriter, body io.Reader, m *meterPump, reqStart time.Time) (ttft time.Duration, gotByte bool, written int64, clientGone bool) {
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {
@@ -646,7 +678,7 @@ func streamBody(w http.ResponseWriter, body io.Reader, m *meterPump, reqStart ti
 			// Client gone: stop forwarding. We deliberately do not meter a chunk the client
 			// never received, matching what was actually delivered.
 			if _, werr := w.Write(chunk); werr != nil {
-				return ttft, gotByte, written
+				return ttft, gotByte, written, true
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -654,7 +686,7 @@ func streamBody(w http.ResponseWriter, body io.Reader, m *meterPump, reqStart ti
 			m.feed(chunk)
 		}
 		if err != nil {
-			return ttft, gotByte, written
+			return ttft, gotByte, written, false
 		}
 	}
 }

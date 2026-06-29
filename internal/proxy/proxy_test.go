@@ -1110,9 +1110,12 @@ func TestStreamBodyMeteringPanicDoesNotBreakStream(t *testing.T) {
 	rec := httptest.NewRecorder()
 	pump := newMeterPump(panicWriter{}, nil, 0, slog.New(slog.DiscardHandler))
 
-	_, gotByte, written := streamBody(rec, strings.NewReader(payload), pump, time.Now())
+	_, gotByte, written, clientGone := streamBody(rec, strings.NewReader(payload), pump, time.Now())
 	pump.finish() // must not panic
 
+	if clientGone {
+		t.Fatal("clientGone = true, want false (recorder accepts all writes)")
+	}
 	if !gotByte || written != int64(len(payload)) {
 		t.Fatalf("written = %d, gotByte = %v; want %d/true", written, gotByte, len(payload))
 	}
@@ -1138,7 +1141,7 @@ func TestStreamBodyManyChunksNoLoss(t *testing.T) {
 	pump := newMeterPump(acc, raw, 0, slog.New(slog.DiscardHandler))
 
 	// A reader that yields one small chunk per Read, so the proxy hands off many times.
-	_, _, written := streamBody(rec, &chunkReader{data: []byte(full)}, pump, time.Now())
+	_, _, written, _ := streamBody(rec, &chunkReader{data: []byte(full)}, pump, time.Now())
 	_, dropped := pump.finish()
 
 	if dropped {
@@ -1173,6 +1176,109 @@ func (c *chunkReader) Read(p []byte) (int, error) {
 	n := copy(p, c.data[c.pos:end])
 	c.pos += n
 	return n, nil
+}
+
+// failingWriter is an http.ResponseWriter whose body writes always fail, standing in for a
+// client that has disconnected mid-stream. Header()/WriteHeader succeed so the proxy reaches
+// the streaming loop; the first body Write then fails.
+type failingWriter struct {
+	header http.Header
+	code   int
+}
+
+func (f *failingWriter) Header() http.Header {
+	if f.header == nil {
+		f.header = http.Header{}
+	}
+	return f.header
+}
+func (f *failingWriter) WriteHeader(c int)         { f.code = c }
+func (f *failingWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+// TestStreamBodyReportsClientGone: a failed write to the client surfaces as clientGone=true so
+// the caller can mark the log, while the bytes read so far are still counted.
+func TestStreamBodyReportsClientGone(t *testing.T) {
+	const payload = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+	pump := newMeterPump(usage.NewAccumulator(true), nil, 0, slog.New(slog.DiscardHandler))
+
+	_, gotByte, written, clientGone := streamBody(&failingWriter{}, strings.NewReader(payload), pump, time.Now())
+	pump.finish()
+
+	if !clientGone {
+		t.Fatal("clientGone = false, want true (write failed)")
+	}
+	if !gotByte || written != int64(len(payload)) {
+		t.Fatalf("gotByte=%v written=%d, want true/%d", gotByte, written, len(payload))
+	}
+}
+
+// TestClientDisconnectBeforeResponse: when the client's context is cancelled before any upstream
+// response arrives, the request is logged as a client abort (status 499) rather than a phantom
+// provider 502, so provider error rates stay honest.
+func TestClientDisconnectBeforeResponse(t *testing.T) {
+	hit := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release) // unblock the handler before the test server is torn down
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case hit <- struct{}{}:
+		default:
+		}
+		<-release // never respond; the proxy's request is cancelled out from under this call
+	})
+	p, st, key := harness(t, up)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.4"}`)).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+
+	done := make(chan struct{})
+	go func() { p.ServeHTTP(httptest.NewRecorder(), req); close(done) }()
+	<-hit
+	cancel()
+	<-done
+
+	logs, _ := st.QueryLogs(store.LogFilter{AllAttempts: true})
+	if len(logs) != 1 {
+		t.Fatalf("logs = %d, want exactly 1", len(logs))
+	}
+	l := logs[0]
+	if l.StatusCode != statusClientClosed {
+		t.Errorf("status = %d, want %d (client closed)", l.StatusCode, statusClientClosed)
+	}
+	if !strings.Contains(l.Error, "client disconnected before upstream responded") {
+		t.Errorf("error = %q, want client-disconnect note", l.Error)
+	}
+}
+
+// TestClientDisconnectMidStream: when the client drops while the response is streaming, the
+// upstream status stands (200) but the log records why the captured body/usage is truncated.
+func TestClientDisconnectMidStream(t *testing.T) {
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		fl.Flush()
+	})
+	p, st, key := harness(t, up)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.4","stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+	p.ServeHTTP(&failingWriter{}, req)
+
+	logs, _ := st.QueryLogs(store.LogFilter{})
+	if len(logs) != 1 {
+		t.Fatalf("logs = %d, want 1", len(logs))
+	}
+	l := logs[0]
+	if l.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 (upstream succeeded; client left)", l.StatusCode)
+	}
+	if !strings.Contains(l.Error, "client disconnected mid-stream") {
+		t.Errorf("error = %q, want mid-stream disconnect note", l.Error)
+	}
 }
 
 // TestRequestBodyExceedsLimitReturns413 confirms an over-limit body is rejected before any
