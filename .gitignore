@@ -6,6 +6,11 @@
 /modelcheck
 /dist
 /config.yaml
+/config.test.yaml
+
+# Mock database for debugging/verifying the portal — tracked on purpose. Edit it directly
+# (e.g. with sqlite3) when the fixtures need to change.
+!/testdata/portal-mock.db
 
 # Portal UI build output — produced by `npm --prefix ui run build` (and by CI / the Docker
 # image), not committed. The .gitkeep anchor keeps the go:embed target present so the Go
